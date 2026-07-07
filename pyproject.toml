@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cosmo_sr"
+version = "0.1.0"
+description = "Scarce-HR / many-LR super-resolution for cosmological displacement+velocity fields"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch>=1.10",
+    "matplotlib",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

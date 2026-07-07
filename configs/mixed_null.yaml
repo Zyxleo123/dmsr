@@ -1,0 +1,45 @@
+# Ablation: null-space decomposition generator with hard data consistency.
+#   x_hat = A+(y) + (I - A+ A) H(y, z)   =>   A(x_hat) = y exactly
+# Trained with paired loss + ambient consistency on 3 paired boxes + 349 LR-only.
+# NOTE: because A(x_hat)=y by construction, the ambient term is ~0 and the
+# unpaired LR gives ~no deterministic gradient; this ablation isolates that.
+# Run with: python -m cosmo_sr.train.train_ambient --config configs/mixed_null.yaml
+data:
+  unpaired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"
+  paired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  scale_factor: 8
+  mmap: true
+
+model:
+  name: NullSpaceSRGenerator
+  in_channels: 6
+  out_channels: 6
+  width: 64
+  depth: 4
+  z_channels: 0          # 0 = deterministic; >0 appends noise channels to H
+
+loss:
+  recon: mse
+  huber_delta: 1.0
+  lambda_ambient: 1.0
+  lambda_pair: 1.0
+  lambda_tv: 0.0
+
+degrader:
+  mode: average
+
+train:
+  batch_size_unpaired: 1
+  batch_size_paired: 1
+  lr: 1.0e-4
+  steps: 20000
+  seed: 0
+  log_every: 50
+  save_every: 1000
+
+output:
+  run_dir: runs/mixed_null

@@ -1,0 +1,13 @@
+=== cosmo_sr null | config=configs/mixed_null.yaml ===
+Running on existing allocation — no nested srun
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: zyxleo to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in runs/mixed_null/wandb/run-20260707_143833-1hujwhlk
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run mixed_null
+wandb: ⭐️ View project at https://wandb.ai/zyxleo/cosmo_sr
+wandb: 🚀 View run at https://wandb.ai/zyxleo/cosmo_sr/runs/1hujwhlk
+/var/spool/slurm/job16340/slurm_script: line 53: 58514 Killed                  "${PYTHON}" -m "${MODULE}" --config "${CONFIG}" "$@"
+[2026-07-07T14:40:12.776] error: Detected 1 oom_kill event in StepId=16340.batch. Some of the step tasks have been OOM Killed.

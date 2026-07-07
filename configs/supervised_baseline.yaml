@@ -1,0 +1,33 @@
+data:
+  # Glob patterns for paired LR / HR canonical (6, Ng, Ng, Ng) .npy fields.
+  # Leave empty to use built-in synthetic data (also used by --smoke).
+  train_lr_glob: ""
+  train_hr_glob: ""
+  val_lr_glob: ""
+  val_hr_glob: ""
+  crop_lr: 16
+  scale_factor: 8
+
+model:
+  name: SimpleSRGenerator
+  in_channels: 6
+  out_channels: 6
+  width: 64
+  depth: 4
+
+loss:
+  # optional regularizers (0 disables); supervised loss is always MSE
+  lambda_tv: 0.0
+  lambda_finite: 0.0
+  lambda_meanstd: 0.0
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 10000
+  seed: 0
+  log_every: 50
+  save_every: 1000
+
+output:
+  run_dir: runs/supervised_baseline

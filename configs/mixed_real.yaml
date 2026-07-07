@@ -1,0 +1,42 @@
+# Our method on real data: many LR-only (lr_sims) + scarce paired LR/HR (dmo-64/512).
+# Preprocess paired sets first:
+#   python scripts/preprocess_paired.py --out /zfsauton/scratch/yixiz/DMSR/paired_catnorm
+# HR fields are Ng=512 (~3GB each) -> mmap: true. If GPU OOM, lower crop_lr (e.g. 8).
+data:
+  unpaired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"
+  paired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  scale_factor: 8
+  mmap: true
+
+model:
+  name: SimpleSRGenerator
+  in_channels: 6
+  out_channels: 6
+  width: 64
+  depth: 4
+
+loss:
+  recon: mse
+  huber_delta: 1.0
+  lambda_ambient: 1.0
+  lambda_pair: 1.0
+  lambda_tv: 0.0
+
+degrader:
+  mode: average
+
+train:
+  batch_size_unpaired: 1
+  batch_size_paired: 1
+  lr: 1.0e-4
+  steps: 20000
+  seed: 0
+  log_every: 50
+  save_every: 1000
+
+output:
+  run_dir: runs/mixed_real

@@ -1,0 +1,75 @@
+# Scale-shared stochastic null-space residual flow (64 -> 512 cascade).
+#   x_2R = B_cons_R(y_R) + P_null_R(r),   r ~ flow(v_phi | y_R, R)
+# Paired flow matching over octaves {64,128,256} (pyramid of the HR boxes)
+# + LR-only degrade consistency & band-statistics from the 349 LR sims.
+# Run with: python -m cosmo_sr.train.train_flow --config configs/flow_cascade.yaml
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128          # crop at 512-res; pyramid -> 128/64/32/16 per level
+  n_levels: 4
+  full_res: 512
+  mmap: true
+  # Multi-octave LR-only sources. `crop` is the native-grid crop; `pool` average-
+  # pools it by that factor so the field lands on grid `res`. Sizes are chosen so
+  # the generated residual (grid 2*res) matches the paired residual crop size.
+  lr_only:
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"       # Ng=64
+      res: 64
+      crop: 16          # grid64 size16 -> residual grid128 size32
+      pool: 1
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims_256/set*/catnorm.npy"   # Ng=256
+      res: 128
+      crop: 64          # grid256 size64 -> pool2 -> grid128 size32 -> residual size64
+      pool: 2
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims_256/set*/catnorm.npy"   # Ng=256
+      res: 256
+      crop: 64          # grid256 size64 -> residual grid512 size128
+      pool: 1
+
+model:
+  channels: 6
+  width: 64
+  depth: 4
+  embed_dim: 128
+  context_channels: 0
+  grad_checkpoint: true  # checkpoint residual blocks (big memory win, ~30% slower).
+                         # Needed alongside amp: GroupNorm is forced fp32 under
+                         # autocast, so fp16 alone barely reduces activation memory.
+
+base_upscaler:
+  kind: identity        # "identity" (U_R) or "backbone"/"sr2" (learned SR2)
+  # width: 32           # used when kind == backbone
+  # depth: 2
+
+loss:
+  n_bands: 8
+  lambda_deg: 1.0
+  lambda_band: 1.0
+  band_ema: 0.9
+  lr_sample_steps: 4    # Euler steps for LR-only residual sampling (grad)
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 40000
+  seed: 0
+  log_every: 50
+  save_every: 2000
+  eval_every: 500       # run validation (per-octave FM/consistency/high-k) every N steps
+  amp: true             # fp16 autocast + GradScaler; ~halves memory. Needed: at
+                         # crop_hr=128/width=64/depth=4 fp32 uses ~46GB (OOMs a
+                         # 48GB GPU). Set false to debug numerics in fp32.
+
+wandb:
+  mode: online          # online | offline | disabled (uses WANDB_API_KEY from ~/.bashrc)
+  project: cosmo_sr
+  # entity: your_team
+  name: flow_cascade
+  group: null
+
+output:
+  run_dir: runs/flow_cascade

@@ -1,0 +1,4 @@
+# Pinned external dependency commits (read-only; do not modify these repos).
+# external/map2map and external/SRS-map2map are symlinks to the local clones.
+map2map      https://github.com/eelregit/map2map     4ebc835f019b16e68060ea05acf0e9fe0a62e6bd
+SRS-map2map  https://github.com/yueyingn/SRS-map2map  77e68576b538f710ade66443b7badc5afe8a6193

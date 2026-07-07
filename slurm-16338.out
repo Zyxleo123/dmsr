@@ -1,0 +1,12 @@
+=== cosmo_sr supervised_real | config=configs/supervised_real.yaml ===
+Running on existing allocation — no nested srun
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: zyxleo to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in runs/supervised_real/wandb/run-20260707_143833-a1pfbv4j
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run supervised_real
+wandb: ⭐️ View project at https://wandb.ai/zyxleo/cosmo_sr
+wandb: 🚀 View run at https://wandb.ai/zyxleo/cosmo_sr/runs/a1pfbv4j
+[2026-07-07T15:01:15.474] error: *** JOB 16338 ON gpu29 CANCELLED AT 2026-07-07T15:01:15 DUE to SIGNAL Terminated ***

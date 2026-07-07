@@ -1,0 +1,33 @@
+# Ablation: supervised on 3 paired HR boxes only (no ambient LR).
+# Run with: python -m cosmo_sr.train.train_supervised --config configs/supervised_real.yaml
+data:
+  train_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  train_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  scale_factor: 8
+  mmap: true
+
+model:
+  name: SimpleSRGenerator
+  in_channels: 6
+  out_channels: 6
+  width: 64
+  depth: 4
+
+loss:
+  recon: mse        # switch to "huber" for robust loss (huber_delta below)
+  huber_delta: 1.0
+  lambda_tv: 0.0
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 20000
+  seed: 0
+  log_every: 50
+  save_every: 1000
+
+output:
+  run_dir: runs/supervised_real

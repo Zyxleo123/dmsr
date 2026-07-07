@@ -1,0 +1,36 @@
+data:
+  # Many LR-only samples + scarce paired LR/HR samples.
+  unpaired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"
+  paired_lr_glob: ""
+  paired_hr_glob: ""
+  val_lr_glob: ""
+  val_hr_glob: ""
+  crop_lr: 16
+  scale_factor: 8
+
+model:
+  name: SimpleSRGenerator
+  in_channels: 6
+  out_channels: 6
+  width: 64
+  depth: 4
+
+loss:
+  lambda_ambient: 1.0
+  lambda_pair: 1.0
+  lambda_tv: 0.0
+
+degrader:
+  mode: average
+
+train:
+  batch_size_unpaired: 1
+  batch_size_paired: 1
+  lr: 1.0e-4
+  steps: 10000
+  seed: 0
+  log_every: 50
+  save_every: 1000
+
+output:
+  run_dir: runs/ambient_full

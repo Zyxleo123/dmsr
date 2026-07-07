@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+runs/
+eval_out/
+.pytest_cache/
+*.npy
+*.npz
+!tests/**/*.npy

@@ -1,0 +1,36 @@
+data:
+  # Empty globs -> built-in synthetic data. crop_lr is capped to 8 in smoke mode.
+  unpaired_lr_glob: ""
+  paired_lr_glob: ""
+  paired_hr_glob: ""
+  val_lr_glob: ""
+  val_hr_glob: ""
+  crop_lr: 8
+  scale_factor: 8
+
+model:
+  name: SimpleSRGenerator
+  in_channels: 6
+  out_channels: 6
+  width: 16
+  depth: 2
+
+loss:
+  lambda_ambient: 1.0
+  lambda_pair: 1.0
+  lambda_tv: 0.0
+
+degrader:
+  mode: average
+
+train:
+  batch_size_unpaired: 1
+  batch_size_paired: 1
+  lr: 1.0e-4
+  steps: 20
+  seed: 0
+  log_every: 5
+  save_every: 0
+
+output:
+  run_dir: runs/ambient_smoke
