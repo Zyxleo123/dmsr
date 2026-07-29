@@ -1,0 +1,96 @@
+# Stochastic degrader, DISPLACEMENT-ONLY. This is the recommended run.
+#
+# Two decisions, both backed by measurements on set0:
+#
+# 1. DROP VELOCITY. Real-space halo positions are q + Psi, so a real-space halo
+#    image depends on displacement alone. Meanwhile the velocity channels carry
+#    ~99% of the field MSE and are nearly unpredictable from the HR field
+#    (cross-correlation r(k) ~ 0.3 near Nyquist; the optimal linear filter beats
+#    avg-pool by 0.4%). Keeping them just buries the signal in noise.
+#    COST: no redshift-space distortions, no halo kinematics, no phase-space
+#    halo finders, no sim restart. Fine iff every downstream metric is real-space.
+#
+# 2. STAY STOCHASTIC. Dropping velocity does NOT make the problem deterministic.
+#    The displacement residual (0.8% of variance) is 98% above k/kNy = 0.2 and is
+#    concentrated in collapsed regions (rms 184 kpc/h in voids -> 630 kpc/h in the
+#    deepest haloes), and a ridge fit on block moments recovers R^2 ~ 0.003 of it.
+#    It is a stochastic field with learnable statistics, not a function.
+#
+# And it MATTERS -- this is the thing field-space MSE hides. The Eulerian density
+# built from A(disp_HR) has sigma_delta = 5.26 against the true LR field's 4.67
+# (+13% too clumpy), with P_A/P_true climbing to 1.61 at Nyquist. Block-averaging
+# returns each Lagrangian patch's exact centre of mass, which lands tightly in the
+# halo centre; the real LR run's coarser force resolution puffs haloes out. An
+# MSE-trained degrader cannot fix this -- it smooths further, making it worse. Only
+# a sampler that puts the scatter back can get the density field right.
+#
+# WATCH: val/density/sigma_ratio and val/density/pk_ratio_density_b* -> target 1.0.
+# Their controls are val/density/sigma_ratio_A and pk_ratio_A_density_b*, which are
+# the avg-pool baseline. Closing that gap is the entire point of this run.
+factor: 8
+
+data:
+  mode: real_pair
+  field_channels: 6         # what's on disk
+  use_channels: [0, 1, 2]   # train on displacement only
+  paired_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set1[0-3].npy"
+  paired_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set1[0-3].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set14.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set14.npy"
+  test_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  test_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  lr_grid_res: 64
+  mmap: true
+  augment: true
+  val_stride: 16
+  val_max_crops: 32
+
+model:
+  channels: 3               # must equal len(use_channels)
+  width: 64
+  depth: 4
+  use_res_embed: true
+  embed_dim: 64
+
+train:
+  batch_size: 4
+  accum_steps: 8            # effective batch 32
+  lr: 2.0e-4
+  warmup: 500
+  min_lr_frac: 0.05
+  grad_clip: 1.0
+  steps: 40000
+  seed: 0
+  # Parallel cropping. A 128^3 HR crop is a ~25 MB strided gather out of a
+  # 512^3 box (~45 ms), and one optimizer step needs batch_size*accum_steps of
+  # them -- with num_workers 0 that ran serially against the GPU. Boxes are
+  # warmed in the parent before the fork, so workers share them copy-on-write
+  # and RAM does NOT multiply by num_workers. Keep <= --cpus-per-task (8).
+  num_workers: 6
+  log_every: 50
+  save_every: 2000
+  eval_every: 500           # cheap: flow loss only
+  sample_every: 2000        # expensive: ODE sampling + density + spectra
+  amp: true
+
+eval:
+  ode_steps: 20             # midpoint solver -> 40 NFE per sample
+  mean_samples: 8
+  n_bands: 6
+  density: true             # the headline metric
+  boxsize: 100000.0         # kpc/h (MP-Gadget paramfile.genic BoxSize)
+  dis_norm: 6000.0          # kpc/h per normalized unit (disnorm: 6000 * D(z=0))
+
+wandb:
+  mode: online
+  project: cosmo_learn_degradation
+  name: stoch_degrader_disp_w64_d4_fm
+  group: stochastic_disp
+
+output:
+  run_dir: runs/stoch_degrader_disp_w64_d4_fm

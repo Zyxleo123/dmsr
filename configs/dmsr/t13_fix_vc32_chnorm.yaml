@@ -1,0 +1,20 @@
+# ARM 2 -- arm 1 plus per-voxel channel normalization.
+#
+# `nn.GroupNorm` reduces over (C/G, D, H, W), so every output voxel depends on the
+# statistics of the whole crop. Measured on t13_unconstrained_s0 (set14): the LR
+# conditioning features of a fixed 8^3 region computed in an 8^3 window correlate
+# only r = 0.474 with the same region computed in the full 64^3 box, and 92.7% of
+# that discrepancy is a per-channel affine rescale -- i.e. this layer, not missing
+# spatial information. It is also a train/eval mismatch, since training uses 8^3
+# LR windows while full-box inference tiles at 32^3.
+#
+# `norm: channel` takes the group statistics over channels only, never over space,
+# leaving the layer strictly pointwise. Same parameter count.
+base: t13_unc_fulldisp_pshuffle8_l003.yaml
+critic:
+  valid_center: 32
+model:
+  norm: channel
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_fix_vc32_chnorm, group: dmsr_densityfix}
+output: {run_dir: runs/dmsr/t13_fix_vc32_chnorm_s0}

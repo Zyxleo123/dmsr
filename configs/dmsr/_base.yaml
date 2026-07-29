@@ -1,0 +1,184 @@
+# Shared base for every DMSR-stage config. Stage files override only what differs.
+#
+# Single-operator framing: A = avg_pool3d(k=8), 512^3 HR -> 64^3 LR. This matches
+# the paired boxes on disk AND the native 64^3 resolution of the 350 LR-only
+# boxes, so unpaired sims condition the model directly (which is what makes the
+# Stage C-vs-D test meaningful).
+factor: 8
+
+data:
+  # Box-level split, never a crop split: set0-2 paired train, set15 val,
+  # set3-set14 test (12 boxes -- see the test globs below).
+  train_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  train_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_lr_glob:   "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  val_hr_glob:   "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  # TEST = 12 boxes (set3..set14). set3-13 are unused by this stage -- they are not
+  # in train (set0-2), not val (set15), and the LR-only pool comes from the separate
+  # lr_sims/ simulation set. Using them all as test turns criterion 5 from "cannot
+  # claim independent-box significance" into a genuine 12-box paired bootstrap, at
+  # zero training cost (evaluation only). Crops are tagged with their source box so
+  # resampling is by BOX, never by crop.
+  test_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[3-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set1[0-4].npy"
+  test_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[3-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set1[0-4].npy"
+  # 350 unpaired LR boxes -- disjoint simulations, so no held-out box can leak.
+  lr_only_glob:  "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"
+  crop_lr: 8            # -> 64^3 HR crops
+  channels: 6
+  # Displacement-only first: velocity is noise-limited (eta_frac ~0.60 vs 0.008
+  # for displacement), and real-space halo positions depend on displacement alone.
+  use_channels: [0, 1, 2]
+  augment: true
+  mmap: true
+  epoch_length: 4096
+  # Physical scale of the simulation. BOTH CIC call sites derive their cellsize
+  # from these, because they need DIFFERENT values and a single hand-written number
+  # got it wrong twice (see docs/dmsr_stage.md 9.0i):
+  #   HighPassDensity  acts on HR crops of the 512^3 grid -> boxsize/(lr_grid*factor)
+  #                                                        = 100000/512 = 195.3125
+  #   env descriptors  act on LR crops of the  64^3 grid  -> boxsize/lr_grid
+  #                                                        = 100000/64  = 1562.5
+  # cic_density's lattice is in units of ONE CELL OF THE GRID THE FIELD LIVES ON, so
+  # cellsize must be that grid's physical spacing -- not the crop's, not the LR grid's
+  # when the field is HR. Confirmed against paramfile.genic (BoxSize=100000 kpc/h) and
+  # the repo convention in train_degrader.py / compare_flow_baseline.py.
+  boxsize: 100000.0     # kpc/h -- 100 Mpc/h
+  lr_grid_res: 64       # full LR box grid (not the crop)
+  dis_norm: 6000.0
+
+model:
+  cond_channels: 32
+  encoder_width: 64
+  width: 64
+  num_levels: 3
+  blocks_per_level: 1
+  embed_dim: 128
+  use_resblocks: true
+  use_attention: false
+  zero_init_tail: true
+  grad_checkpoint: true
+  condition_encoder_init: random     # random | lr_pretrained
+  encoder_ckpt: null
+  encoder_lr_scale: 0.1              # applies only when lr_pretrained
+  freeze_encoder: false
+  init_from: null
+
+critic:
+  width: 64
+  n_layers: 3
+  lr: 2.0e-4
+  betas: [0.0, 0.99]
+  # r1_gamma RE-CALIBRATED after fixing cellsize + adding CriticInputNormalizer
+  # (docs 9.0i/9.0j). Both changes alter the input the critic sees, so the previous
+  # value (0.001, tuned on the unnormalised, wrongly-scaled input) no longer applies.
+  # Measured again, 300 critic-only steps from the Stage B ckpt, normalised input:
+  #   gamma  loss_D  separation  wR1/hinge  ratio@lam=0.0084
+  #   0.0    0.023     4.996        --        6.405    (unregularised, saturated)
+  #   0.001  0.343     4.195       4.0        2.428    (near-perfect separation)
+  #   0.01   1.152     0.869       4.5        0.563    <-- chosen
+  #   0.1    1.854     0.147        --        0.133    (weaker critic)
+  # 0.01 is the balance point: clearly discriminating (0.869, ~6x gamma=0.1 and ~130x
+  # what 0.01 gave on the UNnormalised input) while loss_D ~1.15 stays away from both
+  # the uninformative 2.0 and the saturated <0.35 regime, with R1 still a real
+  # constraint at 4.5x the hinge term.
+  r1_gamma: 0.01
+  r1_interval: 16
+  lowpass: blockavg     # blockavg (= P_A on density, exact complement of A) | fourier
+  kcut_frac: 1.0
+
+adv:
+  # lambda_adv RE-CALIBRATED with the new critic. grad_ratio is EXACTLY linear in
+  # lambda_adv, so critic strength (r1_gamma) and gradient subordination are tuned
+  # independently: at r1_gamma=0.01 the measured ratio is 0.563 at lambda_adv=0.0084,
+  # so 0.0030 places it at ~0.20 -- mid-band for the 0.10-0.30 target.
+  lambda_adv: 0.0030
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  gen_ode_steps: 4
+  bp_steps: 1
+  critic_warmup_steps: 200
+  target_grad_ratio: [0.1, 0.3]   # calibration target for ||g_adv||/||g_flow||
+
+env:
+  pool_size: 2048
+  # n_dims=2, n_bins=8 chosen by measurement, not default. At PRODUCTION scale
+  # (2048/4096 crops, all 349 lr_sims boxes, 4 live descriptors) this gives
+  # source-classifier AUC 0.506/0.500/0.490 -> 0.500/0.510/0.487 across seeds 0/1/2,
+  # rejecting only ~15/4096 crops. n_dims=4/n_bins=5 was measured to reject 45% of
+  # crops AND score *worse* afterwards -- the 4-D support box becomes so restrictive
+  # that the survivors stop being representative. More aggressive matching is worse.
+  n_dims: 2
+  n_bins: 8
+  max_auc: 0.60
+  descriptor:
+    redshift: 0.0
+    disp_channels: [0, 1, 2]
+    vel_channels: null      # unavailable: use_channels=[0,1,2] slices velocity at load
+    # cellsize is derived from data.boxsize / data.lr_grid_res at build time; do not
+    # hand-write it here (that is what produced the 10x error).
+    dis_norm: 6000.0
+    # ON deliberately, as cheap insurance. With tidal off only var_density and
+    # disp_rms survive the constant-descriptor filter, so the guard would pass while
+    # measuring almost nothing. At production scale tidal changes the verdict very
+    # little (AUC ~0.50 either way -- the pools really are indistinguishable; see
+    # docs/dmsr_stage.md 9.0b, which supersedes an earlier 0.585 reading taken on a
+    # 120-box subset that did NOT replicate). Keeping it costs one startup pass and
+    # removes a blind spot. Computed from the displacement CIC density, so it needs
+    # no velocity channels.
+    use_tidal: true
+
+equivariance:
+  lambda_eq: 0.0
+  fraction: 0.25
+
+# Experiment E -- deterministic mean + stochastic innovation. DISABLED by default:
+# with enabled=false the generator, loss and logging are byte-identical to Stage C.
+mean_innovation:
+  enabled: false
+  mean_ckpt: runs/dmsr/paired_deterministic/ckpt_best.pt   # trained paired_det net
+  freeze_mean: true            # Phase 2: mean is a fixed offset, gets no gradient
+  joint_finetune: false        # GATED optional joint phase (do not enable until frozen
+                               # phase is complete); mean trained only by its own recon loss
+  mean_lr_scale: 0.1           # joint only: mean LR < flow LR
+  lambda_mean_recon: 1.0       # joint only
+
+# Non-mutating Fourier-band loss diagnostic (Part 3). 0 = OFF (default): Stage C
+# runs are byte-identical. When > 0, logs per-band loss fraction / relative error
+# every N steps by reusing the flow loss's own velocities (no extra RNG draw).
+diagnostics:
+  fourier_band_every: 0
+
+train:
+  batch_size: 2
+  lr: 1.0e-4
+  betas: [0.9, 0.99]
+  steps: 40000
+  smoke_steps: 4
+  seed: 0
+  ema_decay: 0.999
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 1000
+  save_every: 2000
+  grad_log_every: 200
+  num_workers: 0
+
+eval:
+  n_steps: 20
+  low_frac: 0.5
+  high_frac: 1.5
+  max_val_crops: 16
+  max_val_batches: 4
+  diversity_samples: 3
+  best_metric: val_rk_transition
+  best_mode: max
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  group: dmsr

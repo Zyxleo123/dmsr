@@ -1,0 +1,29 @@
+# Enlarged-train split: 13 train / 2 val / 1 test (was 3 / 1 / 12-as-bootstrap).
+#   train = set0..set12   (13 boxes, up from set0-2)
+#   val   = set13 + set15 (2 boxes; set15 = the historical val box)
+#   test  = set14         (1 box; the box always used for eval/visualisation)
+# ONLY the paired-box split changes vs _base.yaml. The 350-box LR-only pool
+# (lr_sims/) is disjoint and inherited unchanged, so Stage D-style conditioning
+# is unaffected. See the dmsr-stage-nullspace-flow-critic memory.
+#
+# NOTE: only ONE held-out test box (set14), same as before, so independent-box
+# test significance still CANNOT be claimed -- val now has 2 boxes for a slightly
+# less noisy model-selection signal. Bootstrap by box/seed, never by crop.
+base: _base.yaml
+data:
+  train_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set1[0-2].npy"
+  train_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set1[0-2].npy"
+  val_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set13.npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  val_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set13.npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  test_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set14.npy"
+  test_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set14.npy"

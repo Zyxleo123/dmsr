@@ -1,0 +1,26 @@
+# STAGE D -- OUR MAIN MODEL. Stage B + the identical HR critic, critic fakes from
+# environment-balanced ALL-LR crops (paired + the 350 LR-only boxes).
+#
+# Identical architecture, initialization, update count, critic and hyperparameters
+# to Stage C. The second generator stream draws balanced LR-only crops instead of
+# repeating paired ones. Balancing is enforced: the run ABORTS if the
+# source-classifier AUC exceeds env.max_auc (0.60).
+#
+# Every field below is identical in stage_c_critic_pairedlr.yaml. The ONLY
+# difference between the two files is `stage: c` vs `stage: d`, which selects the
+# second generator stream's data source. Verified by tests/dmsr/test_stage_parity.py.
+base: _base.yaml
+stage: d
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder.pt
+  init_from: runs/dmsr/stage_b/ckpt_best.pt
+adv:
+  lambda_adv: 0.0030   # re-calibrated; see _base.yaml. MUST stay identical in C and D.
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_stage_d, group: dmsr_cvd}
+output: {run_dir: runs/dmsr/stage_d_s0}

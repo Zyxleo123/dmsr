@@ -1,0 +1,36 @@
+# ABLATION (b): UNCONSTRAINED generator -- Stage C with the exact-consistency
+# null-space projection REMOVED. Diagnostic only; measures the price of the
+# `x_hat = A_plus(y) + P_A(r)` constraint. NOT a production model, and it touches
+# nothing about the locked C/D or the C-vs-E result.
+#
+# Identical to Stage C in every training-relevant field (backbone, encoder init,
+# generator warm-start, critic, lambda_adv schedule, steps, seed, paired second
+# stream) EXCEPT `model.unconstrained: true`. So any metric difference vs stage_c
+# is attributable to the projection alone.
+#
+#   * target becomes the FULL residual x_hr - A_plus(y) (model may correct the LR
+#     large scales), initial noise + velocity are unprojected -> x_hat is only
+#     approximately consistent; A(x_hat)-y is logged as `soft_consistency_rms`.
+#   * `soft_consistency.lambda: 0.0` => fully free generator (reference-only
+#     penalty off). Raise it to softly pull consistency back if desired.
+#
+# Uses the *_frozen.pt inputs that the LOCKED Stage C actually trained from
+# (encoder.pt differs from encoder_frozen.pt; see mean_innovation_e.yaml).
+base: _base.yaml
+stage: c
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder_frozen.pt   # MUST match locked Stage C
+  init_from: runs/dmsr/stage_b/ckpt_best_frozen.pt   # warm-start (identical to ckpt_best.pt)
+  unconstrained: true                                # <-- the only substantive change
+soft_consistency:
+  lambda: 0.0                                        # reference-only; 0 = fully free
+adv:
+  lambda_adv: 0.0030   # identical to Stage C/D
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_unconstrained_ablation, group: dmsr_ablation_b}
+output: {run_dir: runs/dmsr/unconstrained_ablation_s0}

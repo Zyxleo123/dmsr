@@ -1,0 +1,28 @@
+# ARM 3/4 -- MEAN/INNOVATION. Critic mechanics (= Stage C) with the generator
+# decomposed into a FROZEN deterministic mean (the phase-1 t13_paired_deterministic
+# net) + a stochastic innovation flow warm-started from the phase-1 Stage B.
+# Identical to mean_innovation_e.yaml except the enlarged split and the new-split
+# inits. Every training-relevant field matches t13_critic.yaml so the
+# critic-vs-mean/innovation comparison is about the decomposition alone.
+base: _base_train13.yaml
+stage: c
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder_frozen.pt   # MUST match t13_critic
+  init_from: runs/dmsr/t13_stage_b/ckpt_best.pt      # warm-starts the INNOVATION flow
+mean_innovation:
+  enabled: true
+  mean_ckpt: runs/dmsr/t13_paired_deterministic/ckpt_best.pt   # phase-1 mean (new split)
+  freeze_mean: true
+  joint_finetune: false
+adv:
+  lambda_adv: 0.0030
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+diagnostics:
+  fourier_band_every: 1000
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_mean_innovation, group: dmsr_train13}
+output: {run_dir: runs/dmsr/t13_mean_innovation_s0}

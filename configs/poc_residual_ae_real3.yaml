@@ -1,0 +1,46 @@
+# POC Experiment 1: residual AE overfit on the 3 real paired HR boxes.
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128
+  n_levels: 4
+  full_res: 512
+  mmap: true
+
+model:
+  channels: 6
+  width: 48
+  ch_mults: [1, 2, 2]
+  latent_channels: 32
+  n_res: 1
+
+base_upscaler:
+  kind: identity
+
+loss:
+  n_bands: 8
+  lambda_r: 1.0
+  lambda_x: 1.0
+  lambda_band: 0.1
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 3000
+  seed: 0
+  log_every: 25
+  save_every: 1000
+  eval_every: 250
+  amp: true
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  name: poc_residual_ae_real3
+  group: latent_poc
+
+output:
+  run_dir: runs/poc_residual_ae_real3

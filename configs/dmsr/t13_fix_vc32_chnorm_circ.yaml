@@ -1,0 +1,19 @@
+# ARM 3 -- arm 2 plus circular padding in the velocity net.
+#
+# The boxes are periodic and crops are extracted with wraparound, but the velocity
+# U-Net convolves with `padding_mode='zeros'` (the PyTorch default), so every crop
+# face is convolved against a fictitious vacuum. The LR condition encoder already
+# pads circularly, so the two halves of the model disagree about the boundary.
+#
+# tests/test_flow_unet_norm_padding.py asserts that circular padding makes the
+# network translation-equivariant on a periodic input and that zero padding does
+# not.
+base: t13_unc_fulldisp_pshuffle8_l003.yaml
+critic:
+  valid_center: 32
+model:
+  norm: channel
+  padding_mode: circular
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_fix_vc32_chnorm_circ, group: dmsr_densityfix}
+output: {run_dir: runs/dmsr/t13_fix_vc32_chnorm_circ_s0}

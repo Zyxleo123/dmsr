@@ -1,0 +1,28 @@
+# STAGE A at crop_lr=16 (-> 128^3 HR) -- the "context" gate.
+#
+# Tests whether a wider LR neighbourhood per crop improves the CONDITIONING
+# (transition-band r(k)) and the null-space PRIOR COHERENCE (bispectrum, no crop
+# seams) relative to the crop_lr=8 Stage A (runs/dmsr/stage_a). It CANNOT raise
+# the fixed high-k operator ceiling: ker A is set by A alone, independent of crop
+# size (see docs/dmsr_stage.md + the identifiability note).
+#
+# ONLY crop size + batch size change vs stage_a_paired_flow.yaml:
+#   * crop_lr 8 -> 16 (128^3 HR = 8x the voxels of 64^3).
+#   * batch_size 2 -> 1 for the 8x activation memory. Norm is GroupNorm (batch-
+#     independent), so this changes only gradient noise, not the normalisation.
+#   * grad_checkpoint stays true (inherited from _base).
+# Encoder RF is 15 voxels, which already spans a 16^3 crop, so dilations are left
+# at the default (1,2,4) -- a wider crop (e.g. 32) would want an extra dilation,
+# but 16 does not, keeping this a clean one-variable change.
+#
+# steps: 12000 -- crop-8 Stage A converged by ~4-5k (40k was overkill), so 12k is
+# ample headroom while keeping the run ~5h. best-ckpt on val_rk_transition, so the
+# same-ground comparison is best-vs-best regardless of the exact step budget.
+base: _base.yaml
+stage: a
+model: {condition_encoder_init: random}
+data: {crop_lr: 16}
+train: {batch_size: 1, steps: 12000}
+eval: {max_val_crops: 8}
+wandb: {name: dmsr_stage_a_crop16, group: dmsr_stages}
+output: {run_dir: runs/dmsr/stage_a_crop16}

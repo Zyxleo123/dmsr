@@ -1,0 +1,57 @@
+# True memorization check for the REAL (non-trivial) learned degrader.
+#
+# data.mode: real_pair so D_phi must learn a physical 512->64 degradation
+# (not the trivial pyramid A_R target). Critically, data.fixed_crops pins a
+# tiny closed set of crops and cycles them -- without that, "3-box overfit"
+# still samples ~3*64^3 unique 16^3 LR crops and train loss just tracks
+# per-crop ||A(hr)-lr||^2 (empirically ~0.03-0.6 valleys/peaks) while the
+# model barely leaves A (mse/A ≈ 0.97 in the first overfit3box run).
+#
+# Success criterion: train AND val degrader/mse both collapse well below the
+# A baseline for those same crops (CPU probe: one crop 0.049 -> ~7e-4 by
+# step ~600 with the current w32/d2 model). If that fails, architecture /
+# loss / alignment is broken. If it passes but the full random-crop run
+# stays near A, the issue is capacity/generalization -- not a plumbing bug.
+factor: 8
+
+data:
+  mode: real_pair
+  paired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  crop_lr: 16
+  lr_grid_res: 64
+  mmap: true
+  augment: false
+  fixed_crops: 4
+
+model:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+
+loss:
+  lambda_delta: 1.0e-3
+
+train:
+  batch_size: 1
+  lr: 1.0e-3
+  steps: 2000
+  seed: 0
+  log_every: 25
+  save_every: 1000
+  eval_every: 100
+  amp: true
+  early_stop_patience: 0
+
+wandb:
+  mode: online
+  project: cosmo_learn_degradation
+  name: degrader_real_512to64_w32_d2_resembed_overfit4crop
+  group: overfit_ladder
+
+output:
+  run_dir: runs/degrader_real_512to64_w32_d2_resembed_overfit4crop

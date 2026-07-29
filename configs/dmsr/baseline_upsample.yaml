@@ -1,0 +1,6 @@
+# x_hat = A_plus(y). No learned parameters; the floor every stage must beat.
+# Evaluated directly by scripts/dmsr_eval.py --baseline upsample.
+base: _base.yaml
+# NOTE: eval-only config -- there is nothing to train. Scored via
+# `scripts/dmsr_eval.py --baseline`, which needs only the data/factor blocks.
+output: {run_dir: runs/dmsr/baseline_upsample}

@@ -1,0 +1,67 @@
+# SR null-space residual flow -- PAIRED-ONLY BASELINE.
+# Identical to sr_flow_strongband.yaml except lambda_band 8 -> 0 (+ run dir/name).
+# The single-knob difference means: (strongband result) - (this result) = exactly
+# the contribution of the unpaired LR data. This is the internal comparison that
+# proves the thesis ("unpaired LR helps over the few paired boxes alone").
+# lambda_deg kept at 1.0 (it is ~0 by construction, so it neither helps nor hurts)
+# so the ONLY functional difference between the two runs is the distributional term.
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128
+  n_levels: 4
+  full_res: 512
+  mmap: true
+  lr_only:
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"       # Ng=64
+      res: 64
+      crop: 16
+      pool: 1
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims_256/set*/catnorm.npy"   # Ng=256
+      res: 128
+      crop: 64
+      pool: 2
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims_256/set*/catnorm.npy"   # Ng=256
+      res: 256
+      crop: 64
+      pool: 1
+
+model:
+  channels: 6
+  width: 64
+  depth: 4
+  embed_dim: 128
+  context_channels: 0
+  grad_checkpoint: true
+
+base_upscaler:
+  kind: identity
+
+loss:
+  n_bands: 8
+  lambda_deg: 1.0
+  lambda_band: 0.0        # <-- baseline: no unpaired/distributional signal
+  band_ema: 0.9
+  lr_sample_steps: 4
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 40000
+  seed: 0
+  log_every: 50
+  save_every: 2000
+  eval_every: 500
+  amp: true
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  name: sr_flow_pairedonly
+  group: sr_fix
+
+output:
+  run_dir: runs/sr_flow_pairedonly

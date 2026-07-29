@@ -94,14 +94,16 @@ def equilateral_bispectrum(
     return np.asarray(ks), np.asarray(bks)
 
 
-def halo_abundance(*_args, **_kwargs):  # pragma: no cover - documented hook
-    """Halo/subhalo abundance (mass function).
+def halo_abundance(catalog, boxsize_mpc_h: float = 100.0, which: str = "hosts"):
+    """Halo/subhalo abundance (mass function) from a Rockstar catalog.
 
-    Not implemented in-repo: this requires reconstructing particle positions from
-    the displacement field and running an external halo finder (FoF / Rockstar).
-    Wire your halo catalogs here to compare abundance vs the SR2 baseline.
+    Prefer :mod:`cosmo_sr.eval.halo_metrics` for the full Stage-1 suite. This
+    wrapper keeps the historical ``sr2_stats`` entry point.
     """
-    raise NotImplementedError(
-        "halo_abundance requires an external halo finder on reconstructed particles; "
-        "see README 'SR2 metrics' for the intended pipeline."
-    )
+    from .halo_metrics import mass_function
+    from .rockstar import HaloCatalog
+
+    if not isinstance(catalog, HaloCatalog):
+        raise TypeError("halo_abundance expects a cosmo_sr.eval.rockstar.HaloCatalog")
+    cat = catalog.hosts() if which == "hosts" else catalog.subhalos()
+    return mass_function(cat.mvir, boxsize_mpc_h)

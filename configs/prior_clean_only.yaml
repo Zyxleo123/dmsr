@@ -1,0 +1,37 @@
+# P0 clean-HR-only prior (baseline; no ambient data)
+factor: 2
+data:
+  hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 64            # s=8 HR crop -> 8^3 LR measurement
+  use_channels: [0, 1, 2]  # displacement-only (Gate-1: velocity is eta-limited)
+  augment: true
+  mmap: true
+model:
+  width: 64
+  num_levels: 3
+  blocks_per_level: 1
+  embed_dim: 128
+  use_resblocks: true
+  use_attention: true
+  grad_checkpoint: true
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 20000
+  ema_decay: 0.999
+  seed: 0
+  amp: true
+  log_every: 50
+  save_every: 2000
+  eval_every: 500
+wandb:
+  mode: online
+  project: cosmo_sr
+  group: prior_phaseC
+branches:
+  clean: true
+  ambient: none
+  name: prior_clean_only
+output:
+  run_dir: runs/prior_clean_only

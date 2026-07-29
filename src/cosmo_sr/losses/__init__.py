@@ -18,6 +18,11 @@ import torch
 import torch.nn as nn
 
 from .ambient import ambient_loss, compute_ambient
+from .ambient_denoise import (
+    clean_denoise_loss,
+    ambient_denoise_loss,
+    build_ambient_target,
+)
 from .supervised import supervised_loss
 from .regularizers import (
     assert_finite,
@@ -31,6 +36,9 @@ from .regularizers import (
 __all__ = [
     "ambient_loss",
     "compute_ambient",
+    "clean_denoise_loss",
+    "ambient_denoise_loss",
+    "build_ambient_target",
     "supervised_loss",
     "assert_finite",
     "total_variation",

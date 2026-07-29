@@ -24,3 +24,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: end-to-end runs that launch subprocess trainers (minutes, not seconds)",
+]

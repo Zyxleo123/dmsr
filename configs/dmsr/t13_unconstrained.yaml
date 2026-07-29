@@ -1,0 +1,25 @@
+# ARM 4/4 -- NO NULLSPACE, EVERYTHING ELSE. Critic arm (= Stage C) with the
+# exact-consistency null-space projection REMOVED (model.unconstrained). Warm-
+# starts from the phase-1 Stage B on the same 13-box split. Identical to
+# t13_critic.yaml in every training-relevant field EXCEPT unconstrained:true, so
+# any metric difference vs the critic arm is attributable to the projection alone.
+# Target becomes the FULL residual x_hr - A_plus(y); A(x_hat)-y is logged as
+# soft_consistency_rms; soft_consistency.lambda 0 => fully free generator.
+base: _base_train13.yaml
+stage: c
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder_frozen.pt   # matches t13_critic
+  init_from: runs/dmsr/t13_stage_b/ckpt_best.pt      # phase-1 Stage B (new split)
+  unconstrained: true                                # <-- the only substantive change
+soft_consistency:
+  lambda: 0.0
+adv:
+  lambda_adv: 0.0030
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unconstrained, group: dmsr_train13}
+output: {run_dir: runs/dmsr/t13_unconstrained_s0}

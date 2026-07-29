@@ -1,0 +1,16 @@
+# LAMBDA-LADDER ARM -- CRITIC OFF (lambda_adv = 0). The decisive control: the
+# generator gets NO adversarial gradient at all (train_dmsr.py gates the adv loss on
+# `lam > 0`), so this is pure UNCONSTRAINED flow-matching MSE.
+#
+# NOTE: with lambda_adv = 0 the critic-input settings inherited from
+# t13_unc_fulldisp_l003 (residual_mode: full, density_mode: highpass) are INERT --
+# the critic still trains but never touches the generator. So this arm is the
+# "no adversarial" baseline for the whole unconstrained line, not a drop-P_A arm.
+# We have never run this on the unconstrained base (the lamsweep `off` arm was on
+# the PROJECTED base). If it wins, the critic is a net negative here.
+base: t13_unc_fulldisp_l003.yaml
+adv:
+  lambda_adv: 0.0
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_off, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_off_s0}

@@ -1,0 +1,104 @@
+# Deterministic learned degrader, v2 -- fixed instrumentation + optimisation.
+#
+# Supersedes learned_degrader_real.yaml. Nothing about the *model* changed; what
+# changed is that you can now actually see what it is doing:
+#
+#   * WATCH `degrader/skill_ema` and `val/degrader/skill`, NOT `loss`.
+#     Raw loss is ~95% determined by which crop was drawn (per-crop A-baseline
+#     MSE spans 0.05-0.53), and every run used seed 0, so the w32/w64/d2/d4
+#     sweep was comparing three copies of the same crop sequence -- that is why
+#     they agreed to 3 decimals. skill = 1 - mse/mse_vs_A_baseline divides the
+#     shared per-crop difficulty out.
+#   * val is now an exhaustive pass over a deterministic crop grid (64 crops for
+#     one 64^3 box at crop_lr 16), not 2 random crops. The old best_val ~0.0347
+#     that all three model sizes reported was one lucky crop, not a model
+#     property.
+#   * per-channel-group metrics: avg-pool already explains 99.2% of the
+#     displacement variance but only ~65% of the velocity variance, so velocity
+#     carried ~99% of the raw MSE and displacement was invisible.
+#
+# Expect skill to plateau around 0.05-0.15. That is not a bug: the LR and HR
+# runs are physically decorrelated at small scales (r(k) ~ 0.3 near Nyquist for
+# velocity), so most of the residual is conditional variance, not model error.
+# If you want a degrader with the *right power spectrum* rather than the
+# conditional mean, use configs/stoch_degrader_real.yaml instead.
+factor: 8
+
+data:
+  mode: real_pair
+  paired_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set1[0-3].npy"
+  paired_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set1[0-3].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set14.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set14.npy"
+  test_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  test_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  lr_grid_res: 64
+  mmap: true
+  augment: true
+  # val: deterministic tiling. stride=crop_lr -> 4^3 = 64 non-overlapping crops.
+  val_stride: 16
+  val_max_crops: null
+
+model:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+
+loss:
+  # Was 1.0e-3. This term penalises ||Delta||^2, i.e. it is a spring pulling the
+  # model back toward the trivial A baseline -- exactly the wrong direction when
+  # the whole job is to learn a correction to A. Off.
+  lambda_delta: 0.0
+  # Weight channels by inverse residual variance (estimated from the training
+  # stream at startup). Without this the loss is ~99% velocity and the
+  # displacement channels are effectively never trained.
+  normalize_channels: true
+
+train:
+  batch_size: 4
+  # Effective batch 4*8 = 32. At batch_size 1 the gradient was dominated by
+  # whichever rare dense crop came up; per-crop loss varies ~10x.
+  accum_steps: 8
+  lr: 3.0e-4          # raised from 5e-5, affordable now the batch is 32x larger
+  warmup: 500
+  min_lr_frac: 0.05   # cosine decay to 5% of peak
+  grad_clip: 1.0
+  steps: 20000
+  seed: 0
+  # Parallel cropping. A 128^3 HR crop is a ~25 MB strided gather out of a
+  # 512^3 box (~45 ms), and one optimizer step needs batch_size*accum_steps of
+  # them -- with num_workers 0 that ran serially against the GPU. Boxes are
+  # warmed in the parent before the fork, so workers share them copy-on-write
+  # and RAM does NOT multiply by num_workers. Keep <= --cpus-per-task (8).
+  num_workers: 6
+  log_every: 50
+  save_every: 2000
+  eval_every: 500
+  amp: true
+  early_stop_patience: 20
+
+eval:
+  # Eulerian density diagnostic. Expect sigma_ratio to sit ABOVE 1 (too clumpy)
+  # and to get *worse*, not better, as MSE improves -- regression to the
+  # conditional mean smooths, and smoothing over-collapses haloes. That is the
+  # deterministic degrader's structural failure, made visible.
+  density: true
+  n_bands: 6
+  boxsize: 100000.0
+  dis_norm: 6000.0
+
+wandb:
+  mode: online
+  project: cosmo_learn_degradation
+  name: degrader_real_v2_w32_d2_bs32_chnorm
+  group: v2
+
+output:
+  run_dir: runs/degrader_real_v2_w32_d2_bs32_chnorm

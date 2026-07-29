@@ -1,0 +1,94 @@
+# Stage 3: supervised residual diffusion prior. Ordinary denoising objective on
+# real paired residuals dPsi* = Psi_HR - Psi_base. No catalog reward here.
+base: reward.yaml
+
+model:
+  channels: 6
+  scale_factor: 8
+  width: 48
+  # Depth is set by the *tiling* cost, not by capacity alone. Measured
+  # receptive-field half-widths (scripts/reward/measure_receptive_field.py,
+  # width-independent; 1 HR cell = 0.195 Mpc/h), with the resulting tile size at
+  # core=128 and the compute overhead of tiling a 512^3 box:
+  #
+  #   levels blocks   rf   rf[Mpc/h]  margin  tile   overhead
+  #     1      1      16      3.1        24    176^3    2.6x
+  #     1      2      24      4.7        32    192^3    3.4x
+  #     2      1      26      5.1        32    192^3    3.4x
+  #     2      2      41      8.0        48    224^3    5.4x   <- chosen
+  #     3      1      42      8.2        48    224^3    5.4x
+  #     3      2      65     12.7        72    272^3    9.6x
+  #
+  # levels=2/blocks=2 keeps ~8 Mpc/h of context -- far beyond any subhalo's
+  # virial radius (<=1 Mpc/h) -- at 5.4x rather than 9.6x, and reaches as far as
+  # levels=3/blocks=1 for the same cost. A short reach is also aligned with the
+  # low-k constraint: a residual model that cannot see beyond 8 Mpc/h cannot
+  # manufacture a large-scale offset in the first place.
+  num_levels: 2
+  blocks_per_level: 2
+  embed_dim: 128
+  num_groups: 8
+  # Pointwise ChannelGroupNorm3d, not nn.GroupNorm: GroupNorm's statistics are
+  # taken over the whole window, which makes a 64^3 training crop and a tiled
+  # full-box pass renormalise the same region differently and destroys valid-core
+  # tiling. See cosmo_sr/models/flow_unet.py::ChannelGroupNorm3d.
+  norm: channel
+  use_attention: false
+  use_checkpoint: true
+  padding_mode: circular
+  condition_on_lr: true
+  condition_on_base: true
+  # sigma_res is filled in from the residual-target audit at build time; the
+  # placeholder keeps the config self-contained for a smoke run.
+  sigma_res: null
+
+diffusion:
+  n_steps: 20            # DDIM steps at sampling time
+  t_min: 0.001
+  # Strictly below 1: alpha(1) = 0, so the first DDIM step would divide by zero.
+  t_max: 0.999
+  churn: 0.0
+  # Bound on the predicted clean residual in whitened units, where unit variance
+  # is the definition of the scale. Without it an early checkpoint (eps_hat ~ 0)
+  # emits a residual ~1/alpha(t_max) larger than the field it is correcting.
+  x0_clip: 4.0
+  loss_weighting: snr
+  min_snr_gamma: 5.0
+
+data:
+  crop_hr: 64            # multiple of scale_factor and of 2**num_levels
+  base_seed: 0           # which frozen SR2 realisation is the baseline
+  train_length: 200000
+  val_length: 512
+
+train:
+  steps: 60000
+  batch_size: 4
+  grad_accum: 2
+  lr: 1.0e-4
+  weight_decay: 0.0
+  warmup: 1000
+  min_lr_frac: 0.1       # cosine decay floor; 1.0 disables the schedule entirely
+  grad_clip: 1.0
+  ema_decay: 0.999
+  amp: true
+  seed: 0
+  num_workers: 8
+  log_every: 50
+  val_every: 2000
+  ckpt_every: 2000
+  val_batches: 16
+  # Field/diversity diagnostics on a small fixed crop set (cheap, every val).
+  diag_samples: 2
+  diag_crop_hr: 64
+  residual_scale: 1.0
+
+output:
+  # Overridden by the sbatch script; never write checkpoints to home.
+  run_dir: null
+
+wandb:
+  mode: online          # online | offline | disabled (uses WANDB_API_KEY from ~/.bashrc)
+  project: cosmo_sr
+  name: residual_prior
+  group: null

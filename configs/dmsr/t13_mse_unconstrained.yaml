@@ -1,0 +1,14 @@
+# EXPERIMENT 2/3 -- "MSE with A_plus, but unconstrained".
+# Deterministic one-shot regression (stage det) that KEEPS the A_plus(y) base but
+# drops the null-space projection: x_hat = A_plus(y) + f(y),
+# loss = MSE(f(y), x_hr - A_plus(y)). The net is free to correct the LR large
+# scales (the ~8.5% operator mismatch) instead of trusting them, but still gets the
+# A_plus(y) warm start. A(x_hat)-y is logged as soft_consistency_rms only.
+# From scratch (random encoder), 13-box split, 40k steps -- mirrors
+# t13_paired_deterministic with model.unconstrained added.
+base: _base_train13.yaml
+stage: det
+model: {unconstrained: true}
+train: {steps: 40000, seed: 0}
+wandb: {name: dmsr_t13_mse_unconstrained, group: dmsr_train13_afree}
+output: {run_dir: runs/dmsr/t13_mse_unconstrained_s0}

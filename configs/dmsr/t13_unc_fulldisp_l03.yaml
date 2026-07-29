@@ -1,0 +1,21 @@
+# SR2-MATCH ARM 1/4 -- DROP P_A (critic sees the FULL displacement field), raised
+# lambda. Identical to t13_unconstrained EXCEPT the critic input residual channel
+# is the whole displacement (residual_mode: full) instead of P_A(x), and lambda_adv
+# is raised so the now-informative critic actually exerts force (the lamsweep showed
+# lambda is flat WHILE P_A strips the coarse signal). This moves our critic toward
+# SR2's discriminator, which takes the full displacement. Density channel KEPT
+# (colleague found it helps; harmless as an option).
+base: t13_unconstrained.yaml
+critic:
+  residual_mode: full        # <-- the lever: full displacement, not P_A(x)
+  density_mode: highpass     # keep the density channel as-is
+  global_pool: false         # local PatchGAN (globality tested in a separate arm)
+adv:
+  lambda_adv: 0.030          # grad-ratio ~2 (lamsweep top); critic gets real weight
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_l03, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_l03_s0}

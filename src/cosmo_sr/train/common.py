@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from ..utils.config import save_config, write_run_metadata
+from ..utils.config import collect_run_metadata, save_config, write_run_metadata
 
 
 def grad_global_norm(parameters) -> float:
@@ -98,6 +99,7 @@ def maybe_init_wandb(
     except Exception:
         return False
     run_dir = Path(run_dir)
+    meta = collect_run_metadata()
     try:
         wandb.init(
             project=wcfg.get("project", os.environ.get("WANDB_PROJECT", "cosmo_sr")),
@@ -106,7 +108,7 @@ def maybe_init_wandb(
             group=wcfg.get("group"),
             job_type=job_type,
             dir=str(run_dir),
-            config=cfg,
+            config={**cfg, "run_metadata": meta},
             mode=mode,
             reinit=True,
         )
@@ -243,3 +245,57 @@ def init_run_dir(run_dir: str | os.PathLike, cfg: Dict[str, Any]) -> Path:
 
 def to_device_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     return {k: v.to(device) for k, v in batch.items()}
+
+
+def build_lr_schedule(optimizer, base_lr: float, steps: int, warmup: int = 0,
+                      min_lr_frac: float = 1.0):
+    """Linear warmup then cosine decay to ``min_lr_frac * base_lr``.
+
+    Returns ``None`` when there is nothing to do (no warmup and no decay), so
+    callers can keep a constant LR without paying for a scheduler.
+    """
+    warmup = max(0, int(warmup))
+    if warmup == 0 and min_lr_frac >= 1.0:
+        return None
+
+    def lr_lambda(step: int) -> float:
+        if warmup and step < warmup:
+            return (step + 1) / warmup
+        progress = (step - warmup) / max(1, steps - warmup)
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_frac + (1.0 - min_lr_frac) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+@torch.no_grad()
+def estimate_residual_std(
+    paired_iter, ops, device: torch.device, n_batches: int = 32
+) -> torch.Tensor:
+    """Per-channel std of the degradation residual ``r = x_R - A_R(x_2R)``.
+
+    Two consumers need this and both break badly without it:
+
+    * the channel-weighted MSE -- the residual std differs by ~9x between the
+      displacement channels (~0.066) and the velocity channels (~0.58), so an
+      unweighted MSE puts ~99% of its weight on velocity and the model is
+      effectively never trained on displacement;
+    * the stochastic degrader -- conditional flow matching interpolates the
+      target against a unit Gaussian, so a target whose channels span an order
+      of magnitude in scale is badly conditioned. We whiten by these stds and
+      un-whiten at sample time.
+
+    Estimated from the training stream so it always matches the actual data,
+    and stored in the checkpoint so sampling can reproduce it.
+    """
+    sq_sum = None
+    n = 0
+    for _ in range(max(1, int(n_batches))):
+        b = to_device_batch(next(paired_iter), device)
+        r = b["lr"] - ops.A(b["hr"])           # (B, C, N, N, N)
+        s = r.pow(2).sum(dim=(0, 2, 3, 4))     # (C,)
+        sq_sum = s if sq_sum is None else sq_sum + s
+        n += r.shape[0] * r.shape[2] * r.shape[3] * r.shape[4]
+    std = (sq_sum / max(n, 1)).sqrt()
+    return std.clamp_min(1e-6).float()

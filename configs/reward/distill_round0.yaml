@@ -1,0 +1,43 @@
+# Stage 8: one offline reward-weighted distillation round.
+#
+#   L = L_sup + lambda_elite * L_elite + lambda_ref * L_ref
+#
+# L_sup   denoising on the real HR - SR2 residual targets (kept throughout);
+# L_elite reward-weighted denoising on selected generated residuals;
+# L_ref    consistency with the frozen residual prior (the teacher).
+#
+# Exactly one round: candidates are never regenerated during optimisation.
+base: residual_prior.yaml
+
+distill:
+  init_from: null            # residual-prior checkpoint; set by the sbatch script
+  teacher_checkpoint: null   # frozen copy of the same prior, for L_ref
+  replay_manifest: null      # $ZFS/dmsr_reward/replay/round_000/replay.jsonl
+  paired_fraction: 0.5       # fraction of each batch drawn from paired supervision
+  lambda_elite: 1.0
+  lambda_elite_warmup_steps: 2000   # ramp 0 -> lambda_elite
+  lambda_ref: 0.1
+  tau: 1.0
+  a_max: 5.0
+  w_max: 10.0
+  weight_normalize: mean
+  # Abort conditions checked at every validation; a tripped flag stops the run
+  # instead of quietly producing a broken checkpoint.
+  abort_on:
+    residual_rms_ratio_max: 3.0     # vs the prior's residual RMS
+    low_k_change_max: 0.05
+    diversity_min: 0.02
+    elite_weight_ratio_max: 5.0     # max elite weight / batch mean weight
+
+train:
+  steps: 20000
+  batch_size: 4
+  grad_accum: 2
+  lr: 3.0e-5
+  warmup: 500
+  val_every: 1000
+  ckpt_every: 1000
+
+wandb:
+  mode: disabled
+  name: reward_distill_round0

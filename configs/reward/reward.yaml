@@ -1,0 +1,213 @@
+# Single source of truth for the catalog reward, the chunk geometry and the
+# field-fidelity feasibility filter. Every stage (audit, oracle, replay,
+# distillation, evaluation) reads this file; nothing hard-codes a bin edge.
+#
+# Thresholds under `constraints` marked `calibrated: false` are placeholders.
+# Run scripts/reward/calibrate_constraints.py to replace them with values
+# derived from the frozen SR2 baseline and the paired HR boxes, and commit the
+# result. Do not widen a threshold just to make candidates pass.
+
+freeze: configs/sr2_baseline/freeze.yaml
+
+data:
+  root: /zfsauton/scratch/yixiz/DMSR/paired_catnorm
+  boxsize_mpc_h: 100.0
+  dis_norm_kpc_h: 6000.0
+  redshift: 0.0
+  scale_factor: 8
+  ng_lr: 64
+  ng_hr: 512
+
+# Box-level splits. These mirror configs/sr2_baseline/freeze.yaml and are
+# repeated here so a leak is a diff, not an inference.
+split:
+  train_boxes: [set0, set1, set2, set3, set4, set5, set6, set7]
+  val_boxes:   [set8, set9, set10, set11]
+  test_boxes:  [set12, set13, set14, set15]
+  # Roles *inside* the frozen test split, for this project only. set12 has been
+  # inspected repeatedly -- the SR2 subhalo study and the reward sanity check
+  # both ran on it -- so it is development/validation data and cannot carry a
+  # held-out claim. The three boxes nothing has looked at are reserved for the
+  # final comparison and must not be opened before then.
+  dev_boxes:        [set12]
+  final_eval_boxes: [set13, set14, set15]
+
+# --- Experiment 0: fine-grained (64^3) credit ------------------------------
+# The generator's own output tile, used as the credit unit. This does NOT
+# replace `geometry` below: chunks are the purity-masked Eulerian attribution
+# the earlier audits used, tiles are the exact member-particle attribution.
+#
+# The two differ in kind, not in resolution. Chunk attribution *rejects* a halo
+# whose Rvir sphere is not chunk-pure, and that rejection was measured to be
+# mass-dependent (retention 0.37 / 0.30 / 0.22 / 0.12 / 0.00 from 1e12 to 1e14
+# Msun/h) -- it deletes exactly the hosts the occupation reward targets, which
+# is why chunk_hr had to move from 128 to 256. Tile attribution splits every
+# object *fractionally* over the tiles that produced its particles, using
+# Rockstar member ids against our Lagrangian particle-id convention, so nothing
+# is rejected, nothing is mass-selected, and the tile volumes are the nominal
+# ones. Summing tiles reproduces the direct full-box statistics exactly; that
+# identity is the Experiment-0 deliverable and is tested in tests/reward/test_tiles.py.
+tiles:
+  tile_hr: 64                # 512 / nsplit=8: one SR2 forward pass
+  # Rows of the .particles ASCII table read per pandas chunk. 8e6 rows is ~1 GB
+  # resident against a ~7 GB file; raise only if the node has memory to spare.
+  chunk_rows: 8000000
+
+# --- Experiment 1: targeted HR-residual oracle -----------------------------
+oracle_hr:
+  dev_boxes: [set8, set9]
+  # Bins 2 and 3 (1e13, 3.16e13) are where Gate B must be decided. Bin 4 is
+  # evaluation-only and oracle_select_targets.py refuses it explicitly.
+  host_bins: [2, 3]
+  max_targets: 24
+  # ~2.9e10 Msun/h, well above Rockstar's 20-particle floor, so a recovered
+  # object is detectable rather than marginal.
+  min_sub_particles: 50
+  # Mpc/h between selected hosts. All of a box's targets are edited in ONE
+  # field and scored with ONE Rockstar run; that is only sound if the masks
+  # cannot interact.
+  min_separation_mpc_h: 6.0
+  alphas: [0.0, 0.25, 0.5, 1.0]
+  modes: [disp, vel, both]
+  # targeted: smooth mask over the target's own Lagrangian sites.
+  # exact_particles: hard indicator on exactly those sites (dilate=0, smooth=0).
+  # control: equal site count drawn from the same host, excluding the target.
+  kinds: [targeted, control, exact_particles]
+  mask:
+    dilate: 2          # cells; a measure-zero site set is not an intervention
+    smooth: 1.5        # cells; a hard edge would make the low-k constraint
+                       # measure the mask rather than the physics
+  recovery:
+    pos_tol_rvir: 0.5  # fraction of the HOST's Rvir
+    mass_tol_dex: 0.5
+
+geometry:
+  # Lagrangian credit-assignment chunk, in HR cells. 256 cells = 50 Mpc/h,
+  # 2^3 = 8 chunks per box.
+  #
+  # Set from measurement, not from the collapse-sphere argument. The old value
+  # (128 = 25 Mpc/h) was justified by "wide enough to contain the Lagrangian
+  # patch of a 1e14 Msun/h host (13.5 Mpc/h)". That is necessary but nowhere
+  # near sufficient: the surrounding Eulerian neighbourhood also has to be
+  # chunk-pure, and for a cluster it is not, so the purity mask rejected hosts
+  # in proportion to their mass -- exactly the hosts the occupation reward is
+  # about. Measured over all 16 boxes (audit_host_counts.py), hosts per
+  # ensemble and the occupation CI95 relative width:
+  #
+  #   host bin    chunk_hr=128, B=16        chunk_hr=256, B=8
+  #   1e12        190.6  CI 0.19  usable    1285.9  CI 0.073  usable
+  #   3.16e12      56.9  CI 0.31  usable     427.0  CI 0.123  usable
+  #   1e13         13.8  CI 0.50  NO         130.1  CI 0.161  usable
+  #   3.16e13       2.2  CI 1.49  NO          30.0  CI 0.331  usable
+  #   1e14          0.0  empty    NO           4.0  CI 1.02   eval-only
+  #
+  # At 128 neither upper reliable bin cleared the 20-30 effective-host bar, so
+  # Gate B's occupation criterion was not evaluable at all. At 256 all four
+  # reliable bins clear it, 3.16e13 with p10=22 hosts and 0% empty ensembles.
+  # Loosening min_purity is NOT the alternative: 0.8 -> 0.5 buys ~5 points of
+  # retention. Chunk size is the lever.
+  #
+  # The cost, accepted deliberately: leave-one-out credit now covers 1/8 of a
+  # box per chunk instead of 1/64, so replay weighting is much coarser and the
+  # weight-ratio abort in replay.py matters more. A reward whose target bins
+  # are empty is not improved by attributing it precisely.
+  chunk_hr: 256
+  # Eulerian mesh on which chunk ownership is measured (0.78 Mpc/h cells).
+  purity_grid: 128
+  # A halo counts only if every Eulerian cell its Rvir sphere touches is owned
+  # by the same chunk with at least this mass share.
+  min_purity: 0.8
+  radius_mult: 1.0
+  # Halos needing a wider neighbourhood than this (cluster scale) are dropped
+  # rather than mixed across chunks.
+  max_half_width: 4
+
+catalog:
+  # Particle mass is 5.82e8 Msun/h, and rockstar.cfg keeps halos with >= 20
+  # bound particles, so 1.2e10 Msun/h is the resolution floor. The lowest bin
+  # starts just above it.
+  sub_mass_bins:
+    log10_min: 10.1
+    log10_max: 13.1
+    n_bins: 6
+  host_mass_bins:
+    log10_min: 12.0
+    log10_max: 14.5
+    n_bins: 5
+  min_sub_particles: 20      # matches MIN_HALO_OUTPUT_SIZE in rockstar.cfg
+  min_host_particles: 20
+  abundance_transform: log10_floor
+  occupation_transform: log10_floor
+  abundance_floor_halos: 0.1
+  occupation_floor: 0.05
+
+reward:
+  # 8 chunks per box at chunk_hr=256, so B=8 makes one ensemble exactly one
+  # box's worth of chunks -- the independent cosmological unit, and the unit the
+  # box bootstrap already resamples. B=16 here would silently span two boxes.
+  ensemble_size_B: 8
+  num_ensembles_K: 8
+  # lambda = shrinkage * mean(diag(C)); reported with cond(C_reg) in every manifest.
+  shrinkage: 0.1
+  bootstrap_draws: 400
+  bootstrap_seed: 0
+  # Stratify ensembles over box, host-mass class and environment class so no
+  # single massive-host chunk dominates every draw.
+  strata: [box, host_mass_class, environment_class]
+
+  # --- Occupation is the primary target -------------------------------------
+  # <N_sub | M_host> is nearly flat in SR2 (3.97 -> 17.3 where HR goes 4.9 ->
+  # 337.6). Subhalo abundance is the secondary target. R_cat stays the joint
+  # 11-d score, but R_occ and R_abund are always reported alongside it, and
+  # Gate B is decided on occupation.
+  occupation:
+    # Host bins, by index into host_mass_bins:
+    #   0: 1e12   1: 3.16e12   2: 1e13   3: 3.16e13   4: 1e14
+    # Bin 4 is CONFIRMED evaluation-only, over all 16 boxes:
+    #   - only ~0.1 hosts survive attribution per box, empty in 98.7% of B=16
+    #     ensembles (audit_host_counts.py);
+    #   - including it puts 96.3% of the frozen baseline's Mahalanobis distance
+    #     into that one empty bin, and flips one abundance bin negative through
+    #     the off-diagonals (audit_reward_covariance.py -> "fail").
+    # Dropping it gives cond(C_reg)=89.9, max single-bin share 0.47, no negative
+    # bins, LOBO reward-rank Spearman 0.983. Do not put it back.
+    #
+    # Bins 0-3 all clear the effective-host bar at chunk_hr=256 (1286, 427, 130
+    # and 30 hosts per B=8 ensemble, no empty ensembles). They did not at 128 --
+    # see the geometry note above for why that value changed.
+    reliable_host_bins: [0, 1, 2, 3]
+    upper_reliable_host_bins: [2, 3]
+    sparse_host_bins: [4]
+    include_sparse_in_reward: false
+    # Gate B: improvement in at least this many reliable bins, of which at
+    # least this many must be upper-reliable (1e13 or 3.16e13).
+    min_improved_reliable_bins: 2
+    min_improved_upper_bins: 1
+
+constraints:
+  calibrated: false
+  # ||A(Psi_hat) - A(Psi_base)|| / ||A(Psi_base)||. The frozen baseline already
+  # gets LR-visible scales right; this bounds how far the residual may move them.
+  low_k_change_max: 0.02
+  # mean |T(k) - 1| of displacement against HR. The frozen baseline sits near
+  # 0.35 (T_high ~ 0.65), so a candidate is only allowed to be slightly worse.
+  displacement_power_error_max: 0.40
+  # mean |log(P_delta_hat / P_delta_hr)|. Baseline density power is already good
+  # (ratio_high ~ 0.99), so the budget here is tight.
+  density_power_error_max: 0.05
+  # ||A(Psi_hat) - y_lr|| / ||y_lr||; the baseline's own value is not zero.
+  lr_consistency_error_max: 0.05
+  # Residual sample spread / residual RMS. A floor: collapse is a failure.
+  diversity_min: 0.05
+
+replay:
+  elite_quantile: 0.2
+  require_positive_marginal: true
+  tau: 1.0
+  a_max: 5.0
+  w_max: 10.0
+  weight_normalize: mean
+
+rockstar:
+  binary: external/rockstar/rockstar
+  config: configs/sr2_baseline/rockstar.cfg

@@ -1,0 +1,21 @@
+# LR condition-encoder pretraining (Stage B prerequisite).
+# Trains on paired-train LR + all 350 LR-only boxes. Val/test boxes are excluded
+# by resolve_split(), which RAISES if lr_only_glob matches a held-out box.
+base: _base.yaml
+data:
+  crop_lr: 16          # larger crops than the flow uses; SSL is cheap
+ssl:
+  block_size: 2
+  mask_ratio: 0.5
+  channel_mask_p: 0.15
+  translate: true
+  rotate: true
+  lambda_fourier: 0.1  # weak spectral term
+train:
+  batch_size: 16
+  lr: 2.0e-4
+  steps: 20000
+  log_every: 100
+  save_every: 2000
+wandb: {name: dmsr_lr_ssl, group: dmsr_ssl}
+output: {run_dir: runs/dmsr/lr_ssl}

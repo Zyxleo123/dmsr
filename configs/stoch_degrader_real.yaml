@@ -1,0 +1,97 @@
+# Stochastic degrader: conditional flow matching for p(x_R | x_2R).
+#
+# The reformulation. The deterministic degrader can only fit E[x_R | x_2R], and
+# on genuinely independent paired N-body runs that conditional mean is nearly A
+# itself: the optimal linear shift-invariant filter beats plain avg-pool by 0.4%,
+# a ridge fit on block mean + sub-cell dispersion + local density gains 0.6%
+# (R^2 ~ 0.005), and the trained CNN gains ~10%. The rest is not model error --
+# it is conditional variance, because the LR run's small-scale velocities have
+# chaotically decorrelated from the HR run's (cross-correlation r(k) falls to
+# ~0.70 by 45% of Nyquist and ~0.31 near Nyquist).
+#
+# Fitting the mean of a distribution you cannot predict is a power-destroying
+# operation: std(A_vel) ~ 0.79-0.84 against std(x_LR_vel) ~ 0.97-1.01, and MSE
+# only smooths further. So model the distribution and *sample* from it.
+#
+# WATCH: val/stoch/pk_ratio_vel_b* (sampled velocity power / true power, per
+# k-band). Target 1.0. Compare against val/stoch/pk_ratio_A_vel_b*, which is the
+# avg-pool baseline and drops well below 1 at high k -- closing that gap is the
+# entire point of this run.
+#
+# DO NOT read val/stoch/mse_sample as a regression: a single sample pays the
+# conditional variance twice, so ~2x the conditional-mean MSE is *correct* for a
+# calibrated sampler. val/stoch/mse_mean_K (the K-sample mean) is the number
+# that should match the deterministic degrader's MSE, proving nothing was lost.
+factor: 8
+
+data:
+  mode: real_pair
+  paired_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set1[0-3].npy"
+  paired_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set1[0-3].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set14.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set14.npy"
+  test_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  test_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  lr_grid_res: 64
+  mmap: true
+  augment: true
+  val_stride: 16
+  # Sampling costs ~2*ode_steps forward passes per crop, so cap the val grid.
+  val_max_crops: 32
+
+model:
+  channels: 6
+  # Wider/deeper than the deterministic degrader: this one has a real function
+  # to learn (a score/velocity field over the residual distribution), not a ~10%
+  # correction to A, so capacity should actually matter here. That is itself the
+  # test -- if THIS is still flat across model sizes, something else is wrong.
+  width: 64
+  depth: 4
+  use_res_embed: true
+  embed_dim: 64
+
+train:
+  batch_size: 4
+  accum_steps: 8      # effective batch 32
+  lr: 2.0e-4
+  warmup: 500
+  min_lr_frac: 0.05
+  grad_clip: 1.0
+  steps: 40000
+  seed: 0
+  # Parallel cropping. A 128^3 HR crop is a ~25 MB strided gather out of a
+  # 512^3 box (~45 ms), and one optimizer step needs batch_size*accum_steps of
+  # them -- with num_workers 0 that ran serially against the GPU. Boxes are
+  # warmed in the parent before the fork, so workers share them copy-on-write
+  # and RAM does NOT multiply by num_workers. Keep <= --cpus-per-task (8).
+  num_workers: 6
+  log_every: 50
+  save_every: 2000
+  eval_every: 500     # cheap: flow loss only
+  sample_every: 2000  # expensive: ODE sampling + power spectra
+  amp: true
+
+eval:
+  ode_steps: 20       # midpoint solver -> 40 NFE per sample
+  mean_samples: 8     # K for the conditional-mean check
+  n_bands: 6
+  # Eulerian density diagnostic on the displacement channels -- the metric that
+  # actually says whether the degradation is "true". A(disp_HR) over-clumps:
+  # sigma_delta 5.26 vs the true LR field's 4.67, P_A/P_true -> 1.61 at Nyquist.
+  density: true
+  boxsize: 100000.0   # kpc/h
+  dis_norm: 6000.0    # kpc/h per normalized unit
+
+wandb:
+  mode: online
+  project: cosmo_learn_degradation
+  name: stoch_degrader_real_w64_d4_fm
+  group: stochastic
+
+output:
+  run_dir: runs/stoch_degrader_real_w64_d4_fm

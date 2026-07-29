@@ -1,0 +1,68 @@
+# Learned degrader trained on GENUINELY INDEPENDENT paired HR/LR N-body runs
+# (separate simulations at Ng=512 and Ng=64, same cosmology/ICs, related to
+# each other only physically -- not by avg_pool3d). This is the real
+# degradation-learning counterpart to configs/learned_degrader.yaml, which
+# instead derives its "LR" targets from the HR field via avg_pool3d and so
+# trivially converges to the analytic A_R baseline (see that file's docstring).
+#
+# D_phi(x_hr, R) = A_R(x_hr) + Delta_phi(x_hr, R), factor=8 (Ng 512 -> 64).
+#
+# Uses 14 train boxes (set0-set13) plus random flip/permutation augmentation --
+# with only set0-set2 (3 boxes) and no augmentation, train loss kept dropping
+# while val/degrader/mse rose after ~step 7k (classic overfitting to a handful
+# of large-scale-structure phases). set14 is held out for val, set15 for test
+# (the run this config was originally launched with used set14 as train and
+# set15 as val -- ckpt_best.pt under runs/..._allboxes_aug/ predates this fix).
+factor: 8
+
+data:
+  mode: real_pair
+  paired_lr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set1[0-3].npy"
+  paired_hr_glob:
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-9].npy"
+    - "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set1[0-3].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set14.npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set14.npy"
+  # Held out for final evaluation only -- train_degrader.py does not read
+  # these; wire them into an eval/test script instead of touching them here.
+  test_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set15.npy"
+  test_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_lr: 16
+  lr_grid_res: 64
+  mmap: true
+  augment: true
+
+model:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+
+loss:
+  lambda_delta: 1.0e-3
+
+train:
+  batch_size: 1
+  lr: 5.0e-5
+  steps: 20000
+  seed: 0
+  log_every: 50
+  save_every: 2000
+  eval_every: 500
+  amp: true
+  # Stop if val/degrader/mse hasn't improved for this many eval windows
+  # (eval_every * this many steps); 0 disables. Also saves ckpt_best.pt on
+  # every val improvement instead of only ever keeping ckpt_last.pt.
+  early_stop_patience: 20
+
+wandb:
+  mode: online
+  project: cosmo_learn_degradation
+  name: degrader_real_512to64_w32_d2_resembed_lr1e-4_s20k_allboxes_aug
+  group: null
+
+output:
+  run_dir: runs/degrader_real_512to64_w32_d2_resembed_lr1e-4_s20k_allboxes_aug

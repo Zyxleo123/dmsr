@@ -2,3 +2,6 @@
 # external/map2map and external/SRS-map2map are symlinks to the local clones.
 map2map      https://github.com/eelregit/map2map     4ebc835f019b16e68060ea05acf0e9fe0a62e6bd
 SRS-map2map  https://github.com/yueyingn/SRS-map2map  77e68576b538f710ade66443b7badc5afe8a6193
+# Rockstar is cloned under external/rockstar (TIPSY I/O stubbed for missing libtirpc).
+# See external/rockstar/BUILD_NOTE.txt for the exact build commit + flags.
+rockstar     https://github.com/yt-project/rockstar  (see external/rockstar/BUILD_NOTE.txt)

@@ -1,0 +1,18 @@
+# SR2-MATCH ARM 2/4 -- DROP P_A, ORIGINAL lambda (weight control). Identical to
+# arm 1 (t13_unc_fulldisp_l03) EXCEPT lambda_adv stays at the t13_unconstrained
+# value 0.003. Isolates whether the full-displacement critic needs the raised
+# weight to matter, or whether seeing the coarse signal is enough on its own.
+base: t13_unconstrained.yaml
+critic:
+  residual_mode: full
+  density_mode: highpass
+  global_pool: false
+adv:
+  lambda_adv: 0.0030         # <-- same as baseline; only the critic INPUT changed vs t13_unconstrained
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_l003, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_l003_s0}

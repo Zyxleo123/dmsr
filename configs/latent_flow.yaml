@@ -1,0 +1,85 @@
+# Latent conditional flow with CFG (stage 3). Frozen AE + frozen learned degrader.
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128
+  n_levels: 4
+  full_res: 512
+  mmap: true
+
+# Frozen residual autoencoder (architecture must match its training config).
+ae:
+  channels: 6
+  width: 32
+  ch_mults: [1, 2, 2]
+  latent_channels: 16
+  n_res: 1
+ae_checkpoint: runs/residual_ae/ckpt_last.pt
+
+# Frozen learned degrader (auxiliary consistency only).
+degrader:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+degrader_checkpoint: runs/learned_degrader/ckpt_last.pt
+
+model:
+  latent_channels: 16
+  cond_channels: 6
+  width: 64
+  depth: 4
+  embed_dim: 128
+  cond_mode: trilinear
+  grad_checkpoint: true
+
+base_upscaler:
+  kind: identity
+
+loss:
+  n_bands: 8
+  p_uncond: 0.1
+  lambda_clean: 0.1
+  lambda_D: 0.01
+  lambda_x: 0.1
+  lambda_band: 0.1
+  lambda_A: 0.0
+  band_ema: 0.9
+  eval_sample_steps: 10
+  eval_cfg_scale: 1.0
+  lr_sample_steps: 4
+  # LR-only band regularization (disabled by default; see plus_lronly config)
+  lambda_lr_band: 0.0
+  lambda_lr_deg: 0.0
+
+# Optional hooks (disabled by default; not implemented for the first pass).
+dps_guidance:
+  enabled: false
+  gamma: 0.0
+hr_critic:
+  enabled: false
+lr_discriminator:
+  enabled: false
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 40000
+  seed: 0
+  log_every: 50
+  save_every: 2000
+  eval_every: 500
+  amp: true
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  name: latent_flow
+  group: null
+
+output:
+  run_dir: runs/latent_flow

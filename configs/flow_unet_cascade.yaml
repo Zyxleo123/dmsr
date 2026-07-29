@@ -1,0 +1,95 @@
+# Scale-shared stochastic null-space residual flow (64 -> 512 cascade) with a
+# map2map-style 3D U-Net velocity backbone (modernised: GroupNorm, SiLU,
+# residual blocks, FiLM, same padding, zero-init tail, checkpointing).
+# Same data/loss/train setup as configs/flow_cascade.yaml; only `model` differs.
+# Run with: python -m cosmo_sr.train.train_flow --config configs/flow_unet_cascade.yaml
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128          # crop at 512-res; pyramid -> 128/64/32/16 per level
+  n_levels: 4
+  full_res: 512
+  mmap: true
+  # Multi-octave LR-only sources. `crop` is the native-grid crop; `pool` average-
+  # pools it by that factor so the field lands on grid `res`. Sizes are chosen so
+  # the generated residual (grid 2*res) matches the paired residual crop size.
+  lr_only:
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims/set*/catnorm.npy"       # Ng=64
+      res: 64
+      crop: 16          # grid64 size16 -> residual grid128 size32
+      pool: 1
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims_256/set*/catnorm.npy"   # Ng=256
+      res: 128
+      crop: 64          # grid256 size64 -> pool2 -> grid128 size32 -> residual size64
+      pool: 2
+    - glob: "/zfsauton/scratch/yixiz/DMSR/lr_sims_256/set*/catnorm.npy"   # Ng=256
+      res: 256
+      crop: 64          # grid256 size64 -> residual grid512 size128
+      pool: 1
+
+model:
+  name: UNetResidualFlowModel
+  channels: 6
+  width: 64
+  num_levels: 2         # downsample stages; crops must be divisible by 2**num_levels
+  blocks_per_level: 1
+  embed_dim: 128
+  context_channels: 0
+
+  # Not exact map2map because flow training needs same-size output.
+  map2map_compat: false
+  padding: same
+
+  # Modern but safe defaults for the real flow run.
+  norm: group
+  num_groups: 8
+  activation: silu
+  use_resblocks: true
+  use_film: true        # condition on flow time t and octave R
+  use_attention: false
+  zero_init_tail: true  # velocity field starts near zero -> stable early training
+  use_checkpoint: true  # checkpoint conv stages (big memory win, ~30% slower)
+
+  # To recover a plain map2map-style U-Net instead (compat/ablation only --
+  # valid padding shrinks the output, so it cannot train the flow):
+  # model:
+  #   name: UNetResidualFlowModel
+  #   map2map_compat: true    # forces: padding=valid, norm=batch,
+  #                           # activation=leaky_relu, use_resblocks=false,
+  #                           # use_film=false, use_attention=false,
+  #                           # zero_init_tail=false, use_checkpoint=false
+
+base_upscaler:
+  kind: identity        # "identity" (U_R) or "backbone"/"sr2" (learned SR2)
+  # width: 32           # used when kind == backbone
+  # depth: 2
+
+loss:
+  n_bands: 8
+  lambda_deg: 1.0
+  lambda_band: 1.0
+  band_ema: 0.9
+  lr_sample_steps: 4    # Euler steps for LR-only residual sampling (grad)
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 40000
+  seed: 0
+  log_every: 50
+  save_every: 2000
+  eval_every: 500       # run validation (per-octave FM/consistency/high-k) every N steps
+  amp: true             # fp16 autocast + GradScaler; ~halves memory. Set false
+                        # to debug numerics in fp32.
+
+wandb:
+  mode: online          # online | offline | disabled (uses WANDB_API_KEY from ~/.bashrc)
+  project: cosmo_sr
+  name: flow_unet_cascade
+  group: null
+
+output:
+  run_dir: runs/flow_unet_cascade

@@ -1,0 +1,10 @@
+# STAGE B -- Stage A + LR-pretrained condition encoder. Everything else matched.
+base: _base.yaml
+stage: b
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder.pt
+  encoder_lr_scale: 0.1     # pretrained encoder trains 10x slower than new layers
+  freeze_encoder: false
+wandb: {name: dmsr_stage_b, group: dmsr_stages}
+output: {run_dir: runs/dmsr/stage_b}

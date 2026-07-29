@@ -1,0 +1,15 @@
+# EXPERIMENT 3/3 -- "flow with no A / A_plus at all".
+# Stochastic rectified-flow generator (stage a, NO critic) with the operator
+# removed ENTIRELY: no A_plus(y) base, no null-space projection. The flow regresses
+# the FULL HR field from full-space noise, conditioned on y through the encoder
+# only: x_hat = r (the integrated endpoint), target r_target = x_hr. Contrast the
+# nullspace arm (x_hat = A_plus(y) + P_A(r)) and the unconstrained arm
+# (x_hat = A_plus(y) + r). A(x_hat)-y is logged as soft_consistency_rms only.
+# From scratch (random encoder), 13-box split, 40k steps -- mirrors t13_nullspace
+# with model.a_free added.
+base: _base_train13.yaml
+stage: a
+model: {condition_encoder_init: random, a_free: true}
+train: {steps: 40000, seed: 0}
+wandb: {name: dmsr_t13_flow_afree, group: dmsr_train13_afree}
+output: {run_dir: runs/dmsr/t13_flow_afree_s0}

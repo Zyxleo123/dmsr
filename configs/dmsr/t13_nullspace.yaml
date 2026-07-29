@@ -1,0 +1,10 @@
+# ARM 1/4 -- NULLSPACE. Pure paired stochastic null-space flow, NO critic
+# (= Stage A). Trains from scratch (random condition encoder), so it needs no
+# warm-start and can launch immediately in phase 1. Identical to
+# stage_a_paired_flow.yaml except the 13-box train split.
+base: _base_train13.yaml
+stage: a
+model: {condition_encoder_init: random}
+train: {steps: 40000, seed: 0}
+wandb: {name: dmsr_t13_nullspace, group: dmsr_train13}
+output: {run_dir: runs/dmsr/t13_nullspace_s0}

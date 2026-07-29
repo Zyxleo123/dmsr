@@ -1,0 +1,19 @@
+# SR2-MATCH ARM 4/4 -- DROP P_A + ENRICHED density channel. Arm 1 with the density
+# channel switched from the high-pass band to the FULL Eulerian overdensity delta
+# (density_mode: full), so the critic sees density at every scale, not only the
+# unresolved band. Honors the colleague's finding that density in the critic helps
+# by giving it MORE density, and stays a config option. Local PatchGAN, raised lambda.
+base: t13_unconstrained.yaml
+critic:
+  residual_mode: full
+  density_mode: full         # <-- full delta instead of the high-pass band
+  global_pool: false
+adv:
+  lambda_adv: 0.030
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_denfull_l03, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_denfull_l03_s0}

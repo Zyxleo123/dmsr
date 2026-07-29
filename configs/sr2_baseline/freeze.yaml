@@ -1,0 +1,75 @@
+# Frozen SR2 (SRS-map2map) baseline — Stages 0–2 of the subhalo study.
+# Do not edit silently. Bump freeze_version and re-run the freeze script if anything changes.
+freeze_version: "sr2_baseline_v1"
+redshift: 0.0
+note: "z=2 deferred until matched catnorm pairs exist; G_z2.pt is recorded but unused."
+
+model:
+  path: external/SRS-map2map/SRmodel/G_z0.pt
+  path_z2_unused: external/SRS-map2map/SRmodel/G_z2.pt
+  scale_factor: 8
+  in_chan: 6
+  out_chan: 6
+
+externals:
+  map2map_commit: 4ebc835f019b16e68060ea05acf0e9fe0a62e6bd
+  srs_map2map_commit: 77e68576b538f710ade66443b7badc5afe8a6193
+  rockstar_repo: external/rockstar
+
+data:
+  root: /zfsauton/scratch/yixiz/DMSR/paired_catnorm
+  lr_glob: "lr/set*.npy"
+  hr_glob: "hr/set*.npy"
+  shape_lr: [6, 64, 64, 64]
+  shape_hr: [6, 512, 512, 512]
+  channels: "disp[0:3] + vel[3:6], catnorm"
+  source_snapshots: /zfsauton/scratch/yixiz/DMSR/int_redshift_same_cosmology/dmo-{64,512}/set*/PART_009
+  preprocess: "scripts/preprocess_paired.py --redshift 0.0"
+  # Growth norms use Om=0.31 (SRS default). At z=0, D=1 so dis_norm=6000.
+  dis_norm_kpc_h: 6000.0
+  om_norm: 0.31
+
+cosmology_sim:
+  # WMAP9 from SRS-map2map/scripts/LR-sim/paramfile.genic
+  boxsize_kpc_h: 100000.0
+  boxsize_mpc_h: 100.0
+  Omega0: 0.2814
+  OmegaLambda: 0.7186
+  OmegaBaryon: 0.0464
+  HubbleParam: 0.697
+
+split:
+  # Box-level; SR2 was pretrained elsewhere so all 16 boxes are held-out for SR2.
+  train_boxes: [set0, set1, set2, set3, set4, set5, set6, set7]
+  val_boxes: [set8, set9, set10, set11]
+  test_boxes: [set12, set13, set14, set15]
+  field_table_boxes: [set12, set13, set14, set15]
+
+inference:
+  nsplit: 8
+  pad: 3
+  noise_mode: per_tile
+  # Nested TTS seeds: N in {1,2,4,8,16,32} uses seeds 0 .. N-1
+  seed_list: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+              16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+  field_table_seed: 0
+
+rockstar:
+  binary: external/rockstar/rockstar
+  config: configs/sr2_baseline/rockstar.cfg
+  file_format: GADGET2
+  min_halo_output_size: 20
+  periodic: true
+  # Upstream Rockstar forces PERIODIC=0 when PARALLEL_IO=0; we patch
+  # external/rockstar/config.c::setup_config so this flag is honored.
+  # Particle mass for 512^3 equal-mass tracers in a 100 Mpc/h box (Msun/h):
+  # Omega0 * 2.77536627e11 * Box^3 / N_part
+  particle_mass_msun_h: 581881454.87
+  force_res_mpc_h: 0.005   # ~2.5 HR cells; documented, not tuned per experiment
+  full_particle_chunks: 0  # keep off unless dumps are on scratch
+
+reproduce:
+  field_table_command: >
+    python scripts/sr2/reproduce_field_table.py
+    --freeze configs/sr2_baseline/freeze.yaml
+    --out runs/sr2_baseline/field_table

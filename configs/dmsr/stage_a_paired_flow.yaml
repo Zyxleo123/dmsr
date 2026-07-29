@@ -1,0 +1,6 @@
+# STAGE A -- paired stochastic null-space flow. The central supervised baseline.
+base: _base.yaml
+stage: a
+model: {condition_encoder_init: random}
+wandb: {name: dmsr_stage_a, group: dmsr_stages}
+output: {run_dir: runs/dmsr/stage_a}

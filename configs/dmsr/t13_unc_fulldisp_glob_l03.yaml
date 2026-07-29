@@ -1,0 +1,19 @@
+# SR2-MATCH ARM 3/4 -- DROP P_A + GLOBAL discriminator. Arm 1 plus global_pool:
+# the critic collapses its patch grid to a single score per volume (SR2's D is
+# global; ours is a local PatchGAN by default, a choice made for 3 paired boxes --
+# now 13). Tests whether large-scale/whole-field policing, not just the coarse
+# residual, is what SR2 buys. Density channel KEPT.
+base: t13_unconstrained.yaml
+critic:
+  residual_mode: full
+  density_mode: highpass
+  global_pool: true          # <-- global single-score discriminator (SR2-style)
+adv:
+  lambda_adv: 0.030
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_glob_l03, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_glob_l03_s0}

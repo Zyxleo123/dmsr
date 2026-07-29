@@ -48,6 +48,8 @@ from ..losses.flow import (
     degrade_consistency_loss,
     flow_matching_loss,
 )
+from ..models.flow_unet import UNetResidualFlowModel
+from ..models.hblock_flow import HBlockResidualFlowModel
 from ..models.residual_flow import ResidualFlowModel
 from ..models.unet_baseline import SimpleSRGenerator
 from ..operators.base_upscaler import (
@@ -76,6 +78,63 @@ def _build_base_upscaler(cfg: Dict[str, Any], channels: int, factor: int, device
         )
         return BackboneUpscaler(backbone, factor=factor).to(device)
     raise ValueError(f"Unknown base_upscaler.kind {kind!r} (use 'identity' or 'backbone')")
+
+
+def _build_flow_model(model_cfg: Dict[str, Any], channels: int, factor: int) -> torch.nn.Module:
+    """Construct the velocity network from ``model:`` config (default keeps old configs working)."""
+    name = str(model_cfg.get("name", "ResidualFlowModel"))
+    if name == "ResidualFlowModel":
+        return ResidualFlowModel(
+            channels=channels,
+            width=int(model_cfg.get("width", 64)),
+            depth=int(model_cfg.get("depth", 4)),
+            embed_dim=int(model_cfg.get("embed_dim", 128)),
+            context_channels=int(model_cfg.get("context_channels", 0)),
+            factor=factor,
+            use_checkpoint=bool(model_cfg.get("grad_checkpoint", False)),
+        )
+    if name == "UNetResidualFlowModel":
+        return UNetResidualFlowModel(
+            channels=channels,
+            width=int(model_cfg.get("width", 64)),
+            num_levels=int(model_cfg.get("num_levels", 2)),
+            blocks_per_level=int(model_cfg.get("blocks_per_level", 1)),
+            kernel_size=int(model_cfg.get("kernel_size", 3)),
+            padding=str(model_cfg.get("padding", "same")),
+            norm=str(model_cfg.get("norm", "group")),
+            num_groups=int(model_cfg.get("num_groups", 8)),
+            activation=str(model_cfg.get("activation", "silu")),
+            use_resblocks=bool(model_cfg.get("use_resblocks", False)),
+            use_film=bool(model_cfg.get("use_film", False)),
+            embed_dim=int(model_cfg.get("embed_dim", 128)),
+            use_attention=bool(model_cfg.get("use_attention", False)),
+            attention_heads=int(model_cfg.get("attention_heads", 4)),
+            zero_init_tail=bool(model_cfg.get("zero_init_tail", False)),
+            use_checkpoint=bool(
+                model_cfg.get("use_checkpoint", model_cfg.get("grad_checkpoint", False))
+            ),
+            context_channels=int(model_cfg.get("context_channels", 0)),
+            factor=factor,
+            map2map_compat=bool(model_cfg.get("map2map_compat", False)),
+        )
+    if name == "HBlockResidualFlowModel":
+        return HBlockResidualFlowModel(
+            channels=channels,
+            width=int(model_cfg.get("width", 64)),
+            num_levels=int(model_cfg.get("num_levels", 3)),
+            embed_dim=int(model_cfg.get("embed_dim", 128)),
+            context_channels=int(model_cfg.get("context_channels", 0)),
+            factor=factor,
+            groups=int(model_cfg.get("groups", 8)),
+            zero_init_tail=bool(model_cfg.get("zero_init_tail", True)),
+            use_checkpoint=bool(
+                model_cfg.get("use_checkpoint", model_cfg.get("grad_checkpoint", False))
+            ),
+        )
+    raise ValueError(
+        f"Unknown model.name {name!r} (use 'ResidualFlowModel', 'UNetResidualFlowModel', "
+        "or 'HBlockResidualFlowModel')"
+    )
 
 
 def _resolve_lr_streams(cfg: Dict[str, Any], crop_hr: int, n_levels: int) -> List[Dict[str, Any]]:
@@ -248,15 +307,7 @@ def train(cfg: Dict[str, Any], smoke: bool = False) -> Dict[str, Any]:
 
     ops = MultiScaleOperators(factor=factor).to(device)
     base_upscaler = _build_base_upscaler(cfg, channels, factor, device)
-    model = ResidualFlowModel(
-        channels=channels,
-        width=int(model_cfg.get("width", 64)),
-        depth=int(model_cfg.get("depth", 4)),
-        embed_dim=int(model_cfg.get("embed_dim", 128)),
-        context_channels=int(model_cfg.get("context_channels", 0)),
-        factor=factor,
-        use_checkpoint=bool(model_cfg.get("grad_checkpoint", False)),
-    ).to(device)
+    model = _build_flow_model(model_cfg, channels, factor).to(device)
 
     params = list(model.parameters()) + list(base_upscaler.parameters())
     optimizer = torch.optim.Adam(params, lr=lr)

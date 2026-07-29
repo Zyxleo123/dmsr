@@ -1,0 +1,40 @@
+# POC Experiment 2: learned degrader real-data sanity on the 3 real paired HR boxes.
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128
+  n_levels: 4
+  full_res: 512
+  mmap: true
+
+model:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+
+loss:
+  lambda_delta: 1.0e-3
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 2000
+  seed: 0
+  log_every: 25
+  save_every: 1000
+  eval_every: 250
+  amp: true
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  name: poc_learned_degrader_real3
+  group: latent_poc
+
+output:
+  run_dir: runs/poc_learned_degrader_real3

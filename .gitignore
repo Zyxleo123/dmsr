@@ -9,3 +9,10 @@ eval_out/
 *.npy
 *.npz
 !tests/**/*.npy
+
+# job logs and generated figures/artifacts
+slurm-*.out
+*.png
+docs/figures/
+# vendored external clone (see external/COMMITS.txt)
+external/rockstar/

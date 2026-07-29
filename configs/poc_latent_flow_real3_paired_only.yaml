@@ -1,0 +1,82 @@
+# POC Experiment 3: latent flow overfit on 3 real paired HR boxes (no LR-only branch).
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128
+  n_levels: 4
+  full_res: 512
+  mmap: true
+
+ae:
+  channels: 6
+  width: 48
+  ch_mults: [1, 2, 2]
+  latent_channels: 32
+  n_res: 1
+ae_checkpoint: runs/poc_residual_ae_real3/ckpt_last.pt
+
+degrader:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+degrader_checkpoint: runs/poc_learned_degrader_real3/ckpt_last.pt
+
+model:
+  latent_channels: 32
+  cond_channels: 6
+  width: 64
+  depth: 4
+  embed_dim: 128
+  cond_mode: trilinear
+  grad_checkpoint: true
+
+base_upscaler:
+  kind: identity
+
+loss:
+  n_bands: 8
+  p_uncond: 0.1
+  lambda_clean: 0.1
+  lambda_D: 0.01
+  lambda_x: 0.1
+  lambda_band: 0.1
+  lambda_A: 0.0
+  band_ema: 0.9
+  eval_sample_steps: 20
+  eval_cfg_scale: 1.0
+  cfg_eval_scales: [0.0, 1.0, 2.0]
+  lr_sample_steps: 4
+  lambda_lr_band: 0.0
+  lambda_lr_deg: 0.0
+
+dps_guidance:
+  enabled: false
+  gamma: 0.0
+hr_critic:
+  enabled: false
+lr_discriminator:
+  enabled: false
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 5000
+  seed: 0
+  log_every: 25
+  save_every: 1000
+  eval_every: 250
+  amp: true
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  name: poc_latent_flow_real3_paired_only
+  group: latent_poc
+
+output:
+  run_dir: runs/poc_latent_flow_real3_paired_only

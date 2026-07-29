@@ -1,0 +1,24 @@
+# STAGE C -- Stage B + HR critic, critic fakes from PAIRED LR crops only.
+#
+# This is the control for Stage D. It isolates the value of the critic itself
+# from the value of extra LR simulations. Paired crops are REPEATED so the number
+# of generator and critic updates exactly matches Stage D.
+#
+# Every field below is identical in stage_d_critic_alllr.yaml. The ONLY
+# difference between the two files is `stage: c` vs `stage: d`, which selects the
+# second generator stream's data source. Verified by tests/dmsr/test_stage_parity.py.
+base: _base.yaml
+stage: c
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder.pt
+  init_from: runs/dmsr/stage_b/ckpt_best.pt
+adv:
+  lambda_adv: 0.0030   # re-calibrated; see _base.yaml. MUST stay identical in C and D.
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_stage_c, group: dmsr_cvd}
+output: {run_dir: runs/dmsr/stage_c_s0}

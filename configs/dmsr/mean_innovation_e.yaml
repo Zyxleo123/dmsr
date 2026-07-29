@@ -1,0 +1,32 @@
+# EXPERIMENT E -- mean + innovation. Stage C mechanics with the generator
+# decomposed into a FROZEN deterministic mean (the trained paired_deterministic
+# net) + a stochastic innovation flow that learns the innovation target e_gt.
+#
+# Every field here is IDENTICAL to stage_c_critic_pairedlr.yaml -- same critic,
+# same PAIRED-LR-only second stream (stage: c), same lambda_adv schedule, same
+# steps/seed, same encoder SSL init, same Stage B warm start for the flow. The
+# ONLY differences are the `mean_innovation` block (which swaps the generator for
+# the mean+innovation decomposition) and the diagnostics logging. This keeps the
+# C-vs-E comparison about the decomposition alone.
+base: _base.yaml
+stage: c
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder_frozen.pt   # MUST match Stage C exactly (encoder.pt differs)
+  init_from: runs/dmsr/stage_b/ckpt_best_frozen.pt   # warm-starts the INNOVATION flow
+mean_innovation:
+  enabled: true
+  mean_ckpt: runs/dmsr/paired_deterministic/ckpt_best.pt
+  freeze_mean: true
+  joint_finetune: false
+adv:
+  lambda_adv: 0.0030   # MUST stay identical to Stage C.
+  start_step: 0
+  ramp_steps: 2000
+  n_critic: 1
+  critic_warmup_steps: 200
+diagnostics:
+  fourier_band_every: 1000   # log per-band flow-loss distribution alongside training
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_mean_innovation_e, group: dmsr_cve}
+output: {run_dir: runs/dmsr/mean_innovation_e_s0}

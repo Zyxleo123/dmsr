@@ -1,0 +1,46 @@
+# Residual autoencoder (stage 1 of the latent residual flow extension).
+factor: 2
+resolutions: [64, 128, 256]
+
+data:
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set15.npy"
+  crop_hr: 128
+  n_levels: 4
+  full_res: 512
+  mmap: true
+
+model:
+  channels: 6
+  width: 32
+  ch_mults: [1, 2, 2]
+  latent_channels: 16
+  n_res: 1
+
+base_upscaler:
+  kind: identity
+
+loss:
+  n_bands: 8
+  lambda_r: 1.0
+  lambda_x: 1.0
+  lambda_band: 0.1
+
+train:
+  batch_size: 1
+  lr: 1.0e-4
+  steps: 20000
+  seed: 0
+  log_every: 50
+  save_every: 2000
+  eval_every: 500
+  amp: true
+
+wandb:
+  mode: online
+  project: cosmo_sr
+  name: residual_ae
+  group: null
+
+output:
+  run_dir: runs/residual_ae

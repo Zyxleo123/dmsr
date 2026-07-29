@@ -1,0 +1,10 @@
+# LAMBDA-LADDER ARM -- drop P_A, lambda 0.0010 (below the 0.003 that is currently
+# winning val_density_Tk_error_high). Everything else identical to
+# t13_unc_fulldisp_l003, so lambda_adv is the ONLY difference across the ladder
+# {0, 0.0003, 0.001, 0.003, 0.03}.
+base: t13_unc_fulldisp_l003.yaml
+adv:
+  lambda_adv: 0.0010
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_l001, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_l001_s0}

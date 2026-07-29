@@ -1,0 +1,13 @@
+# EXPERIMENT 1/3 -- "MSE with no A / A_plus at all".
+# Deterministic one-shot regression (stage det) with the operator removed
+# ENTIRELY: no A_plus(y) base, no null-space projection. The net regresses the
+# full HR field directly from y (encoder conditioning only): x_hat = f(y),
+# loss = MSE(f(y), x_hr). A(x_hat)-y is logged as soft_consistency_rms only.
+# From scratch (random encoder), 13-box split, 40k steps -- mirrors
+# t13_paired_deterministic (the projected det baseline) with model.a_free added.
+base: _base_train13.yaml
+stage: det
+model: {a_free: true}
+train: {steps: 40000, seed: 0}
+wandb: {name: dmsr_t13_mse_afree, group: dmsr_train13_afree}
+output: {run_dir: runs/dmsr/t13_mse_afree_s0}

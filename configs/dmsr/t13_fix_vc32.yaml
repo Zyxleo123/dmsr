@@ -1,0 +1,21 @@
+# ARM 1 -- fix the density critic's target.
+#
+# Identical to t13_unc_fulldisp_pshuffle8_l003 except the density channels are
+# built with the bulk-offset valid-center CIC deposit instead of the wrapped one.
+#
+# The wrapped deposit (`% ng` inside the crop) is not an approximation: measured
+# on set14, the density it produces for a 64^3 crop is correlated only r = 0.080
+# with that region's true density, with sigma inflated 2.2x, because only 9.75%
+# of a region's own particles stay inside it (median |Psi| = 36 HR cells).
+# valid_center=32 scores the central Eulerian cube the crop can actually fill,
+# offset by the crop's own bulk displacement -- measured r = 1.0000, rel RMS
+# 0.005 against an exactly-buffered reference.
+#
+# Cost: the critic supervises 32^3 instead of 64^3 of Eulerian volume per crop.
+# See docs/density_collapse_investigation.md (Stage 2 / 2c).
+base: t13_unc_fulldisp_pshuffle8_l003.yaml
+critic:
+  valid_center: 32
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_fix_vc32, group: dmsr_densityfix}
+output: {run_dir: runs/dmsr/t13_fix_vc32_s0}

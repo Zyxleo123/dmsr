@@ -17,14 +17,68 @@ from typing import Any, Dict, Optional
 import yaml
 
 
-def load_config(path: str | os.PathLike) -> Dict[str, Any]:
-    """Load a YAML config into a plain dict."""
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge ``override`` into ``base`` (override wins). Returns a new dict."""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(path: str | os.PathLike, _seen: Optional[set] = None) -> Dict[str, Any]:
+    """Load a YAML config into a plain dict.
+
+    Supports single inheritance via a top-level ``base:`` key holding a path
+    relative to the config's own directory. The parent is loaded first and the
+    child is deep-merged over it, so a stage config need only state what differs
+    from ``_base.yaml`` -- which is what makes "Stage C and D differ in exactly
+    one field" checkable by reading the files.
+    """
+    path = Path(path).resolve()
+    _seen = _seen or set()
+    if path in _seen:
+        raise ValueError(f"circular config inheritance at {path}")
+    _seen.add(path)
+
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
     if cfg is None:
         cfg = {}
     if not isinstance(cfg, dict):
         raise ValueError(f"Config at {path} must be a mapping, got {type(cfg)}")
+
+    base_ref = cfg.pop("base", None)
+    if base_ref:
+        parent = load_config(path.parent / str(base_ref), _seen)
+        cfg = _deep_merge(parent, cfg)
+    return cfg
+
+
+def apply_overrides(cfg: Dict[str, Any], pairs: Optional[list]) -> Dict[str, Any]:
+    """Apply ``dotted.key=value`` overrides in-place (values parsed as YAML).
+
+    Example: ``apply_overrides(cfg, ["train.steps=30", "wandb.mode=offline"])``.
+    Missing intermediate dicts are created. Useful for smoke/debug launches.
+    """
+    if not pairs:
+        return cfg
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError(f"override must be key=value, got {pair!r}")
+        key, raw = pair.split("=", 1)
+        value = yaml.safe_load(raw)
+        node = cfg
+        parts = key.split(".")
+        for p in parts[:-1]:
+            nxt = node.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[p] = nxt
+            node = nxt
+        node[parts[-1]] = value
     return cfg
 
 

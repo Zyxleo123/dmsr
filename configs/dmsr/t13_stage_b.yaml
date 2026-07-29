@@ -1,0 +1,14 @@
+# PREREQUISITE (phase 1) -- Stage B (LR-pretrained condition encoder, fine-tuned)
+# on the 13-box train split. Identical to stage_b_paired_flow_lrssl.yaml except
+# the enlarged split. Its ckpt_best.pt is the warm-start init for the critic /
+# mean-innovation / unconstrained arms, so it must train on the new data first.
+base: _base_train13.yaml
+stage: b
+model:
+  condition_encoder_init: lr_pretrained
+  encoder_ckpt: runs/dmsr/lr_ssl/encoder.pt   # LR-SSL pool is disjoint -> reused as-is
+  encoder_lr_scale: 0.1
+  freeze_encoder: false
+train: {steps: 20000}
+wandb: {name: dmsr_t13_stage_b, group: dmsr_train13}
+output: {run_dir: runs/dmsr/t13_stage_b}

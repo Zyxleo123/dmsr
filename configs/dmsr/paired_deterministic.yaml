@@ -1,0 +1,7 @@
+# Deterministic null-space regression: x_hat = A_plus(y) + P_A(f(y)), MSE loss.
+# Uses the existing supervised trainer; included as the "no stochasticity" control.
+base: _base.yaml
+stage: det
+train: {steps: 40000}
+wandb: {name: dmsr_paired_deterministic, group: dmsr_baseline}
+output: {run_dir: runs/dmsr/paired_deterministic}

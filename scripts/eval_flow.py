@@ -44,8 +44,7 @@ def main():
     from cosmo_sr.utils.config import load_config
     from cosmo_sr.data.field_io import load_field
     from cosmo_sr.operators.multiscale import MultiScaleOperators
-    from cosmo_sr.models.residual_flow import ResidualFlowModel
-    from cosmo_sr.train.train_flow import _build_base_upscaler
+    from cosmo_sr.train.train_flow import _build_base_upscaler, _build_flow_model
     from cosmo_sr.eval.flow_eval import evaluate_cascade, sr2_power_summary
     from cosmo_sr.eval.sr2_stats import equilateral_bispectrum, velocity_statistics
     from cosmo_sr.inference.flow_sample import sample_step
@@ -60,11 +59,7 @@ def main():
     ops = MultiScaleOperators(factor=factor).to(device)
     base_upscaler = _build_base_upscaler(cfg, channels, factor, device)
     mcfg = cfg.get("model", {})
-    model = ResidualFlowModel(
-        channels=channels, width=int(mcfg.get("width", 64)),
-        depth=int(mcfg.get("depth", 4)), embed_dim=int(mcfg.get("embed_dim", 128)),
-        context_channels=int(mcfg.get("context_channels", 0)), factor=factor,
-    ).to(device)
+    model = _build_flow_model(mcfg, channels, factor).to(device)
 
     state = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state["model"])

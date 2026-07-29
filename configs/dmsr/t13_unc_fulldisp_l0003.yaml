@@ -1,0 +1,10 @@
+# LAMBDA-LADDER ARM -- drop P_A, lambda 0.0003 (10x below the current best 0.003).
+# Identical to t13_unc_fulldisp_l003 except lambda_adv. If density keeps improving
+# as lambda falls, the critic is a net NEGATIVE on the unconstrained base and the
+# `off` arm should win outright.
+base: t13_unc_fulldisp_l003.yaml
+adv:
+  lambda_adv: 0.0003
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_l0003, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_l0003_s0}

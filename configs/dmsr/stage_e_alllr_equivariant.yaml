@@ -1,0 +1,11 @@
+# STAGE E -- Stage D + cubic-equivariance regularization (OPTIONAL).
+# Enable only after Stage D is stable AND tests/dmsr/test_cubic.py passes.
+# The main project claim must not depend on this stage.
+base: stage_d_critic_alllr.yaml
+stage: e
+model: {init_from: runs/dmsr/stage_d_s0/ckpt_best.pt}
+equivariance:
+  lambda_eq: 0.1
+  fraction: 0.25
+wandb: {name: dmsr_stage_e, group: dmsr_stages}
+output: {run_dir: runs/dmsr/stage_e_s0}

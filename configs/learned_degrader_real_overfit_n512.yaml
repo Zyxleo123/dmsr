@@ -1,0 +1,47 @@
+# Capacity-ladder rung 4/4 (see learned_degrader_real_overfit.yaml for N=4).
+# Same 3-box pool, same everything else -- only fixed_crops changes. 512
+# crops is still a tiny slice of the ~3*64^3 possible positions per box, but
+# far more than a w32/d2 CNN should need if capacity isn't the bottleneck.
+factor: 8
+
+data:
+  mode: real_pair
+  paired_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  paired_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  val_lr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/lr/set[0-2].npy"
+  val_hr_glob: "/zfsauton/scratch/yixiz/DMSR/paired_catnorm/hr/set[0-2].npy"
+  crop_lr: 16
+  lr_grid_res: 64
+  mmap: true
+  augment: false
+  fixed_crops: 512
+
+model:
+  channels: 6
+  width: 32
+  depth: 2
+  use_res_embed: true
+  embed_dim: 64
+
+loss:
+  lambda_delta: 1.0e-3
+
+train:
+  batch_size: 1
+  lr: 1.0e-3
+  steps: 16000
+  seed: 0
+  log_every: 200
+  save_every: 8000
+  eval_every: 800
+  amp: true
+  early_stop_patience: 0
+
+wandb:
+  mode: online
+  project: cosmo_learn_degradation
+  name: degrader_real_512to64_w32_d2_resembed_overfit512crop
+  group: overfit_ladder
+
+output:
+  run_dir: runs/degrader_real_512to64_w32_d2_resembed_overfit512crop

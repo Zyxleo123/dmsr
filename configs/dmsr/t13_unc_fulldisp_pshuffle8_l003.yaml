@@ -1,0 +1,17 @@
+# SR2-DENSITY ARM -- the actual SR2 density-discriminator input. Identical to the
+# current-best t13_unc_fulldisp_l003 (drop P_A, lambda 0.003) EXCEPT the density
+# channel is switched from the single high-pass band to SR2's own construction:
+# the FULL Eulerian delta on a 2x-finer CIC mesh, inverse-pixel-shuffled to 8
+# channels at field resolution (density_mode: pshuffle8). Critic in_channels
+# 3(disp)+8(density)=11. Isolates whether SR2's richer density view closes the
+# 0.282->0.977 same-ruler density high-k gap on top of the winning l003 config.
+base: t13_unc_fulldisp_l003.yaml
+critic:
+  residual_mode: full
+  density_mode: pshuffle8     # <-- SR2's 8-channel inverse-pixel-shuffle density
+  global_pool: false
+adv:
+  lambda_adv: 0.0030          # matches the l003 optimum from the lambda-ladder
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_unc_fulldisp_pshuffle8_l003, group: dmsr_srsmatch}
+output: {run_dir: runs/dmsr/t13_unc_fulldisp_pshuffle8_l003_s0}
