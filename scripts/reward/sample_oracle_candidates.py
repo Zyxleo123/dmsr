@@ -27,6 +27,7 @@ from _common import (add_common_args, banner, load_reward_config, lr_path,
                      parse_boxes, select_device, split_boxes, write_json)
 
 from cosmo_sr.reward import paths
+from cosmo_sr.reward.base import find_base_field
 from cosmo_sr.reward.diffusion import DiffusionConfig
 from cosmo_sr.reward.model import build_residual_denoiser
 from cosmo_sr.reward.sampling import (TileSpec, measure_receptive_field,
@@ -114,10 +115,10 @@ def main() -> None:
     rows = []
     for box in boxes:
         lr = np.load(lr_path(cfg, box))
-        hits = sorted(paths.SR2_BASE_CACHE().glob(f"{box}_seed{args.base_seed}_*.npy"))
-        if not hits:
+        base_path = find_base_field(box, args.base_seed)
+        if base_path is None:
             raise SystemExit(f"no cached SR2 base for {box}")
-        base = np.load(hits[0], mmap_mode="r")
+        base = np.load(base_path, mmap_mode="r")
         for j in range(k):
             seed = int(args.seed0) + j
             path = fields / f"{box}_resid_seed{seed}.npy"
@@ -151,7 +152,7 @@ def main() -> None:
             rows.append({
                 "box": box, "seed": seed, "residual": str(path),
                 "residual_rms_disp": rms, "seconds": dt, "regenerated": True,
-                "base": str(hits[0]),
+                "base": str(base_path),
                 "x0_clip": float(diff.x0_clip),
                 "clip_fraction_max": clip_max,
                 "clip_fraction_final_step": clip_last,

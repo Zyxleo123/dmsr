@@ -40,7 +40,51 @@ from ..tts.sampling import tile_noise, tile_starts
 from ..tts.srs_noise import ControlledG, load_controlled_generator
 from . import paths
 
-__all__ = ["BaseFieldSpec", "FrozenSR2Base", "ResidualComposer", "compose"]
+__all__ = ["BaseFieldSpec", "FrozenSR2Base", "ResidualComposer", "compose",
+           "find_base_field", "lr_sha"]
+
+# Bump when anything that changes the produced field changes: the freeze
+# convention, the tiling/trim, the noise construction. It is part of the cache
+# key, so an old field cannot be silently reused under new code.
+BASE_FIELD_CODE_VERSION = "1"
+
+
+def lr_sha(lr_field: np.ndarray) -> str:
+    """Short checksum of an LR conditioning field.
+
+    In the cache key because the key's job is to identify *the field that was
+    produced*, and that is a function of the LR input as much as of the weights.
+    Without it, regenerating ``lr/set8.npy`` -- a preprocessing fix, a different
+    degrader -- leaves a stale 3.2 GB base field sitting at exactly the filename
+    the new one would claim, and every downstream residual is computed against
+    a baseline that no longer corresponds to its own conditioning.
+    """
+    a = np.ascontiguousarray(np.asarray(lr_field), dtype=np.float32)
+    return hashlib.blake2b(a.tobytes(), digest_size=8).hexdigest()
+
+
+def find_base_field(box: str, seed: int, root=None, *, pattern: Optional[str] = None):
+    """The one cached base field for ``(box, seed)``; refuse if there are several.
+
+    Every consumer used to ``sorted(glob(...))[0]``, which silently picks the
+    lexicographically first key when two differ -- different weights, different
+    LR field, different code version. Two candidates mean the caller has to say
+    which; picking one is how a run mixes baselines.
+    """
+    root = Path(root) if root else paths.SR2_BASE_CACHE()
+    pat = pattern or f"{box}_seed{int(seed)}_*.npy"
+    hits = sorted(p for p in Path(root).glob(pat) if not p.name.endswith(".tmp.npy"))
+    if not hits:
+        return None
+    if len(hits) > 1:
+        raise RuntimeError(
+            f"{len(hits)} cached base fields for {box} seed {seed} in {root}:\n  "
+            + "\n  ".join(h.name for h in hits)
+            + "\nThey differ in weights, LR field or code version (the hash in "
+              "the filename). Delete the stale ones or name the file explicitly; "
+              "picking the first would mix baselines across candidates."
+        )
+    return hits[0]
 
 
 def compose(
@@ -81,6 +125,10 @@ class BaseFieldSpec:
     pad: int = 3
     noise_mode: str = "per_tile"
     redshift: float = 0.0
+    # Identity of the LR conditioning field and of the code that consumed it.
+    # Both are part of what determines the output, so both are in the key.
+    lr_sha: str = ""
+    code_version: str = BASE_FIELD_CODE_VERSION
 
     def key(self) -> str:
         payload = json.dumps(self.__dict__, sort_keys=True)
@@ -149,17 +197,24 @@ class FrozenSR2Base(nn.Module):
         return h.hexdigest()[:16]
 
     # ------------------------------------------------------------ generation
-    def spec(self, box: str, seed: int) -> BaseFieldSpec:
+    def spec(self, box: str, seed: int, lr_field: Optional[np.ndarray] = None,
+             *, lr_sha_hex: str = "") -> BaseFieldSpec:
+        if not lr_sha_hex and lr_field is not None:
+            lr_sha_hex = lr_sha(lr_field)
         return BaseFieldSpec(
             box=str(box), seed=int(seed), model_sha=self.model_sha(),
             scale_factor=self.scale_factor, nsplit=self.nsplit, pad=self.pad,
             noise_mode=self.noise_mode, redshift=self.redshift,
+            lr_sha=str(lr_sha_hex),
         )
 
-    def cache_path(self, box: str, seed: int) -> Path:
+    def cache_path(self, box: str, seed: int, lr_field: Optional[np.ndarray] = None,
+                   *, lr_sha_hex: str = "") -> Path:
         root = self.cache_dir or paths.SR2_BASE_CACHE(create=True)
         Path(root).mkdir(parents=True, exist_ok=True)
-        return Path(root) / self.spec(box, seed).filename()
+        return Path(root) / self.spec(
+            box, seed, lr_field, lr_sha_hex=lr_sha_hex
+        ).filename()
 
     @torch.no_grad()
     def base_region(
@@ -207,15 +262,21 @@ class FrozenSR2Base(nn.Module):
         use_cache: bool = True,
         mmap: bool = True,
         progress: bool = False,
+        overwrite: bool = False,
     ) -> np.ndarray:
         """The full-box frozen SR2 field, cached on scratch.
 
         Deterministic in ``(lr_field, seed)``: identical inputs always return an
         identical array, cached or not.
+
+        ``overwrite`` regenerates even when the cache hits. It has to be handled
+        *here*: a caller that only refused to skip the call still landed on the
+        ``path.is_file()`` return below and got the stale field back, so
+        ``--overwrite`` was a no-op wherever it was passed.
         """
         self.assert_frozen()
-        path = self.cache_path(box, seed) if (use_cache and box) else None
-        if path is not None and path.is_file():
+        path = self.cache_path(box, seed, lr_field) if (use_cache and box) else None
+        if path is not None and path.is_file() and not overwrite:
             return np.load(path, mmap_mode="r" if mmap else None)
 
         from ..tts.sampling import super_resolve_srs_seeded
@@ -230,7 +291,8 @@ class FrozenSR2Base(nn.Module):
             np.save(tmp, field)
             os.replace(tmp, path)
             meta = path.with_suffix(".json")
-            meta.write_text(json.dumps(self.spec(box, seed).__dict__, indent=2))
+            meta.write_text(json.dumps(
+                self.spec(box, seed, lr_field).__dict__, indent=2))
             if mmap:
                 return np.load(path, mmap_mode="r")
         return field
@@ -309,13 +371,21 @@ class ResidualComposer(nn.Module):
 
 
 @torch.no_grad()
-def _ddim_from_noise(model, u: torch.Tensor, cfg, cond: dict, seed: int) -> torch.Tensor:
-    """DDIM starting from a caller-supplied noise tensor (device-independent seed)."""
+def _ddim_from_noise(model, u: torch.Tensor, cfg, cond: dict, seed: int,
+                     stats: Optional[dict] = None) -> torch.Tensor:
+    """DDIM starting from a caller-supplied noise tensor (device-independent seed).
+
+    ``stats``, if given, collects the ``x0_clip`` hit fraction per step. Gate A
+    criterion 5 is "the clip, not the model, must not be what sets the
+    amplitude", and that is unanswerable unless the fraction is recorded while
+    sampling.
+    """
     from ..models.operator_denoiser import CosineSchedule
 
     sched = CosineSchedule()
     ts = torch.linspace(cfg.t_max, cfg.t_min, int(cfg.n_steps) + 1, device=u.device)
     gen = torch.Generator(device="cpu").manual_seed(int(seed) + 1)
+    clipped: list = []
     for i in range(int(cfg.n_steps)):
         t_cur = ts[i].expand(u.shape[0])
         t_nxt = ts[i + 1].expand(u.shape[0])
@@ -324,6 +394,8 @@ def _ddim_from_noise(model, u: torch.Tensor, cfg, cond: dict, seed: int) -> torc
         eps_hat = model(u, t_cur, **cond)
         u0_hat = (u - s_c * eps_hat) / a_c.clamp_min(1e-8)
         if getattr(cfg, "x0_clip", 0.0) > 0:
+            if stats is not None:
+                clipped.append(float((u0_hat.abs() >= cfg.x0_clip).float().mean()))
             u0_hat = u0_hat.clamp(-cfg.x0_clip, cfg.x0_clip)
         if cfg.churn <= 0.0:
             u = a_n * u0_hat + s_n * eps_hat
@@ -331,4 +403,8 @@ def _ddim_from_noise(model, u: torch.Tensor, cfg, cond: dict, seed: int) -> torc
             keep = (max(0.0, 1.0 - cfg.churn ** 2)) ** 0.5
             fresh = torch.randn(u.shape, generator=gen, dtype=torch.float32).to(u.device)
             u = a_n * u0_hat + s_n * (keep * eps_hat + cfg.churn * fresh)
+    if stats is not None:
+        stats["x0_clip_fraction_per_step"] = clipped
+        stats["x0_clip_fraction_max"] = max(clipped) if clipped else 0.0
+        stats["x0_clip_fraction_last"] = clipped[-1] if clipped else 0.0
     return u

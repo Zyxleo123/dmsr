@@ -60,8 +60,14 @@ def main() -> None:
     if not ensembles:
         raise SystemExit(f"{man} is empty")
 
-    # Flatten to one row per (ensemble, chunk).
+    # Flatten to one row per (ensemble, chunk). Selection and credit both use
+    # the score oracle_report.py decided on (occupation by default), not the
+    # joint R_cat: weighting elites by a statistic that was not selected for is
+    # how a distilled model ends up chasing abundance while occupation stays
+    # exactly as flat as the frozen baseline left it.
     rows = []
+    scores = {e.get("selection_score", "R_cat") for e in ensembles}
+    banner(f"credit/selection score: {sorted(scores)}")
     for e in ensembles:
         for cid_s, a in (e.get("marginal_contributions") or {}).items():
             rows.append({
@@ -70,8 +76,11 @@ def main() -> None:
                 "seed": e["seed"],
                 "residual_path": e.get("residual_path"),
                 "base_field": e.get("base_field"),
+                "base_seed": int(e.get("base_seed", cfg.get("data", {}).get("base_seed", 0))),
                 "residual_scale": float(e.get("residual_scale", 1.0)),
-                "ensemble_reward": float(e["catalog_reward"]),
+                "ensemble_reward": float(
+                    e.get("selection_reward", e["catalog_reward"])),
+                "selection_score": str(e.get("selection_score", "R_cat")),
                 "marginal_contribution": float(a),
                 "feasible": bool(e.get("feasible", False)),
                 "constraint_values": e.get("constraint_values", {}),
@@ -137,7 +146,11 @@ def main() -> None:
             residual_path=str(rp),
             residual_sha256=sha,
             lr_id=r["box"], base_id=str(r.get("base_field") or ""),
-            base_seed=0, residual_seed=int(r["seed"]),
+            # The seed that actually produced the cached base field this elite
+            # was composed against, not a literal 0. Training resolves the base
+            # from base_id/base_seed, so a run at base_seed != 0 used to train
+            # against the seed-0 field while claiming to be the elite's.
+            base_seed=int(r["base_seed"]), residual_seed=int(r["seed"]),
             residual_scale=float(r["residual_scale"]),
             ensemble_reward=float(r["ensemble_reward"]),
             marginal_contribution=float(r["marginal_contribution"]),

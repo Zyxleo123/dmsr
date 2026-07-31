@@ -27,6 +27,7 @@ from torch.utils.data import Dataset
 from ..data.crops import periodic_crop
 from ..data.field_io import load_field
 from . import paths
+from .geometry import ChunkGrid
 
 __all__ = [
     "PairedResidualCrops",
@@ -72,18 +73,26 @@ def resolve_boxes(
     base_seed: int = 0,
     base_pattern: str = "{box}_seed{seed}_*.npy",
 ) -> List[BoxPaths]:
-    """Locate LR/HR/base files for named boxes; base is optional."""
+    """Locate LR/HR/base files for named boxes; base is optional.
+
+    Resolution goes through :func:`~cosmo_sr.reward.base.find_base_field`, which
+    raises when more than one cached field matches instead of taking the first.
+    Two matches mean the weights, the LR field or the code version changed, and
+    silently picking one mixes baselines across boxes in the same run.
+    """
+    from .base import find_base_field
+
     root = Path(data_root)
     base_root = Path(base_dir) if base_dir else paths.SR2_BASE_CACHE()
     out: List[BoxPaths] = []
     for b in boxes:
-        hits = sorted(Path(base_root).glob(base_pattern.format(box=b, seed=base_seed)))
         out.append(
             BoxPaths(
                 box=b,
                 lr=root / "lr" / f"{b}.npy",
                 hr=root / "hr" / f"{b}.npy",
-                base=hits[0] if hits else None,
+                base=find_base_field(b, base_seed, base_root, pattern=base_pattern.format(
+                    box=b, seed=base_seed)),
                 seed=int(base_seed),
             )
         )
@@ -172,6 +181,31 @@ class PairedResidualCrops(Dataset):
     ``scale_factor``) so the LR conditioning window covers exactly the same
     region -- otherwise ``U(y_lr)`` and ``Psi_base`` would be offset by a
     sub-LR-cell shift that the model would have to undo.
+
+    ``host_chunks`` restricts sampling to crops inside the given ``(box,
+    chunk_id)`` cubes instead of the whole box. That is deliberate overfitting,
+    for the rung-3 question of whether reward can be raised on a handful of
+    fixed massive hosts at all; a model trained this way does not generalise and
+    must not be evaluated as if it did.
+
+    Context and the valid core
+    --------------------------
+    ``context_margin`` widens each crop by that many HR cells on every side and
+    reports ``core_hr`` so the loss can be taken on the central core only. This
+    is not a refinement -- it is what makes training and full-box inference the
+    same operation.
+
+    The model pads circularly, so on a bare ``crop_hr`` crop every voxel whose
+    receptive field is wider than ``crop_hr / 2`` sees the crop wrapped onto
+    itself: an artificial neighbourhood that exists nowhere in the box. At the
+    configured ``levels=2 / blocks=2`` the measured receptive-field half-width
+    is 41 HR cells, so a 64^3 crop contaminates *every* voxel. Full-box sampling
+    then supplies 48 cells of real context per side (``TILE_MARGIN``), and the
+    model is asked at inference for a mapping it was never trained on. Setting
+    ``context_margin`` to the same margin the sampler uses removes the
+    discrepancy; the cost is that the input volume grows from ``crop_hr^3`` to
+    ``(crop_hr + 2 * margin)^3``, which is why ``train.batch_size`` has to come
+    down to match.
     """
 
     def __init__(
@@ -185,6 +219,9 @@ class PairedResidualCrops(Dataset):
         channels: Optional[Sequence[int]] = None,
         use_cached_residual: bool = False,
         redshift: float = 0.0,
+        host_chunks: Optional[Sequence[Tuple[str, int]]] = None,
+        chunk_hr: int = 128,
+        context_margin: int = 0,
     ):
         missing = [b.box for b in boxes if not b.exists()]
         if missing:
@@ -195,8 +232,18 @@ class PairedResidualCrops(Dataset):
             raise ValueError(
                 f"crop_hr={crop_hr} must be a multiple of scale_factor={scale_factor}"
             )
+        if int(context_margin) % int(scale_factor):
+            # An LR-lattice-aligned core needs an LR-lattice-aligned margin,
+            # otherwise the conditioning window is shifted by a fraction of an
+            # LR cell and the model has to undo it.
+            raise ValueError(
+                f"context_margin={context_margin} must be a multiple of "
+                f"scale_factor={scale_factor}"
+            )
         self.boxes = list(boxes)
-        self.crop_hr = int(crop_hr)
+        self.core_hr = int(crop_hr)
+        self.context_margin = int(context_margin)
+        self.crop_hr = self.core_hr + 2 * self.context_margin
         self.crop_lr = self.crop_hr // int(scale_factor)
         self.scale_factor = int(scale_factor)
         self.length = int(length)
@@ -204,7 +251,29 @@ class PairedResidualCrops(Dataset):
         self.channels = None if channels is None else tuple(int(c) for c in channels)
         self.use_cached_residual = bool(use_cached_residual)
         self.redshift = float(redshift)
+        self.chunk_hr = int(chunk_hr)
         self._cache: Dict[str, Dict[str, np.ndarray]] = {}
+
+        self.host_chunks = None
+        if host_chunks:
+            known = {b.box for b in self.boxes}
+            pairs = [(str(b), int(c)) for b, c in host_chunks if str(b) in known]
+            if not pairs:
+                raise ValueError(
+                    f"none of the fixed host chunks name a loaded box "
+                    f"({sorted(known)}); nothing could be sampled"
+                )
+            if self.core_hr > self.chunk_hr:
+                raise ValueError(
+                    f"crop_hr={self.core_hr} exceeds chunk_hr={self.chunk_hr}; a "
+                    f"crop could not be contained in the chunk it is meant to "
+                    f"overfit"
+                )
+            self.host_chunks = pairs
+            self._chunk_box_index = [
+                next(i for i, b in enumerate(self.boxes) if b.box == box)
+                for box, _ in pairs
+            ]
 
     def __len__(self) -> int:
         return self.length
@@ -225,20 +294,44 @@ class PairedResidualCrops(Dataset):
 
     def __getitem__(self, i: int) -> Dict[str, torch.Tensor]:
         rng = np.random.default_rng(self.seed * 1_000_003 + i)
-        bi = int(rng.integers(len(self.boxes)))
+        if self.host_chunks is None:
+            bi = int(rng.integers(len(self.boxes)))
+        else:
+            ci = int(rng.integers(len(self.host_chunks)))
+            bi = self._chunk_box_index[ci]
         bp = self.boxes[bi]
         f = self._open(bp)
         ng_hr = int(f["hr"].shape[1])
         ng_lr = ng_hr // self.scale_factor
-        lr_start = tuple(int(rng.integers(ng_lr)) for _ in range(3))
+
+        if self.host_chunks is None:
+            lr_start = tuple(int(rng.integers(ng_lr)) for _ in range(3))
+        else:
+            # The CORE stays inside the chunk so the loss is entirely on the
+            # region being overfitted; the context margin is free to reach
+            # outside it, exactly as it does at inference. Still
+            # LR-lattice-aligned, so the conditioning window is unshifted.
+            grid = ChunkGrid(ng_hr=ng_hr, chunk_hr=self.chunk_hr)
+            origin = grid.origin(self.host_chunks[ci][1])
+            span_lr = (self.chunk_hr - self.core_hr) // self.scale_factor + 1
+            lr_start = tuple(
+                o // self.scale_factor + int(rng.integers(span_lr)) for o in origin
+            )
         hr_start = tuple(s * self.scale_factor for s in lr_start)
 
-        y_lr = periodic_crop(np.asarray(f["lr"]), lr_start, self.crop_lr, pad=0)
-        base = periodic_crop(np.asarray(f["base"]), hr_start, self.crop_hr, pad=0)
+        # ``hr_start`` is the CORE origin; ``pad`` takes the context around it
+        # periodically from the real box, so the neighbourhood the model sees is
+        # the same one full-box tiling will give it.
+        m_hr = self.context_margin
+        m_lr = m_hr // self.scale_factor
+        y_lr = periodic_crop(np.asarray(f["lr"]), lr_start,
+                             self.crop_lr - 2 * m_lr, pad=m_lr)
+        base = periodic_crop(np.asarray(f["base"]), hr_start, self.core_hr, pad=m_hr)
         if "residual" in f:
-            resid = periodic_crop(np.asarray(f["residual"]), hr_start, self.crop_hr, pad=0)
+            resid = periodic_crop(np.asarray(f["residual"]), hr_start,
+                                  self.core_hr, pad=m_hr)
         else:
-            hr = periodic_crop(np.asarray(f["hr"]), hr_start, self.crop_hr, pad=0)
+            hr = periodic_crop(np.asarray(f["hr"]), hr_start, self.core_hr, pad=m_hr)
             resid = residual_target(hr, base, self.channels)
         return {
             "residual": torch.from_numpy(np.ascontiguousarray(resid, dtype=np.float32)),
@@ -247,6 +340,9 @@ class PairedResidualCrops(Dataset):
             "redshift": torch.tensor(self.redshift, dtype=torch.float32),
             "box_index": torch.tensor(bi, dtype=torch.long),
             "hr_start": torch.tensor(hr_start, dtype=torch.long),
+            # The central region the loss is valid on. Everything outside it was
+            # computed from a partly wrapped neighbourhood.
+            "core_hr": torch.tensor(self.core_hr, dtype=torch.long),
         }
 
 

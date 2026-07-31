@@ -46,6 +46,16 @@ class ReplayCropDataset(Dataset):
     Conditioning tensors are **not** duplicated: each entry references a box, an
     HR origin and the shared SR2 base cache, and the crop is cut from the
     memory-mapped originals.
+
+    The residual is returned **scaled by the entry's own ``residual_scale``**.
+    What earned the reward is ``Psi_base + a * dPsi``, so ``a * dPsi`` is the
+    target; returning the raw ``dPsi`` made a residual-scale sweep select on
+    ``a`` and then train on something else, and the discrepancy was invisible
+    because ``a = 1`` in every default config.
+
+    ``context_margin`` matches :class:`PairedResidualCrops`: elite crops must
+    carry the same real context as paired ones or the two loss terms are
+    computed on different operators.
     """
 
     def __init__(
@@ -58,13 +68,21 @@ class ReplayCropDataset(Dataset):
         length: int = 100000,
         seed: int = 0,
         redshift: float = 0.0,
+        context_margin: int = 0,
     ):
         if not entries:
             raise ValueError("replay dataset is empty")
         if crop_hr % scale_factor:
             raise ValueError(f"crop_hr={crop_hr} must be a multiple of {scale_factor}")
+        if int(context_margin) % int(scale_factor):
+            raise ValueError(
+                f"context_margin={context_margin} must be a multiple of "
+                f"{scale_factor}"
+            )
         self.entries = list(entries)
         self.box_paths = box_paths
+        self.core_hr = int(crop_hr)
+        self.context_margin = int(context_margin)
         self.crop_hr = int(crop_hr)
         self.scale_factor = int(scale_factor)
         self.length = int(length)
@@ -108,26 +126,40 @@ class ReplayCropDataset(Dataset):
         arr = self._residual(e)
         chunk = int(e.chunk_hr)
         full_box = int(arr.shape[-1]) > chunk
-        span = chunk - self.crop_hr
+        span = chunk - self.core_hr
         off = tuple(
             int(rng.integers(span + 1)) // self.scale_factor * self.scale_factor
             for _ in range(3)
         ) if span > 0 else (0, 0, 0)
-        r0 = tuple((int(e.hr_origin[d]) if full_box else 0) + off[d] for d in range(3))
-        sl = tuple(slice(o, o + self.crop_hr) for o in r0)
-        resid = np.asarray(arr[:, sl[0], sl[1], sl[2]], dtype=np.float32)
 
+        m_hr = self.context_margin
+        m_lr = m_hr // self.scale_factor
+        # The core origin, in the box's own coordinates. The residual field on
+        # disk is periodic in the box, so the context is taken periodically too
+        # -- the same neighbourhood the sampler used when it produced it.
         hr_start = tuple(int(e.hr_origin[d]) + off[d] for d in range(3))
+        if full_box:
+            resid = periodic_crop(np.asarray(arr), hr_start, self.core_hr, pad=m_hr)
+        else:
+            # A per-chunk residual file has no context outside the chunk; wrap
+            # inside it rather than reading past the end.
+            resid = periodic_crop(np.asarray(arr), off, self.core_hr, pad=m_hr)
+        # What earned the reward is Psi_base + a * dPsi, so a * dPsi is the target.
+        a = float(getattr(e, "residual_scale", 1.0) or 1.0)
+        if a != 1.0:
+            resid = np.asarray(resid, dtype=np.float32) * np.float32(a)
+
         lr_start = tuple(s // self.scale_factor for s in hr_start)
-        base = periodic_crop(np.asarray(f["base"]), hr_start, self.crop_hr, pad=0)
+        base = periodic_crop(np.asarray(f["base"]), hr_start, self.core_hr, pad=m_hr)
         y_lr = periodic_crop(np.asarray(f["lr"]), lr_start,
-                             self.crop_hr // self.scale_factor, pad=0)
+                             self.core_hr // self.scale_factor, pad=m_lr)
         return {
             "residual": torch.from_numpy(np.ascontiguousarray(resid, dtype=np.float32)),
             "psi_base": torch.from_numpy(np.ascontiguousarray(base, dtype=np.float32)),
             "y_lr": torch.from_numpy(np.ascontiguousarray(y_lr, dtype=np.float32)),
             "weight": torch.tensor(float(self.weights[j]), dtype=torch.float32),
             "redshift": torch.tensor(self.redshift, dtype=torch.float32),
+            "core_hr": torch.tensor(self.core_hr, dtype=torch.long),
         }
 
 
@@ -165,6 +197,7 @@ def _diagnostics(
     n_samples: int = 2,
     boxsize_mpc_h: float = 100.0,
     dis_norm_kpc_h: float = 6000.0,
+    core: Optional[int] = None,
 ) -> Dict[str, float]:
     """Composed-field diagnostics on one validation batch.
 
@@ -181,22 +214,39 @@ def _diagnostics(
     from ..eval.density import cic_density_valid_center
 
     from .base import _ddim_from_noise
+    from .diffusion import valid_core
 
     model.eval()
-    base = batch["psi_base"].to(device)
+    base_full = batch["psi_base"].to(device)
     y = batch["y_lr"].to(device)
-    resid_true = batch["residual"].to(device)
-    hr = base + resid_true
+    resid_true_full = batch["residual"].to(device)
 
     samples = []
+    clip_stats: Dict[str, float] = {}
     for s in range(int(n_samples)):
         gen = torch.Generator(device="cpu").manual_seed(1234 + s)
-        u = torch.randn(tuple(base.shape), generator=gen, dtype=torch.float32).to(device)
+        u = torch.randn(tuple(base_full.shape), generator=gen,
+                        dtype=torch.float32).to(device)
+        st: Dict = {}
         u = _ddim_from_noise(model, u, diff_cfg,
-                             cond={"y_lr": y, "psi_base": base, "redshift": 0.0},
-                             seed=1234 + s)
+                             cond={"y_lr": y, "psi_base": base_full, "redshift": 0.0},
+                             seed=1234 + s, stats=st)
+        clip_stats["diag_x0_clip_fraction_max"] = max(
+            clip_stats.get("diag_x0_clip_fraction_max", 0.0),
+            float(st.get("x0_clip_fraction_max", 0.0)),
+        )
+        clip_stats["diag_x0_clip_fraction_last"] = max(
+            clip_stats.get("diag_x0_clip_fraction_last", 0.0),
+            float(st.get("x0_clip_fraction_last", 0.0)),
+        )
         samples.append(unwhiten(u, model.sigma_res))
-    stack = torch.stack(samples)
+    # Sampling needs the context; every reported number is on the valid core,
+    # so the diagnostics measure what full-box tiling will actually write.
+    stack = valid_core(torch.stack(samples), core)
+    base = valid_core(base_full, core)
+    resid_true = valid_core(resid_true_full, core)
+    hr = base + resid_true
+    y = valid_core(y, None if core is None else max(int(core) // scale_factor, 1))
     pred_resid = stack[0]
     composed = base + float(residual_scale) * pred_resid
 
@@ -208,6 +258,7 @@ def _diagnostics(
             stack.var(dim=0, unbiased=True).mean().sqrt() / scale_rms
         ) if n_samples > 1 else float("nan"),
     }
+    out.update(clip_stats)
     out.update(_band_metrics(composed[:, 0:3], hr[:, 0:3], scale_factor, "diag_disp_"))
     out.update(_band_metrics(base[:, 0:3], hr[:, 0:3], scale_factor, "diag_base_"))
 
@@ -270,6 +321,16 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
     scale = int(dcfg.get("scale_factor", 8))
     crop_hr = int(dcfg.get("crop_hr", 64))
     base_seed = int(dcfg.get("base_seed", 0))
+    # Context margin: how much real neighbourhood is supplied around the scored
+    # core, in HR cells. It must be at least the model's receptive-field
+    # half-width, and should equal the margin the full-box sampler uses
+    # (TILE_MARGIN), or training and inference are different operations. See
+    # PairedResidualCrops for the argument.
+    context_margin = int(dcfg.get("context_margin", 0))
+    if smoke:
+        # The smoke crop is tiny and the smoke model is 1 block deep; a 48-cell
+        # margin around a 32-cell core would make the run a memory test.
+        context_margin = int(dcfg.get("smoke_context_margin", 0))
 
     # ---------------------------------------------------------------- data --
     split = cfg.get("split", {})
@@ -297,17 +358,29 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
     else:
         tb = resolve_boxes(train_boxes, dcfg["root"], base_seed=base_seed)
         vb = resolve_boxes(val_boxes, dcfg["root"], base_seed=base_seed)
+        # Rung 3 only: restrict training crops to a handful of fixed massive-host
+        # chunks. Validation stays on the whole box, so the run reports both
+        # "reward rose on the hosts" and "what it cost everywhere else".
         train_ds = PairedResidualCrops(
             tb, crop_hr=crop_hr, scale_factor=scale,
             length=int(dcfg.get("train_length", 200000)),
             seed=int(tcfg.get("seed", 0)), redshift=float(dcfg.get("redshift", 0.0)),
+            host_chunks=dcfg.get("fixed_host_chunks"),
+            chunk_hr=int(cfg.get("geometry", {}).get("chunk_hr", 128)),
+            context_margin=context_margin,
         )
+        # Validation carries the SAME context margin: diagnostics measured on
+        # wrapped crops would hide exactly the discrepancy the margin exists to
+        # remove, which is how a contaminated prior passes Gate A.
         val_ds = PairedResidualCrops(
             vb, crop_hr=crop_hr, scale_factor=scale,
             length=int(dcfg.get("val_length", 512)),
             seed=int(tcfg.get("seed", 0)) + 991,
             redshift=float(dcfg.get("redshift", 0.0)),
+            context_margin=context_margin,
         )
+        print(f"crops: core {crop_hr}^3 + {context_margin} cells of context "
+              f"= {crop_hr + 2 * context_margin}^3 input", flush=True)
 
     nw = int(tcfg.get("num_workers", 0))
     bs = int(tcfg.get("batch_size", 4))
@@ -330,16 +403,48 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
             print("smoke: synthetic replay batches (no manifest given)", flush=True)
         else:
             entries = replay_entries
-            box_paths = {
-                b.box: {"lr": b.lr, "base": b.base}
-                for b in resolve_boxes(sorted({e.box for e in entries}), dcfg["root"],
-                                       base_seed=base_seed)
-            }
+            # Resolve each box's base field from the ENTRY, not from the config:
+            # the elite was composed against one specific cached SR2 field, and
+            # conditioning on a different one makes the recorded residual the
+            # wrong target. A mismatch is an error, not a fallback.
+            seeds = {e.base_seed for e in entries}
+            if len(seeds) > 1:
+                raise RuntimeError(
+                    f"replay entries span base seeds {sorted(seeds)}; one round "
+                    f"must be composed against a single frozen realisation"
+                )
+            entry_seed = int(next(iter(seeds))) if seeds else base_seed
+            if entry_seed != base_seed:
+                print(f"replay: base_seed {entry_seed} from the manifest overrides "
+                      f"data.base_seed={base_seed}", flush=True)
+            box_paths = {}
+            for b in resolve_boxes(sorted({e.box for e in entries}), dcfg["root"],
+                                   base_seed=entry_seed):
+                recorded = {e.base_id for e in entries
+                            if e.box == b.box and e.base_id}
+                if recorded:
+                    if len(recorded) > 1:
+                        raise RuntimeError(
+                            f"{b.box}: replay entries name {len(recorded)} "
+                            f"different base fields {sorted(recorded)}"
+                        )
+                    p = Path(next(iter(recorded)))
+                    if not p.is_file():
+                        raise FileNotFoundError(
+                            f"{b.box}: replay names base field {p}, which is gone"
+                        )
+                    if b.base is not None and Path(b.base) != p:
+                        print(f"replay: {b.box} base <- {p} (manifest), not "
+                              f"{b.base} (cache glob)", flush=True)
+                    box_paths[b.box] = {"lr": b.lr, "base": p}
+                else:
+                    box_paths[b.box] = {"lr": b.lr, "base": b.base}
             replay_ds = ReplayCropDataset(
                 entries, box_paths, crop_hr=crop_hr, scale_factor=scale,
                 length=int(dcfg.get("train_length", 200000)),
                 seed=int(tcfg.get("seed", 0)) + 17,
                 redshift=float(dcfg.get("redshift", 0.0)),
+                context_margin=context_margin,
             )
             replay_ds.set_weights(elite_weights(
                 [e.marginal_contribution for e in entries],
@@ -371,13 +476,12 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
                                            "scale_factor": scale}).to(device).eval()
         tp = distill_cfg.get("teacher_checkpoint") or distill_cfg.get("init_from")
         if tp:
-            teacher.load_state_dict(torch.load(tp, map_location="cpu")["model"])
+            teacher.load_state_dict(_prior_weights(tp, prefer_ema=True))
         for p in teacher.parameters():
             p.requires_grad_(False)
     if mode == "distill" and distill_cfg.get("init_from"):
-        state = torch.load(distill_cfg["init_from"], map_location="cpu")
-        model.load_state_dict(state.get("ema") or state["model"])
-        print(f"initialised from {distill_cfg['init_from']}", flush=True)
+        model.load_state_dict(_prior_weights(distill_cfg["init_from"],
+                                             prefer_ema=True))
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(tcfg.get("lr", 1e-4)),
                             weight_decay=float(tcfg.get("weight_decay", 0.0)))
@@ -397,7 +501,22 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
         if ck.get("extra", {}).get("ema"):
             ema.module.load_state_dict(ck["extra"]["ema"])
         st.step = int(ck.get("step", 0))
-        print(f"resumed from {resume} at step {st.step}", flush=True)
+        st.best_val = float(ck.get("extra", {}).get("best_val", st.best_val))
+        if sched is not None:
+            # Without this the LR restarts at the warmup floor and re-runs the
+            # whole cosine decay from scratch, so a job that hits its time limit
+            # comes back with a *different* schedule than the one it was
+            # training under -- and a resumed run is not the run it resumed.
+            sd = ck.get("extra", {}).get("scheduler")
+            if sd:
+                sched.load_state_dict(sd)
+            else:
+                for _ in range(st.step):
+                    sched.step()
+                print(f"! {resume} has no scheduler state; replayed {st.step} "
+                      f"steps to reconstruct the LR", flush=True)
+        print(f"resumed from {resume} at step {st.step} "
+              f"(lr={opt.param_groups[0]['lr']:.3g})", flush=True)
 
     use_wandb = maybe_init_wandb(cfg, out_dir, job_type=f"reward_{mode}")
     logger = CSVLogger(out_dir, use_wandb=use_wandb)
@@ -485,6 +604,7 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
                 n_samples=int(tcfg.get("diag_samples", 2)),
                 boxsize_mpc_h=float(dcfg.get("boxsize_mpc_h", 100.0)),
                 dis_norm_kpc_h=float(dcfg.get("dis_norm_kpc_h", 6000.0)),
+                core=crop_hr if context_margin else None,
             ))
             logger.log(st.step, vrow)
             if mode == "distill":
@@ -499,22 +619,39 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
                 st.best_val = float(vrow["val_loss"])
                 save_checkpoint(out_dir / "ckpt_best.pt", model, opt, st.step,
                                 extra={"ema": ema.module.state_dict(),
+                                       "scheduler": sched.state_dict()
+                                       if sched is not None else None,
+                                       "best_val": st.best_val,
                                        "sigma_res": list(np.asarray(sigma).ravel()),
                                        "mode": mode, "val": vrow})
 
         if st.step % int(tcfg.get("ckpt_every", 2000)) == 0 or st.step == steps:
             save_checkpoint(out_dir / "ckpt_last.pt", model, opt, st.step,
                             extra={"ema": ema.module.state_dict(),
+                                   "scheduler": sched.state_dict()
+                                   if sched is not None else None,
+                                   "best_val": st.best_val,
                                    "sigma_res": list(np.asarray(sigma).ravel()),
                                    "mode": mode})
 
     save_checkpoint(out_dir / "ckpt_last.pt", model, opt, st.step,
                     extra={"ema": ema.module.state_dict(),
+                           "scheduler": sched.state_dict() if sched is not None else None,
+                           "best_val": st.best_val,
                            "sigma_res": list(np.asarray(sigma).ravel()), "mode": mode})
     logger.close()
     print(f"finished {st.step} steps in {time.time() - t_start:.0f}s -> {out_dir}",
           flush=True)
     return out_dir
+
+
+def _core_of(batch) -> Optional[int]:
+    """The valid-core size of a batch, if the loader reported one."""
+    c = batch.get("core_hr")
+    if c is None:
+        return None
+    c = int(np.asarray(c).ravel()[0])
+    return c if c > 0 else None
 
 
 def _sup_loss(model, batch, diff: DiffusionConfig, device, weight=None):
@@ -524,7 +661,8 @@ def _sup_loss(model, batch, diff: DiffusionConfig, device, weight=None):
     z = float(batch["redshift"][0]) if "redshift" in batch else 0.0
     u0 = whiten(resid, model.sigma_res)
     cond = {"y_lr": y, "psi_base": base, "redshift": z}
-    loss, aux = denoising_loss(model, u0, cond, diff, per_sample_weight=weight)
+    loss, aux = denoising_loss(model, u0, cond, diff, per_sample_weight=weight,
+                               core=_core_of(batch))
     aux["cond"] = cond
     return loss, aux
 
@@ -575,6 +713,28 @@ def _check_abort(vrow: Dict[str, float], agg: Dict[str, float], abort: Dict) -> 
             f"(limit {limit}): the elite loss is a handful of crops"
         )
     return bad
+
+
+def _prior_weights(path: str | Path, *, prefer_ema: bool = True) -> Dict:
+    """The state dict a checkpoint should be *used* with.
+
+    ``save_checkpoint`` stores the EMA weights under ``extra.ema``, not at the
+    top level, so ``state.get("ema") or state["model"]`` silently fell through
+    to the raw weights every single time. That matters here specifically because
+    the oracle samples from ``extra.ema``: initialising the student from the raw
+    weights, or referencing a raw-weight teacher, means distilling toward
+    elites that a *different* model produced.
+    """
+    st = torch.load(str(path), map_location="cpu")
+    ema = st.get("extra", {}).get("ema") or st.get("ema")
+    if prefer_ema and ema:
+        print(f"loaded EMA weights from {path}", flush=True)
+        return ema
+    if prefer_ema:
+        print(f"! {path} has no EMA weights; using raw weights. The oracle "
+              f"samples from EMA, so the elites came from a different model.",
+              flush=True)
+    return st["model"]
 
 
 def _sigma_from_batch(ds, n: int = 8) -> List[float]:

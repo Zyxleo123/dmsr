@@ -165,3 +165,56 @@ def test_block_precision_matches_an_explicit_submatrix_inverse(model, hr_chunks)
     # And it is NOT the joint-precision slice, which would be the partial form.
     joint_slice = float(d @ model.precision[np.ix_(idx, idx)] @ d)
     assert abs(joint_slice - expected) > 1e-12
+
+
+# --------------------------------------------------------------------------- #
+# include_sparse_in_reward: an excluded bin must carry no weight at all
+# --------------------------------------------------------------------------- #
+def test_an_inactive_dimension_cannot_change_the_reward(hr_chunks, bins):
+    """Dropping the sparse host bin must actually drop it from R_cat.
+
+    ``include_sparse_in_reward: false`` was documentation only: bins_of built
+    every host bin regardless, so the near-empty 1e14 bin stayed in the 11-d
+    quadratic form -- the configuration audit_reward_covariance.py reports as
+    "fail", with 96% of the baseline distance in that one bin.
+    """
+    import numpy as np
+
+    from cosmo_sr.reward.catalog import summary_vector
+    from cosmo_sr.reward.reward import fit_reward_model
+
+    full = fit_reward_model(hr_chunks, bins, ensemble_size=8, n_draws=200, seed=0)
+    last = bins.dim - 1
+    active = [i for i in range(bins.dim) if i != last]
+    trimmed = fit_reward_model(hr_chunks, bins, ensemble_size=8, n_draws=200,
+                               seed=0, active_dims=active)
+
+    assert trimmed.active_dim == bins.dim - 1
+    assert full.active_dim == bins.dim
+
+    # The excluded bin contributes exactly zero, whatever it holds.
+    ens = _ens_from(hr_chunks)
+    comp = trimmed.components(ens)
+    names = list(bins.labels())
+    assert comp[f"contrib_{names[last]}"] == 0.0
+    assert comp["mahalanobis2"] == pytest.approx(-trimmed.reward(ens))
+    # ...and it is still in mu/cov, so it remains reportable.
+    assert trimmed.dim == bins.dim
+    assert np.isfinite(trimmed.mu[last])
+
+
+def test_the_excluded_bin_is_still_reported_in_the_occupation_gap(hr_chunks, bins):
+    from cosmo_sr.reward.reward import fit_reward_model
+
+    active = list(range(bins.dim - 1))
+    m = fit_reward_model(hr_chunks, bins, ensemble_size=8, n_draws=200, seed=0,
+                         active_dims=active)
+    gap = m.occupation_gap(_ens_from(hr_chunks))
+    # Indexed by HOST BIN, not by active dimension: the gate reads it that way.
+    assert gap.shape[0] == bins.n_host_bins
+
+
+def _ens_from(chunks):
+    from cosmo_sr.reward.catalog import pool
+
+    return pool(list(chunks)[:8])

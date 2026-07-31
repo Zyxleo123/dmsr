@@ -31,7 +31,9 @@ source "$_D/_reward_common.sh" "$@"
 : "${SHARD:=${SLURM_ARRAY_TASK_ID:-0}}"
 : "${NUM_SHARDS:=${SLURM_ARRAY_TASK_COUNT:-1}}"
 : "${REWARD_MODEL:=$DMSR_REWARD_ROOT/reward_model/reward_model.json}"
-: "${GROUPS:=3}"
+# 0 = one group per box, which is what a group now is. Set it only to cap the
+# number of boxes reported.
+: "${GROUPS:=0}"
 : "${GATE_TARGET:=0.20}"
 : "${AGGREGATE:=0}"
 

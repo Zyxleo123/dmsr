@@ -31,6 +31,7 @@ from _common import (add_common_args, banner, load_reward_config, lr_path,
 from sample_oracle_candidates import load_model
 
 from cosmo_sr.reward import paths
+from cosmo_sr.reward.base import find_base_field
 from cosmo_sr.reward.diffusion import DiffusionConfig
 from cosmo_sr.reward.sampling import (TileSpec, measure_receptive_field,
                                       sample_residual_box, tile_margin_for)
@@ -105,10 +106,9 @@ def main() -> None:
     rows = []
     for box in boxes:
         lr = np.load(lr_path(cfg, box))
-        hits = sorted(paths.SR2_BASE_CACHE().glob(f"{box}_seed{args.base_seed}_*.npy"))
-        if not hits:
+        base_path = find_base_field(box, args.base_seed)
+        if base_path is None:
             raise SystemExit(f"no cached SR2 base for {box}")
-        base_path = hits[0]
         base = np.load(base_path, mmap_mode="r")
         rows.append({"arm": "sr2", "box": box, "sample": 0, "seed": args.base_seed,
                      "field": str(base_path), "residual": None})

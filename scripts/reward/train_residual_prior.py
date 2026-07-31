@@ -28,10 +28,20 @@ def main() -> None:
     ap.add_argument("--resume", default=None)
     ap.add_argument("--sigma-res", default=None,
                     help="sigma_res.json from the residual-target audit")
+    ap.add_argument("--fixed-hosts", default=None,
+                    help="fixed_hosts.json from select_fixed_hosts.py; restricts "
+                         "training crops to those chunks (rung 3 overfitting)")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
     cfg = apply_overrides(load_config(args.config), args.overrides)
+    if args.fixed_hosts:
+        h = json.loads(Path(args.fixed_hosts).read_text())
+        cfg.setdefault("data", {})["fixed_host_chunks"] = [
+            (str(b), int(c)) for b, c in h["chunks"]
+        ]
+        print(f"fixed hosts <- {args.fixed_hosts}: {len(h['chunks'])} chunks",
+              flush=True)
     if args.sigma_res:
         s = json.loads(Path(args.sigma_res).read_text())
         cfg.setdefault("model", {})["sigma_res"] = s["sigma_res"]

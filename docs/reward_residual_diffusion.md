@@ -692,6 +692,31 @@ A Gate A failure is a **prior/sampling bug**, and the fix is in the prior, the
 whitening, the sampler, or `residual_scale`. Do not evaluate catalog rewards on
 a prior that fails Gate A — the reward numbers would be measuring the bug.
 
+**This is enforced, not advisory.** `scripts/reward/gate_a_check.py` reads the
+run's `metrics.csv` and writes `gate_a.json` with a per-criterion verdict;
+`train_residual_prior.sbatch` runs it, and `sample_reward_oracle.sbatch` refuses
+to sample (exit 0, with the failing criteria printed) unless `passed` is true.
+Criteria 6 needs a second sampling job at two tile sizes and is reported
+`not_evaluated` until one is supplied. `IGNORE_GATE_A=1` overrides, and makes
+every downstream number conditional on an unchecked prior.
+
+### Training and inference must see the same neighbourhood
+
+The model pads circularly. On a bare `crop_hr` crop, every voxel whose receptive
+field is wider than `crop_hr / 2` sees the crop wrapped onto itself — an
+artificial neighbourhood that exists nowhere in the box. At the configured
+`levels = 2 / blocks = 2` the measured half-width is **41 HR cells**, so a 64³
+crop contaminates *every* voxel, while full-box sampling supplies 48 cells of
+real context (`TILE_MARGIN`).
+
+So `data.crop_hr` is the **scored core** and `data.context_margin` (48, the same
+as `TILE_MARGIN`) is the real neighbourhood around it: the forward pass runs on
+160³, the loss is taken on the central 64³, and validation carries the same
+margin so the diagnostics cannot hide the discrepancy they exist to detect. The
+cost is the reason `batch_size` is 1 with `grad_accum` 8. If that does not fit,
+the lever is the **receptive field**, not the margin — a smaller margin does not
+make the wraparound smaller, only invisible.
+
 ---
 
 ## 4. Gate B — can occupation be controlled at all?
@@ -715,16 +740,45 @@ Report separately, never merged:
 * all field constraints;
 * catalog diversity.
 
+### One group is one box
+
+An **ensemble group is a complete box**: at `chunk_hr = 256` a box is exactly 8
+chunks and the reward is fitted at `B = 8`, so a group is the independent
+cosmological unit, the unit the bootstrap resamples, and the unit `C_reg`
+describes. The baseline, the HR reference and every candidate of that box are
+scored on **identical chunk ids**, which is what makes the comparison paired.
+"Reproduced on ≥ 2 groups" therefore means "reproduced on ≥ 2 boxes".
+
+Groups must not be drawn *across* boxes. A candidate field exists for one box
+only, so a cross-box group of `B` chunks leaves each candidate scored on the
+one or two chunks that happen to be its own — a short ensemble compared against
+a full-length baseline, through a covariance fitted for `B`.
+
 ### Pass conditions
 
-All five:
+All six:
 
 1. occupation improves in **at least two reliable bins** (0–3);
 2. the improvement **includes `1e13` or `3.16e13`** (bins 2, 3);
-3. it **beats a random draw** under box-level uncertainty, not just the mean;
+3. it **beats a random draw by at least the gate target (20%)** — a margin, not
+   a sign. Best-of-`K` beats the median of `K` essentially by construction, so
+   a `> 0` test measures only that sampling noise exists;
 4. it does **not rely on the sparse `1e14` bin** — which the §2 audit shows is
-   empty at `chunk_hr = 128` and still under the bar (4 hosts/ensemble) at 256;
-5. field constraints hold and object-level diversity does not collapse.
+   empty at `chunk_hr = 128` and still under the bar (4 hosts/ensemble) at 256.
+   `include_sparse_in_reward: false` now removes it from `R_cat` itself, not
+   only from the criterion;
+5. field constraints hold and object-level diversity does not collapse;
+6. the constraints were **calibrated** (`constraints.calibrated: true`). With
+   placeholder thresholds the feasibility filter — and therefore the elite set —
+   is made of guesses, so `oracle_report.py` reports
+   `blocked_uncalibrated_constraints` instead of a verdict.
+
+Diversity is measured **twice**, and both matter. `diversity` (the feasibility
+floor) is field-level: RMS spread across residual samples. `catalog_diversity`
+is the spread of the occupation curve across candidates. SR2's documented
+failure is precisely that the field varies while the subhalos do not, so the
+field floor can be comfortably satisfied while best-of-`K` has nothing to select
+from.
 
 Field fidelity is a **feasibility filter**, not a term traded against catalog
 reward. An infeasible candidate cannot be an elite at any reward.
@@ -838,6 +892,18 @@ queried inside the training loop.
 If and only if Gate B passes. Replay is built from **ensemble-level** reward and
 **leave-one-out candidate contribution**.
 
+### Gate B decides *whether*; a second oracle run decides *what from*
+
+Gate B samples the **validation** split — that is what makes its verdict a
+held-out statement. An offline replay buffer harvested from that same run would
+turn validation data into training data, and `build_replay.py` refuses it.
+
+So `submit_oracle.sh gate_c` runs its **own** oracle on the **training** boxes
+(`REPLAY_RUN`, default `prior_train_k8`) and harvests the elites from there,
+reading `gate_b.json` from the validation run (`GATE_B_RUN`) only for the
+verdict. Chaining replay straight off Gate B's `run_name` could only ever end in
+a hard refusal with the distillation job stranded behind it.
+
 The reward is **not** another model input. Training remains
 
 ```
@@ -850,7 +916,13 @@ The model never sees a reward value, so there is nothing to condition on and
 nothing to game at inference.
 
 Elite selection requires a **positive occupation contribution**, not merely a
-positive joint reward — the same reason Gate B is decided on `R_occ`. Weights
+positive joint reward — the same reason Gate B is decided on `R_occ`. Both the
+elite cut and the leave-one-out credit are therefore taken in `R_occ`
+(`oracle_report.py --credit-score`, default `R_occ`); the `R_cat` figures are
+recorded alongside for diagnosis and never used as the training signal. The
+elite's own `residual_scale` is applied to the residual the trainer sees, since
+what earned the reward is `Psi_base + a·dPsi`, and the base field is resolved
+from the entry's recorded `base_id`/`base_seed`, not from the config. Weights
 stay bounded and mean-normalised (`w = exp(clip(A, 0, A_max)/tau)`, `w_max = 10`),
 and the run **aborts** if a few chunks dominate: `max(w)/mean(w)` above its bound
 means the leave-one-out credit assumption has failed and the buffer is not worth
@@ -929,7 +1001,8 @@ The rule, to be applied to `gate_b.json` and the Stage-9 tables.
 
 | Verdict | Condition | Next |
 | --- | --- | --- |
-| **Occupation support present** | ≥ 2 reliable occupation bins improve, including `1e13` or `3.16e13`; beats a random draw under box-level uncertainty; not carried by `1e14`; feasible; diversity intact | build the replay buffer and distil |
+| **Occupation support present** | ≥ 2 reliable occupation bins improve, including `1e13` or `3.16e13`; beats a random draw by ≥ the gate target (20%) under box-level uncertainty; not carried by `1e14`; feasible; diversity intact; constraints calibrated | run the oracle again on the **train** boxes, build the replay buffer from *that* run, and distil |
+| **Blocked: uncalibrated constraints** | `constraints.calibrated: false` | run `calibrate_constraints.py`, paste the block in, set the flag, re-aggregate. No verdict until then |
 | **Abundance-only improvement** | `R_abund` improves, occupation criterion not met (even if `R_cat` improved) | a **scientifically informative failure**, reported as such. Ladder rung 5: host-aware conditioning / context. Not a pass |
 | **Support absent in raw sampling** | best-of-`K` does not improve occupation | **not** a no-go. Work the §5 ladder from rung 1. Only rung 6 licenses "the action space is insufficient" |
 

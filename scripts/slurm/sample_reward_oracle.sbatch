@@ -40,6 +40,32 @@ source "$_D/_reward_common.sh" "$@"
 require_input "$PRIOR_CKPT" "scripts/slurm/train_residual_prior.sbatch"
 require_input "$DMSR_REWARD_ROOT/cache/sr2_base" "scripts/slurm/cache_sr2_base.sbatch"
 
+# Gate B is gated on Gate A, per docs/reward_residual_diffusion.md sec. 3a:
+# "do not evaluate catalog rewards on a prior that fails Gate A -- the reward
+# numbers would be measuring the bug". Depending on the training job having
+# exited 0 does not check that. Exit 0 on a failed gate so the scoring and
+# verdict jobs behind this one report a skip rather than dying on Dependency.
+: "${GATE_A_JSON:=$(dirname "$PRIOR_CKPT")/gate_a.json}"
+: "${IGNORE_GATE_A:=0}"
+if [[ "$IGNORE_GATE_A" != "1" ]]; then
+    if [[ ! -r "$GATE_A_JSON" ]]; then
+        echo ">>> GATE A NOT DECIDED: no $GATE_A_JSON."
+        echo ">>> Run: python scripts/reward/gate_a_check.py --run-dir $(dirname "$PRIOR_CKPT")"
+        echo ">>> Not sampling. (IGNORE_GATE_A=1 overrides, and makes every"
+        echo ">>> downstream number conditional on an unchecked prior.)"
+        exit 0
+    fi
+    if ! python -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))['passed'] else 1)" \
+            "$GATE_A_JSON"; then
+        echo ">>> GATE A FAILED ($GATE_A_JSON). Not sampling."
+        python -c "import json,sys; d=json.load(open(sys.argv[1])); [print('    -', k, d['criteria'][k]['detail']) for k in d['failed']]" \
+            "$GATE_A_JSON" || true
+        echo ">>> Fix the prior, the whitening, the sampler or residual_scale first."
+        exit 0
+    fi
+    echo "=== Gate A: PASS ($GATE_A_JSON)"
+fi
+
 python -u scripts/reward/sample_oracle_candidates.py \
     --config "$REWARD_CFG" --model-config "$MODEL_CFG" \
     --checkpoint "$PRIOR_CKPT" \

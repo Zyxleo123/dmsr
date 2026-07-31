@@ -29,6 +29,7 @@ from _common import (add_common_args, banner, bins_of, chunk_grid, hr_path,
 from cosmo_sr.eval.rockstar import (default_rockstar_binary, load_rockstar_ascii,
                                     run_rockstar_on_field)
 from cosmo_sr.reward import paths
+from cosmo_sr.reward.base import find_base_field
 from cosmo_sr.reward.catalog import summarize_catalog, write_summaries
 from cosmo_sr.reward.geometry import assign_halos_to_chunks, chunk_purity_grid
 
@@ -79,13 +80,11 @@ def main() -> None:
     elif args.source == "hr":
         field_path = hr_path(cfg, args.box)
     elif args.source == "base":
-        hits = sorted(paths.SR2_BASE_CACHE().glob(
-            f"{args.box}_seed{args.base_seed}_*.npy"))
-        if not hits:
+        field_path = find_base_field(args.box, args.base_seed)
+        if field_path is None:
             raise SystemExit(
                 f"no cached SR2 base for {args.box}; run slurm/cache_sr2_base.sbatch"
             )
-        field_path = hits[0]
     else:
         raise SystemExit("--field is required for --source candidate")
 

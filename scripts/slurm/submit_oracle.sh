@@ -332,6 +332,15 @@ fi
 # docs/reward_residual_diffusion.md: distillation is gated on Gate B's
 # OCCUPATION verdict). A skip there cascades to the distill job via its own
 # require_input on the (unwritten) replay file.
+#
+# GATE C RUNS ITS OWN ORACLE, on the TRAINING boxes. Gate B samples the
+# validation split, by design -- that is what makes its verdict a held-out
+# statement. An offline replay buffer harvested from that same run would be
+# validation data used as training data, and build_replay.py correctly refuses
+# it, so chaining replay straight off Gate B's run_name could only ever end in
+# a hard SystemExit with the distill job stranded behind it. The correct
+# sequence is: Gate B on val decides *whether* to distil; a separate oracle run
+# on train boxes produces *what* to distil from.
 if [[ "$STAGE" == "gate_c" ]]; then
     if [ -r scripts/slurm/build_replay_cpu.sbatch ] && [ -r scripts/slurm/train_reward_distill_round0.sbatch ]; then
         GATE_B_JOB="${GATE_B_JOB:-}"
@@ -343,11 +352,35 @@ if [[ "$STAGE" == "gate_c" ]]; then
             echo "  !! skipping Gate C" >&2
         else
             echo "  gate_c: replay build will wait on Gate B verdict job $GATE_B_JOB (afterok)" >&2
+            # Gate B's run (val boxes) -- read only, for its gate_b.json verdict.
             RUN_NAME="${RUN_NAME:-prior_k8}"
+            # Gate C's own run (train boxes) -- the source of the elites.
+            REPLAY_RUN="${REPLAY_RUN:-prior_train_k8}"
             ROUND="${ROUND:-round_000}"
-            JID_REPLAY=$(sub "gate C: build replay (CPU)" \
+            echo "  gate_c: elites come from a NEW oracle run '$REPLAY_RUN' on the" >&2
+            echo "  gate_c: TRAIN split; '$RUN_NAME' (val) is read only for its verdict." >&2
+
+            SUB_OVERRIDES=("BOXES=")
+            JID_TGEN=$(sub "gate C: sample K candidates on TRAIN boxes (GPU)" \
                 --dependency=afterok:"$GATE_B_JOB" \
-                scripts/slurm/build_replay_cpu.sbatch "RUN_NAME=$RUN_NAME" "ROUND=$ROUND")
+                scripts/slurm/sample_reward_oracle.sbatch \
+                "RUN_NAME=$REPLAY_RUN" "SPLIT=train" "GATE_B_RUN=$RUN_NAME")
+            SUB_OVERRIDES=()
+            die_if_aborted
+            JID_TSCORE=$(sub "gate C: score TRAIN candidates (CPU array)" \
+                --dependency=afterok:"$JID_TGEN" \
+                scripts/slurm/catalog_reward_oracle_cpu.sbatch "RUN_NAME=$REPLAY_RUN")
+            die_if_aborted
+            JID_TAGG=$(sub "gate C: credit + manifest for TRAIN run (CPU)" \
+                --dependency=afterok:"$JID_TSCORE" --array=0-0 \
+                scripts/slurm/catalog_reward_oracle_cpu.sbatch \
+                "RUN_NAME=$REPLAY_RUN" AGGREGATE=1)
+            die_if_aborted
+
+            JID_REPLAY=$(sub "gate C: build replay (CPU)" \
+                --dependency=afterok:"$JID_TAGG" \
+                scripts/slurm/build_replay_cpu.sbatch \
+                "RUN_NAME=$REPLAY_RUN" "GATE_B_RUN=$RUN_NAME" "ROUND=$ROUND")
             die_if_aborted
             sub "gate C: reward-weighted distill (GPU)" \
                 --dependency=afterok:"$JID_REPLAY" \

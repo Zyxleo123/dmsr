@@ -1,11 +1,19 @@
 #!/usr/bin/env python
 """Stage 6c (CPU): assemble ensembles, score them, and decide Gate B.
 
-Every candidate of a box is scored on the **same** stratified chunk subsets, so
-the comparison between candidates is paired and the spread is sampling noise in
-the residual rather than in the choice of chunks. Several independent groups are
-built so "the best sample was better" can be checked for reproducibility instead
-of being read off one lucky draw.
+**One group is one box.** At ``chunk_hr=256`` a box is exactly 8 chunks and the
+reward is fitted at ``B=8``, so a group is a complete box: the independent
+cosmological unit, the unit the bootstrap resamples, and the unit the reward's
+covariance describes. Every candidate, the frozen baseline and the HR reference
+are then scored on *identical* chunk ids, so a comparison is paired and its
+spread is noise in the residual rather than in the choice of chunks.
+
+An earlier version drew ``B`` chunks stratified *across* boxes: the baseline
+pooled all ``B``, but a candidate exists for only one box, so it was scored on
+the one or two chunks of the group that happened to be its own -- a 2-chunk
+ensemble compared against an 8-chunk baseline, through a covariance fitted for
+8. Reproducibility across groups now means "across boxes", which is the
+statement Gate B is supposed to make anyway.
 
 Writes a machine-readable manifest with, for every candidate: seed, chunk ids,
 base checkpoint, residual checkpoint, residual scale, catalog summary, catalog
@@ -22,8 +30,9 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import (add_common_args, banner, bins_of, chunk_grid, constraints_of,
-                     load_reward_config, write_json)
+from _common import (add_common_args, banner, bins_of, constraints_of,
+                     load_reward_config, require_calibrated_constraints,
+                     write_json)
 
 from cosmo_sr.reward import paths
 from cosmo_sr.reward.catalog import pool, read_summaries
@@ -32,52 +41,85 @@ from cosmo_sr.reward.replay import marginal_contributions
 from cosmo_sr.reward.reward import RewardModel
 
 
-def _strata_label(cs, mode):
-    parts = []
-    if "box" in mode:
-        parts.append(cs.box)
-    if "host_mass_class" in mode:
-        nz = np.nonzero(np.asarray(cs.n_host) > 0)[0]
-        parts.append(f"hm{int(nz.max()) if nz.size else -1}")
-    if "environment_class" in mode:
-        parts.append("env_hi" if float(np.sum(cs.n_host)) > 0 else "env_lo")
-    return "|".join(parts) or cs.box
+def _groups(base_by_box, ensemble_size, candidate_boxes, seed):
+    """One group per box: ``(box, [chunk ids])``, all from that box alone.
 
-
-def _groups(base_by_box, ensemble_size, n_groups, strata_mode, seed):
-    """Stratified chunk subsets, defined from the *baseline* summaries."""
-    pool_keys, labels = [], []
-    for box, d in sorted(base_by_box.items()):
-        for cid, cs in sorted(d.items()):
-            if cs.volume_mpc3 <= 0:
-                continue
-            pool_keys.append((box, cid))
-            labels.append(_strata_label(cs, strata_mode))
-    if not pool_keys:
-        raise SystemExit("no usable chunks: every chunk has zero core volume")
+    A box must supply at least ``ensemble_size`` usable chunks. If it has more,
+    a deterministic subset is taken -- the same subset for the baseline, the HR
+    reference and every candidate of that box, which is what makes the
+    comparison paired.
+    """
     rng = np.random.default_rng(int(seed))
-    by_label = {}
-    for i, lab in enumerate(labels):
-        by_label.setdefault(lab, []).append(i)
-    keys = sorted(by_label)
     groups = []
-    for g in range(int(n_groups)):
-        take, k = [], 0
-        order = list(keys)
-        rng.shuffle(order)
-        seen = set()
-        while len(take) < ensemble_size and k < 100 * ensemble_size:
-            cand = int(rng.choice(by_label[order[k % len(order)]]))
-            if cand not in seen:
-                seen.add(cand)
-                take.append(cand)
-            k += 1
-        groups.append([pool_keys[i] for i in take])
+    for box in sorted(base_by_box):
+        if candidate_boxes and box not in candidate_boxes:
+            continue
+        usable = sorted(cid for cid, cs in base_by_box[box].items()
+                        if cs.volume_mpc3 > 0)
+        if len(usable) < ensemble_size:
+            print(f"  ! {box}: {len(usable)} usable chunks < B={ensemble_size}; "
+                  f"skipping this box rather than scoring a short ensemble "
+                  f"through a covariance fitted for B={ensemble_size}", flush=True)
+            continue
+        if len(usable) > ensemble_size:
+            take = sorted(rng.choice(usable, size=ensemble_size, replace=False).tolist())
+        else:
+            take = usable
+        groups.append((box, [(box, int(c)) for c in take]))
+    if not groups:
+        raise SystemExit(
+            f"no box supplies a complete B={ensemble_size} ensemble of usable "
+            f"chunks; Gate B cannot be decided"
+        )
     return groups
 
 
+def _catalog_diversity(records):
+    """Spread of the CATALOG across candidates of one group, per group.
+
+    Field diversity is not the quantity Gate B needs. SR2's documented failure
+    is exactly that the continuous field varies while the subhalos barely move,
+    so ``diag_sample_diversity`` can sit comfortably above its floor while every
+    candidate produces the same occupation curve -- and then best-of-K has
+    nothing to select from no matter how many samples are drawn. These are the
+    numbers that say whether the catalog itself moved.
+    """
+    out = {}
+    by_group = {}
+    for r in records:
+        by_group.setdefault(r["group"], []).append(r)
+    for g, rs in by_group.items():
+        if len(rs) < 2:
+            out[g] = {"n": len(rs), "occupation_rel_spread": float("nan"),
+                      "R_occ_spread": float("nan")}
+            continue
+        occ = np.asarray([r["occupation"] for r in rs], dtype=np.float64)
+        with np.errstate(invalid="ignore"):
+            sd = np.nanstd(occ, axis=0, ddof=1)
+            mean = np.abs(np.nanmean(occ, axis=0))
+            rel = sd / np.where(mean > 0, mean, np.nan)
+        r_occ = np.asarray([r["sub_rewards"].get("R_occ", np.nan) for r in rs],
+                           dtype=np.float64)
+        out[g] = {
+            "n": len(rs),
+            # Per host bin, then averaged over the bins that had hosts.
+            "occupation_rel_spread": float(np.nanmean(rel)) if np.isfinite(rel).any()
+            else float("nan"),
+            "occupation_rel_spread_per_bin": [
+                float(v) if np.isfinite(v) else None for v in rel
+            ],
+            "R_occ_spread": float(np.nanstd(r_occ, ddof=1))
+            if np.isfinite(r_occ).sum() > 1 else float("nan"),
+        }
+    return out
+
+
 def _diversity(cand_rows, sub: int = 128):
-    """Residual spread across candidates, measured on one fixed sub-cube per box."""
+    """FIELD-level residual spread across candidates, on one sub-cube per box.
+
+    This is the quantity the ``diversity`` feasibility floor bounds. It says
+    nothing about whether the *catalog* varies -- see :func:`_catalog_diversity`.
+    """
     out = {}
     by_box = {}
     for r in cand_rows:
@@ -102,19 +144,31 @@ def main() -> None:
     ap = add_common_args(argparse.ArgumentParser(description=__doc__))
     ap.add_argument("--run-name", required=True)
     ap.add_argument("--reward-model", default=None)
-    ap.add_argument("--groups", type=int, default=3)
+    ap.add_argument("--groups", type=int, default=0,
+                    help="cap on the number of groups (= boxes); 0 = every box")
     ap.add_argument("--ensemble-size", type=int, default=None)
     ap.add_argument("--group-seed", type=int, default=0)
     ap.add_argument("--gate-target", type=float, default=0.20,
                     help="fractional reduction in catalog discrepancy for a pass")
     ap.add_argument("--random-seed", type=int, default=17,
                     help="seed for the 'randomly selected candidate' reference")
+    ap.add_argument("--credit-score", default="R_occ",
+                    choices=["R_occ", "R_abund", "R_cat"],
+                    help="which reward per-chunk credit is measured in; must "
+                         "match what selection is decided on (default R_occ)")
+    ap.add_argument("--allow-uncalibrated", action="store_true",
+                    help="report a verdict even though constraints.calibrated is "
+                         "false (diagnostic only: the feasibility filter, and so "
+                         "the elite set, is then made of placeholders)")
     args = ap.parse_args()
 
     cfg = load_reward_config(args)
     bins = bins_of(cfg)
     cons = constraints_of(cfg)
     rcfg = cfg.get("reward", {})
+    # A pass decided with placeholder feasibility thresholds is not a pass: the
+    # elite set is defined by them. Report everything, then refuse the verdict.
+    uncalibrated = None if args.allow_uncalibrated else require_calibrated_constraints(cfg)
     out = paths.ORACLE(args.run_name)
     manifest = json.loads((out / "candidates.json").read_text())
     B = int(args.ensemble_size or rcfg.get("ensemble_size_B", 16))
@@ -155,8 +209,9 @@ def main() -> None:
     need_reliable = int(occ_cfg.get("min_improved_reliable_bins", 2))
     need_upper = int(occ_cfg.get("min_improved_upper_bins", 1))
 
-    groups = _groups(base_by_box, B, args.groups,
-                     rcfg.get("strata", ["box"]), args.group_seed)
+    groups = _groups(base_by_box, B, {r["box"] for r in cand_rows}, args.group_seed)
+    if args.groups and len(groups) > int(args.groups):
+        groups = groups[:int(args.groups)]
     div = _diversity(cand_rows)
 
     # Feasibility, now including the ensemble-level diversity floor.
@@ -170,8 +225,8 @@ def main() -> None:
 
     records, group_reports = [], []
     rng_pick = np.random.default_rng(int(args.random_seed))
-    for gi, keys in enumerate(groups):
-        gname = f"group{gi}"
+    for gi, (gbox, keys) in enumerate(groups):
+        gname = f"group{gi}_{gbox}"
         base_ens = pool([base_by_box[b][c] for b, c in keys])
         r_base = model.reward(base_ens)
         base_scores = model.scores(base_ens, reliable)
@@ -184,20 +239,29 @@ def main() -> None:
             r_hr, hr_occ = float("nan"), None
         per_cand = []
         for r in cand_rows:
+            if r["box"] != gbox:
+                continue
             s = summaries_of(r)
             if not s:
                 continue
-            sub = [(b, c) for b, c in keys if b == r["box"]]
-            if not sub:
-                continue
-            ens = {c: s[c] for _, c in sub if c in s}
-            basel = {c: base_by_box[r["box"]][c] for _, c in sub
-                     if c in base_by_box[r["box"]]}
-            if len(ens) != len(sub):
+            ens = {c: s[c] for _, c in keys if c in s}
+            basel = {c: base_by_box[gbox][c] for _, c in keys
+                     if c in base_by_box[gbox]}
+            if len(ens) != len(keys) or len(basel) != len(keys):
+                # A candidate missing any chunk of the group is not comparable
+                # to a baseline that has all of them; drop it rather than pool
+                # a shorter ensemble.
+                print(f"  ! {r['tag']}: has {len(ens)}/{len(keys)} chunks of "
+                      f"{gname}; excluded", flush=True)
                 continue
             cand_ens = pool(list(ens.values()))
             reward = model.reward(cand_ens)
-            marg = marginal_contributions(model, ens, basel)
+            # Credit in the score selection is decided on. Gate B is decided on
+            # occupation, so the replay buffer is weighted by occupation credit;
+            # the joint figure is kept alongside it for diagnosis, never as the
+            # training signal.
+            marg = marginal_contributions(model, ens, basel, score=args.credit_score)
+            marg_cat = marginal_contributions(model, ens, basel, score="R_cat")
             cand_scores = model.scores(cand_ens, reliable)
             cand_gap = model.occupation_gap(cand_ens)
             # A host bin "improves" when the candidate's whitened distance from
@@ -212,11 +276,16 @@ def main() -> None:
                 "chunk_ids": sorted(ens),
                 "base_checkpoint": manifest.get("checkpoint"),
                 "base_field": r.get("base_path"),
+                "base_seed": int(manifest.get("base_seed", 0)),
                 "residual_checkpoint": manifest.get("checkpoint"),
                 "residual_path": r.get("residual_path"),
                 "residual_scale": r.get("residual_scale"),
                 "catalog_summary": cand_ens.to_dict(),
                 "catalog_reward": reward,
+                # The score the elite cut is taken on: the same one the credit
+                # is measured in, so selection and weighting agree.
+                "selection_reward": float(cand_scores.get(args.credit_score, reward)),
+                "selection_score": args.credit_score,
                 "reward_base": r_base,
                 "reward_hr": r_hr,
                 "sub_rewards": cand_scores,
@@ -234,6 +303,9 @@ def main() -> None:
                 "feasible": bool(r["feasible"]),
                 "violations": r["violations"],
                 "marginal_contributions": {str(k): float(v) for k, v in marg.items()},
+                "marginal_contributions_score": args.credit_score,
+                "marginal_contributions_R_cat": {
+                    str(k): float(v) for k, v in marg_cat.items()},
                 "optimized_metrics": model.components(cand_ens),
                 "held_out_metrics": {
                     "n_subs_full_box": r.get("n_subs"),
@@ -251,6 +323,7 @@ def main() -> None:
         d_base = -r_base
         report = {
             "group": gname,
+            "box": gbox,
             "chunks": [[b, int(c)] for b, c in keys],
             "n_candidates": len(per_cand),
             "n_feasible": len(feas),
@@ -328,6 +401,7 @@ def main() -> None:
         for rec in records:
             fh.write(json.dumps(rec, sort_keys=True, default=float) + "\n")
 
+    cat_div = _catalog_diversity(records)
     reductions = [g["best_reduction_vs_mean"] for g in group_reports]
     finite = [r for r in reductions if np.isfinite(r)]
     n_ok = sum(1 for r in finite if r >= args.gate_target)
@@ -338,19 +412,26 @@ def main() -> None:
     # A joint Mahalanobis improvement alone does not pass: R_cat can fall
     # because the abundance block moved while <N_sub|M_host> stayed flat, and
     # flat occupation is the failure this project exists to fix.
+    # The target is a SIZE, not a sign. "Better than a random draw by any
+    # margin" was the old test, and with K candidates the best of K beats the
+    # median of K essentially by construction: a >0 criterion measures that
+    # sampling noise exists, not that occupation can be controlled. The same
+    # gate_target the joint score is held to now applies to occupation.
     occ_groups = [
         g for g in group_reports
         if g["n_improved_reliable"] >= need_reliable
         and g["n_improved_upper"] >= need_upper
         and np.isfinite(g["occ_reduction_vs_random"])
-        and g["occ_reduction_vs_random"] > 0
+        and g["occ_reduction_vs_random"] >= args.gate_target
     ]
     n_occ_ok = len(occ_groups)
     joint_ok = n_ok >= 2 and feas_frac > 0
     occ_ok = n_occ_ok >= 2 and feas_frac > 0
     abundance_only = (not occ_ok) and any(g["abundance_only"] for g in group_reports)
 
-    if occ_ok:
+    if uncalibrated:
+        decision = "blocked_uncalibrated_constraints"
+    elif occ_ok:
         decision = "support_present_occupation"
     elif abundance_only:
         decision = "abundance_only_improvement"
@@ -364,7 +445,8 @@ def main() -> None:
         "n_groups_meeting_target": n_ok,
         "n_groups": len(group_reports),
         "mean_feasible_fraction": feas_frac,
-        "diversity_per_box": div,
+        "field_diversity_per_box": div,
+        "catalog_diversity_per_group": cat_div,
         # occupation criterion
         "reliable_host_bins": reliable,
         "upper_reliable_host_bins": upper,
@@ -378,12 +460,16 @@ def main() -> None:
         "n_groups_occupation_ok": n_occ_ok,
         "joint_criterion_met": bool(joint_ok),
         "occupation_criterion_met": bool(occ_ok),
+        "constraints_calibrated": uncalibrated is None,
+        "constraints_uncalibrated_reason": uncalibrated,
+        "group_definition": "one complete box per group (B chunks from that box)",
         "decision": decision,
         "note": (
             "Gate B passes only on OCCUPATION: >= "
             f"{need_reliable} reliable host bins improved, including >= "
             f"{need_upper} of the upper reliable bins ({upper}), beating a "
-            "single random draw, reproduced on >= 2 ensemble groups, with the "
+            f"single random draw by >= {100 * args.gate_target:.0f}%, reproduced "
+            "on >= 2 boxes, with the "
             f"sparse bins {sparse} excluded from the criterion. A joint R_cat "
             "improvement alone is reported as 'abundance_only_improvement', "
             "not a pass. A negative result shows only that ORDINARY SAMPLES "
@@ -393,7 +479,9 @@ def main() -> None:
         ),
     }
     if decision != "support_present_occupation":
-        gate["diagnosis"] = _diagnose(group_reports, div, cand_rows)
+        gate["diagnosis"] = _diagnose(group_reports, div, cand_rows, cat_div)
+        if uncalibrated:
+            gate["diagnosis"].insert(0, uncalibrated)
         gate["diagnosis"].append(
             "Gate B is not a final no-go test. Escalate: (1) sweep K, "
             "temperature and residual scale; (2) CEM/evolutionary search over "
@@ -410,6 +498,10 @@ def main() -> None:
                 "reward_model_lambda": model.lam})
 
     banner(f"Gate B: {gate['decision']}")
+    if uncalibrated:
+        print(f"  !! {uncalibrated}", flush=True)
+        print("  !! No verdict is reported until then. Everything below is still "
+              "computed, for diagnosis only.", flush=True)
     for g in group_reports:
         print(f"  {g['group']}: D2 base={g['D2_base']:.4g} mean={g['D2_mean_sample']:.4g} "
               f"best={g['D2_best_feasible']:.4g} "
@@ -429,15 +521,30 @@ def main() -> None:
     print(f"  -> {out / 'gate_b.json'}", flush=True)
 
 
-def _diagnose(group_reports, div, cand_rows):
+def _diagnose(group_reports, div, cand_rows, cat_div=None):
     out = []
     dv = [v for v in div.values() if np.isfinite(v)]
     if dv and float(np.mean(dv)) < 0.02:
         out.append(
-            f"residual diversity is {np.mean(dv):.3g}: the sampler is nearly "
+            f"residual FIELD diversity is {np.mean(dv):.3g}: the sampler is nearly "
             "deterministic, so best-of-K has nothing to select from. Check "
             "residual_scale and the prior's sample diversity before blaming support."
         )
+    cv = [g["occupation_rel_spread"] for g in (cat_div or {}).values()
+          if np.isfinite(g.get("occupation_rel_spread", np.nan))]
+    if cv and float(np.mean(cv)) < 0.02:
+        msg = (
+            f"CATALOG diversity is {np.mean(cv):.3g}: the occupation curve is "
+            "essentially the same for every candidate"
+        )
+        if dv and float(np.mean(dv)) >= 0.02:
+            msg += (
+                f", even though field diversity is {np.mean(dv):.3g}. That is "
+                "SR2's original failure reproduced in the residual: the field "
+                "moves, the subhalos do not. More samples will not help; the "
+                "residual has to reach the collapsed scales"
+            )
+        out.append(msg + ".")
     feas = [r for r in cand_rows if r.get("feasible")]
     if not feas:
         out.append(

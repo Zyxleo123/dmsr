@@ -15,8 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import (add_common_args, banner, bins_of, load_reward_config,
-                     parse_boxes, split_boxes, write_json)
+from _common import (active_dims_of, add_common_args, banner, bins_of,
+                     load_reward_config, parse_boxes, split_boxes, write_json)
 
 from cosmo_sr.reward import paths
 from cosmo_sr.reward.catalog import read_summaries
@@ -77,9 +77,25 @@ def main() -> None:
         print(f"  dropped {dropped} chunks with zero core volume", flush=True)
 
     ens = int(args.ensemble_size or rcfg.get("ensemble_size_B", 16))
+    active = active_dims_of(cfg, bins)
+    n_boxes = len({c.box for c in usable})
+    if len(active) < bins.dim:
+        excluded = [bins.labels()[i] for i in range(bins.dim) if i not in set(active)]
+        print(f"  reward dimensions: {len(active)} of {bins.dim} "
+              f"(excluded: {', '.join(excluded)})", flush=True)
+    if n_boxes < len(active):
+        # A full covariance on D dimensions from B independent boxes is
+        # underdetermined; the ridge is what makes it invertible at all, so say
+        # so rather than letting cond(C_reg) look like a measurement.
+        print(f"  ! {n_boxes} independent boxes for {len(active)} reward "
+              f"dimensions: the covariance is underdetermined and the reported "
+              f"conditioning is set by reward.shrinkage={rcfg.get('shrinkage', 0.1)}, "
+              f"not by the data. Treat off-diagonal structure as regularised, "
+              f"not measured.", flush=True)
     model = fit_reward_model(
         usable, bins,
         ensemble_size=ens,
+        active_dims=active,
         n_draws=int(args.draws or rcfg.get("bootstrap_draws", 400)),
         shrinkage=float(args.shrinkage if args.shrinkage is not None
                         else rcfg.get("shrinkage", 0.1)),
@@ -92,7 +108,9 @@ def main() -> None:
 
     cond = model.condition_number
     diag = np.sqrt(np.diag(model.cov))
-    print(f"  dim={model.dim}  lambda={model.lam:.4g}  cond(C_reg)={cond:.3g}", flush=True)
+    print(f"  dim={model.active_dim}/{model.dim}  lambda={model.lam:.4g}  "
+          f"cond(C_reg active)={cond:.3g}  "
+          f"cond(C_reg full)={model.condition_number_full:.3g}", flush=True)
     print(f"  per-bin bootstrap sigma: min={diag.min():.4g} max={diag.max():.4g}",
           flush=True)
     if cond > 1e4:

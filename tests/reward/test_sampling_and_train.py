@@ -199,6 +199,47 @@ def test_per_sample_weights_scale_the_denoising_loss():
     assert float(l2.detach()) == pytest.approx(2 * float(l1.detach()), rel=1e-5)
 
 
+def _tiny_box(ng=32, seed=0):
+    rng = np.random.default_rng(seed)
+    base = rng.normal(0, 0.05, (6, ng, ng, ng)).astype(np.float32)
+    lr = base.reshape(6, ng // 4, 4, ng // 4, 4, ng // 4, 4).mean(axis=(2, 4, 6))
+    return base, lr.astype(np.float32)
+
+
+def test_init_noise_replaces_the_seeded_draw():
+    """CEM needs to perturb a *specific* noise vector, not just reseed."""
+    m = _perturbed(levels=1)
+    base, lr = _tiny_box()
+    spec = TileSpec(32, core=16, margin=8, scale_factor=4)
+    cfg = DiffusionConfig(n_steps=2, churn=0.0)
+    noise = np.random.default_rng(3).standard_normal(base.shape).astype(np.float32)
+
+    def run(seed, init):
+        return sample_residual_box(m, base, lr, seed=seed, cfg=cfg, spec=spec,
+                                   verify_margin=False, init_noise=init)
+
+    # With churn = 0 the seed is unused once init_noise is given, so two
+    # different seeds must produce bit-identical fields.
+    assert np.array_equal(run(0, noise), run(999, noise))
+    # And a different noise vector must actually change the answer, or the
+    # search would be optimising something the sampler ignores.
+    other = np.random.default_rng(4).standard_normal(base.shape).astype(np.float32)
+    assert not np.allclose(run(0, noise), run(0, other))
+    # Without init_noise the seed still drives everything, as before.
+    assert not np.allclose(run(0, None), run(1, None))
+
+
+def test_init_noise_of_the_wrong_shape_is_refused():
+    m = _perturbed(levels=1)
+    base, lr = _tiny_box()
+    with pytest.raises(ValueError, match="init_noise shape"):
+        sample_residual_box(m, base, lr, seed=0,
+                            cfg=DiffusionConfig(n_steps=1, churn=0.0),
+                            spec=TileSpec(32, core=16, margin=8, scale_factor=4),
+                            verify_margin=False,
+                            init_noise=np.zeros((6, 16, 16, 16), dtype=np.float32))
+
+
 def _smoke_cfg(tmp_path, mode):
     cfg = {
         "split": {"train_boxes": ["set0"], "val_boxes": ["set1"]},

@@ -64,21 +64,37 @@ def marginal_contributions(
     model: RewardModel,
     ensemble: Mapping[int, ChunkSummary],
     baseline: Mapping[int, ChunkSummary],
+    *,
+    score: str = "R_occ",
 ) -> Dict[int, float]:
     """``A_{k,i}`` for every chunk of one ensemble, from cached summaries only.
 
     ``ensemble`` and ``baseline`` are keyed by chunk id and must cover the same
     chunks; ``baseline[i]`` is chunk ``i`` measured on the frozen SR2 field.
+
+    ``score`` picks which reward the credit is measured in: ``R_occ`` (default),
+    ``R_abund`` or the joint ``R_cat``. It must match what selection was decided
+    on. Credit in ``R_cat`` while Gate B is decided on occupation up-weights
+    chunks that improved *abundance* -- so the elite set trains the model toward
+    a statistic nobody selected for, and a distilled model can move R_cat while
+    leaving occupation exactly as flat as SR2 left it.
     """
+    fn = {
+        "R_cat": model.reward,
+        "R_occ": model.reward_occupation,
+        "R_abund": model.reward_abundance,
+    }.get(str(score))
+    if fn is None:
+        raise ValueError(f"unknown score {score!r}; use R_occ, R_abund or R_cat")
     keys = list(ensemble)
     missing = [k for k in keys if k not in baseline]
     if missing:
         raise KeyError(f"no baseline summary for chunks {missing}")
-    full = model.reward(pool([ensemble[k] for k in keys]))
+    full = fn(pool([ensemble[k] for k in keys]))
     out: Dict[int, float] = {}
     for k in keys:
         swapped = [baseline[k] if kk == k else ensemble[kk] for kk in keys]
-        out[k] = float(full - model.reward(pool(swapped)))
+        out[k] = float(full - fn(pool(swapped)))
     return out
 
 

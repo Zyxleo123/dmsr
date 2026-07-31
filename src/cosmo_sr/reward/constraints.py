@@ -54,6 +54,10 @@ class ConstraintSet:
     density_power_error_max: Optional[float] = None
     lr_consistency_error_max: Optional[float] = None
     diversity_min: Optional[float] = 0.05
+    # False = the committed thresholds are placeholders, not values derived from
+    # the frozen baseline. Carried on the object (not just left in the YAML) so
+    # a consumer cannot use the numbers without also seeing where they came from.
+    calibrated: bool = False
 
     def to_dict(self) -> Dict:
         return {
@@ -62,6 +66,7 @@ class ConstraintSet:
             "density_power_error_max": self.density_power_error_max,
             "lr_consistency_error_max": self.lr_consistency_error_max,
             "diversity_min": self.diversity_min,
+            "calibrated": self.calibrated,
         }
 
     def as_bounds(self) -> Dict[str, Tuple[str, Optional[float]]]:
@@ -85,6 +90,7 @@ def load_constraints(cfg: Dict) -> ConstraintSet:
         density_power_error_max=g("density_power_error_max", None),
         lr_consistency_error_max=g("lr_consistency_error_max", None),
         diversity_min=g("diversity_min", 0.05),
+        calibrated=bool(c.get("calibrated", False)),
     )
 
 

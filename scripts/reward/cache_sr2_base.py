@@ -59,24 +59,40 @@ def main() -> None:
     base.assert_frozen()
 
     rows = []
+    last_spec = {}
     for b in boxes:
-        path = base.cache_path(b, args.seed)
+        # The cache key includes a checksum of the LR field, so the LR has to be
+        # read before the path is known. It is 6 MB against a 3.2 GB output.
+        lr = np.load(lr_path(cfg, b))
+        path = base.cache_path(b, args.seed, lr)
+        last_spec = base.spec(b, args.seed, lr).__dict__
+        stale = sorted(
+            p for p in cache.glob(f"{b}_seed{args.seed}_*.npy") if p != path
+        )
+        if stale:
+            print(f"[{b}] ! {len(stale)} field(s) under a different key: "
+                  f"{', '.join(p.name for p in stale)}", flush=True)
+            print(f"[{b}]   the weights, the LR field or the code version "
+                  f"changed. Delete them, or downstream globs will refuse to "
+                  f"choose.", flush=True)
         if path.is_file() and not args.overwrite:
             print(f"[{b}] cached already -> {path.name}", flush=True)
-            rows.append({"box": b, "path": str(path), "regenerated": False})
+            rows.append({"box": b, "path": str(path), "regenerated": False,
+                         "stale_siblings": [str(p) for p in stale]})
             continue
-        lr = np.load(lr_path(cfg, b))
         t0 = time.time()
-        field = base.base_field(lr, args.seed, box=b, use_cache=True, mmap=False)
+        field = base.base_field(lr, args.seed, box=b, use_cache=True, mmap=False,
+                                overwrite=args.overwrite)
         dt = time.time() - t0
         print(f"[{b}] {tuple(field.shape)} in {dt:.1f}s -> {path.name}", flush=True)
-        rows.append({"box": b, "path": str(path), "regenerated": True, "seconds": dt})
+        rows.append({"box": b, "path": str(path), "regenerated": True,
+                     "seconds": dt, "stale_siblings": [str(p) for p in stale]})
 
     write_json(cache / "cache_manifest.json", {
         "seed": int(args.seed),
         "model_sha": base.model_sha(),
         "model_path": str(model_path),
-        "spec": base.spec(boxes[0], args.seed).__dict__ if boxes else {},
+        "spec": last_spec,
         "boxes": rows,
     })
     banner("done")

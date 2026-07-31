@@ -24,6 +24,7 @@ from _common import (add_common_args, banner, bins_of, chunk_grid, constraints_o
                      read_jsonl, write_json, PROJECT_ROOT)
 
 from cosmo_sr.reward import paths
+from cosmo_sr.reward.base import find_base_field
 from cosmo_sr.reward.catalog import write_summaries
 from cosmo_sr.reward.constraints import check_feasible, constraint_values
 from cosmo_sr.reward.pipeline import field_to_chunk_summaries
@@ -89,10 +90,10 @@ def _score_one(cfg, freeze, grid, bins, cons, geo, dcfg, out, scored_dir, summar
 
     base_seed = int(manifest.get("base_seed", 0))
     if base_path is None:
-        hits = sorted(paths.SR2_BASE_CACHE().glob(f"{box}_seed{base_seed}_*.npy"))
-        if not hits:
+        found = find_base_field(box, base_seed)
+        if found is None:
             raise SystemExit(f"no cached SR2 base for {box}")
-        base_path = str(hits[0])
+        base_path = str(found)
     base = np.load(base_path, mmap_mode="r")
 
     if residual_path is None or residual_scale == 0.0:

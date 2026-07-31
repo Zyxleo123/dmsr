@@ -32,10 +32,16 @@ source "$_D/_reward_common.sh" "$@"
 
 # ---- optimisation -----------------------------------------------------------
 : "${STEPS:=60000}"
-: "${BATCH_SIZE:=4}"
-: "${GRAD_ACCUM:=2}"
+# CROP_HR is the SCORED CORE and CONTEXT_MARGIN the real neighbourhood around
+# it, so the model is trained on the same 160^3 window full-box tiling gives it
+# (TILE_MARGIN=48 in sample_reward_oracle.sbatch). Batch 1 x accum 8 keeps the
+# effective batch at 8 against the 15.6x larger input. See the note in
+# configs/reward/residual_prior.yaml before changing either.
+: "${BATCH_SIZE:=1}"
+: "${GRAD_ACCUM:=8}"
 : "${LR:=1.0e-4}"
 : "${CROP_HR:=64}"
+: "${CONTEXT_MARGIN:=48}"
 : "${CKPT_EVERY:=2000}"
 : "${VAL_EVERY:=1000}"
 : "${NUM_WORKERS:=${SLURM_CPUS_PER_TASK:-8}}"
@@ -64,6 +70,7 @@ python -u scripts/reward/train_residual_prior.py \
     --set split.val_boxes="[${VAL_BOXES//,/, }]" \
     --set data.root="$DATA" \
     --set data.crop_hr="$CROP_HR" \
+    --set data.context_margin="$CONTEXT_MARGIN" \
     --set data.base_seed="$BASE_SEED" \
     --set train.steps="$STEPS" \
     --set train.batch_size="$BATCH_SIZE" \
@@ -77,3 +84,15 @@ python -u scripts/reward/train_residual_prior.py \
     --set train.device="$DEVICE"
 
 echo "=== prior -> $RUN_DIR (ckpt_best.pt, ckpt_last.pt, metrics.csv)"
+
+# Gate A is decided HERE, mechanically, and written to gate_a.json. Not strict:
+# a failing Gate A must not strand Gate B on DependencyNeverSatisfied with no
+# explanation -- sample_reward_oracle.sbatch reads the verdict and says why it
+# is not sampling.
+python -u scripts/reward/gate_a_check.py \
+    --config "$REWARD_CFG" \
+    --run-dir "$RUN_DIR" \
+    ${SIGMA_JSON:+--audit "$DMSR_REWARD_ROOT/audits/residual_target_audit/residual_target_audit.json"} \
+    || echo ">>> gate_a_check.py itself errored; treat Gate A as UNDECIDED"
+
+echo "=== Gate A verdict -> $RUN_DIR/gate_a.json"

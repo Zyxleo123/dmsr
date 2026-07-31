@@ -34,6 +34,7 @@ __all__ = [
     "ddim_sample",
     "denoising_loss",
     "sample_timesteps",
+    "valid_core",
     "whiten",
     "unwhiten",
 ]
@@ -92,6 +93,27 @@ def _loss_weight(t: torch.Tensor, cfg: DiffusionConfig) -> torch.Tensor:
     raise ValueError(f"unknown loss_weighting {cfg.loss_weighting!r}")
 
 
+def valid_core(x: torch.Tensor, core: Optional[int]) -> torch.Tensor:
+    """Central ``core^3`` sub-cube of a ``(B, C, D, H, W)`` tensor.
+
+    ``core=None`` or a core at least as large as the input returns ``x``
+    untouched, so the no-context path costs nothing.
+    """
+    if core is None:
+        return x
+    core = int(core)
+    n = int(x.shape[-1])
+    if core >= n:
+        return x
+    if core <= 0 or (n - core) % 2:
+        raise ValueError(
+            f"core={core} is not a centred sub-cube of a {n}^3 crop "
+            f"(the margin must be equal on both sides)"
+        )
+    o = (n - core) // 2
+    return x[..., o:o + core, o:o + core, o:o + core]
+
+
 def denoising_loss(
     model,
     u0: torch.Tensor,
@@ -101,12 +123,21 @@ def denoising_loss(
     generator: Optional[torch.Generator] = None,
     per_sample_weight: Optional[torch.Tensor] = None,
     reduce: bool = True,
+    core: Optional[int] = None,
 ):
     """``|| eps - eps_phi(u_t, t, cond) ||^2`` on whitened residuals ``u0``.
 
     ``per_sample_weight`` is the reward weight ``w_i`` of section 8; it multiplies
     each element's mean squared error before the batch mean, so a batch mixing
     supervised and elite examples can be scored in one pass.
+
+    ``core`` restricts the loss to the central ``core^3`` region of the crop.
+    The forward pass still runs on the whole (context-expanded) input -- the
+    context is what makes the core's neighbourhood real -- but the voxels near
+    the crop boundary saw a circularly wrapped neighbourhood that does not exist
+    in the box, so training on them teaches a mapping full-box tiling will never
+    ask for. ``None`` scores everything, which is only correct when the model's
+    receptive-field half-width is below half the crop.
 
     Returns ``(loss, aux)`` where ``aux`` carries ``t``, ``eps``, ``eps_hat``.
     """
@@ -120,6 +151,7 @@ def denoising_loss(
     u_t = a * u0 + s * eps
     eps_hat = model(u_t, t, **cond)
     per_elem = (eps_hat - eps) ** 2
+    per_elem = valid_core(per_elem, core)
     per_sample = per_elem.flatten(1).mean(dim=1) * _loss_weight(t, cfg)
     if per_sample_weight is not None:
         per_sample = per_sample * per_sample_weight.reshape(-1).to(per_sample.dtype)

@@ -35,4 +35,25 @@ python -u scripts/reward/train_residual_prior.py \
     --set train.device="$DEVICE"
 
 echo "=== smoke run -> $RUN_DIR"
-echo "=== Gate A: check metrics.csv for finite loss and diag_sample_diversity > 0"
+
+# The smoke run is 6 steps on a tiny model: it cannot pass the real Gate A and
+# is not meant to. What it CAN answer mechanically is "did anything produce a
+# NaN, and does a sampled residual have spread", which is why the criteria are
+# evaluated here rather than left to a human reading metrics.csv. Unevaluated
+# criteria are allowed; a hard FAIL still stops the chain, because the long job
+# would fail the same way eight hours later.
+python -u scripts/reward/gate_a_check.py \
+    --config "$REWARD_CFG" \
+    --run-dir "$RUN_DIR" \
+    --out "$RUN_DIR/gate_a_smoke.json" \
+    --allow-unevaluated \
+    --strict \
+    --loss-drop -1e9 \
+    || { echo "!!! Gate A smoke criteria FAILED; see $RUN_DIR/gate_a_smoke.json"
+         echo "!!! The dependent training job will stay on DependencyNeverSatisfied."
+         echo "!!! That is deliberate: it would fail the same way, eight hours later."
+         exit 1; }
+
+echo "=== Gate A smoke verdict -> $RUN_DIR/gate_a_smoke.json"
+echo "=== the REAL Gate A runs after training:"
+echo "===   python scripts/reward/gate_a_check.py --run-dir <prior run dir>"

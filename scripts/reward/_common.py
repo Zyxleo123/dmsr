@@ -74,8 +74,46 @@ def bins_of(cfg: Dict) -> CatalogBins:
     )
 
 
+def active_dims_of(cfg: Dict, bins: Optional[CatalogBins] = None) -> List[int]:
+    """Summary-vector dimensions the reward is scored on.
+
+    ``reward.occupation.include_sparse_in_reward: false`` drops the sparse host
+    bins from the quadratic form. It used to be documentation only -- the bins
+    were built regardless and every scored candidate carried the 1e14 bin in an
+    11-d reward, which is exactly the configuration ``audit_reward_covariance``
+    reported as "fail" (96% of the baseline distance in one near-empty bin).
+    The bins themselves are still *measured* and reported; they are just not
+    part of R_cat.
+    """
+    b = bins if bins is not None else bins_of(cfg)
+    occ = dict(cfg.get("reward", {}).get("occupation", {}))
+    dims = list(range(b.dim))
+    if occ.get("include_sparse_in_reward", True):
+        return dims
+    drop = {b.n_sub_bins + int(i) for i in occ.get("sparse_host_bins", [])}
+    return [i for i in dims if i not in drop]
+
+
 def constraints_of(cfg: Dict) -> ConstraintSet:
     return load_constraints(cfg.get("constraints", {}))
+
+
+def require_calibrated_constraints(cfg: Dict) -> Optional[str]:
+    """``None`` if the thresholds were calibrated, else why they were not.
+
+    ``constraints.calibrated: false`` marks the committed thresholds as
+    placeholders. Nothing used to read it, so a feasibility filter built from
+    guesses looked identical to one built from the frozen baseline.
+    """
+    c = dict(cfg.get("constraints", {}))
+    if bool(c.get("calibrated", False)):
+        return None
+    return (
+        "configs/reward/reward.yaml has constraints.calibrated: false -- the "
+        "feasibility thresholds are placeholders. Run "
+        "scripts/reward/calibrate_constraints.py, paste the proposed block in, "
+        "and set calibrated: true."
+    )
 
 
 def split_boxes(cfg: Dict, which: str) -> List[str]:

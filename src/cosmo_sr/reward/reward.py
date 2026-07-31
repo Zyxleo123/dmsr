@@ -39,6 +39,12 @@ class RewardModel:
     n_draws: int
     labels: Tuple[str, ...] = ()
     meta: Dict = dc_field(default_factory=dict)
+    # Which of the ``D`` binned statistics the reward is actually a function of.
+    # ``mu`` and ``cov`` stay full-dimensional -- an excluded bin is still
+    # *reported*, it just carries no gradient and no Mahalanobis weight -- but
+    # ``R_cat`` is the quadratic form on this sub-block alone. Empty by
+    # convention means "all dimensions active".
+    active_dims: Tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         self.mu = np.asarray(self.mu, dtype=np.float64)
@@ -46,6 +52,13 @@ class RewardModel:
         d = self.mu.shape[0]
         if self.cov.shape != (d, d):
             raise ValueError(f"cov {self.cov.shape} does not match mu {self.mu.shape}")
+        self.active_dims = tuple(int(i) for i in (self.active_dims or range(d)))
+        bad = [i for i in self.active_dims if not 0 <= i < d]
+        if bad:
+            raise ValueError(f"active_dims {bad} out of range for dim {d}")
+        if len(set(self.active_dims)) != len(self.active_dims):
+            raise ValueError(f"active_dims has duplicates: {self.active_dims}")
+        self._active = np.asarray(self.active_dims, dtype=np.int64)
         self._cov_reg = self.cov + float(self.lam) * np.eye(d)
         self._prec = np.linalg.inv(self._cov_reg)
         # Symmetrise: inv() of a symmetric matrix can drift at the 1e-16 level,
@@ -58,24 +71,42 @@ class RewardModel:
         return int(self.mu.shape[0])
 
     @property
+    def active_dim(self) -> int:
+        """Number of dimensions the reward is actually scored on."""
+        return int(self._active.size)
+
+    @property
     def cov_reg(self) -> np.ndarray:
         return self._cov_reg
 
     @property
     def precision(self) -> np.ndarray:
-        return self._prec
+        """Precision of the ACTIVE block, embedded back into the full ``D x D``.
+
+        Inactive rows/columns are exactly zero, so ``d @ precision @ d`` is the
+        reward's quadratic form no matter what an excluded bin contains.
+        """
+        cache = self.__dict__.setdefault("_prec_active", {})
+        if "full" not in cache:
+            p = np.zeros((self.dim, self.dim), dtype=np.float64)
+            p[np.ix_(self._active, self._active)] = self._block_precision(self._active)
+            cache["full"] = p
+        return cache["full"]
 
     @property
     def condition_number(self) -> float:
+        """cond of the ACTIVE regularized covariance -- what the reward inverts."""
+        return float(np.linalg.cond(self._cov_reg[np.ix_(self._active, self._active)]))
+
+    @property
+    def condition_number_full(self) -> float:
         return float(np.linalg.cond(self._cov_reg))
 
     def vector(self, ens: EnsembleSummary) -> Tuple[np.ndarray, np.ndarray]:
         return summary_vector(ens, self.bins, empty_fill=self.mu)
 
     def mahalanobis2(self, ens: EnsembleSummary) -> float:
-        s, _ = self.vector(ens)
-        d = s - self.mu
-        return float(d @ self._prec @ d)
+        return self.block_mahalanobis2(ens, self._active)
 
     def reward(self, ens: EnsembleSummary) -> float:
         """``-D^2``. Maximal (0) exactly when ``s(E) == mu_HR``."""
@@ -102,12 +133,19 @@ class RewardModel:
 
     @property
     def abundance_index(self) -> np.ndarray:
-        return np.arange(self.bins.n_sub_bins, dtype=np.int64)
+        """Active abundance dimensions."""
+        return np.asarray(
+            [i for i in self._active if i < self.bins.n_sub_bins], dtype=np.int64
+        )
 
     @property
     def occupation_index(self) -> np.ndarray:
+        """Active occupation dimensions (excluded host bins are not scored)."""
         j = self.bins.n_sub_bins
-        return np.arange(j, j + self.bins.n_host_bins, dtype=np.int64)
+        return np.asarray(
+            [i for i in self._active if j <= i < j + self.bins.n_host_bins],
+            dtype=np.int64,
+        )
 
     def _block_precision(self, idx: np.ndarray) -> np.ndarray:
         key = tuple(int(i) for i in idx)
@@ -152,9 +190,14 @@ class RewardModel:
         The sign is dropped deliberately: occupation can in principle overshoot,
         and "closer to HR" is the improvement we mean. Bins with no hosts give
         NaN rather than a fabricated zero.
+
+        Reported for **every** host bin, including ones excluded from the reward
+        by ``active_dims``: the gate indexes this by host-bin number, and an
+        excluded bin is still evidence about what the residual did.
         """
         s, valid = self.vector(ens)
-        idx = self.occupation_index
+        j = self.bins.n_sub_bins
+        idx = np.arange(j, j + self.bins.n_host_bins, dtype=np.int64)
         sd = np.sqrt(np.diag(self._cov_reg)[idx])
         gap = np.abs(s[idx] - self.mu[idx]) / np.where(sd > 0, sd, np.nan)
         return np.where(valid[idx], gap, np.nan)
@@ -169,19 +212,25 @@ class RewardModel:
         }
         if reliable_host_bins is not None:
             j = self.bins.n_sub_bins
-            idx = [j + int(i) for i in reliable_host_bins]
+            active = set(int(i) for i in self._active)
+            idx = [j + int(i) for i in reliable_host_bins if j + int(i) in active]
             out["R_occ_reliable"] = -self.block_mahalanobis2(ens, idx)
         return out
 
     def components(self, ens: EnsembleSummary) -> Dict[str, float]:
-        """Per-bin contribution ``d_i * (C^-1 d)_i`` for diagnosis (sums to D^2)."""
+        """Per-bin contribution ``d_i * (C^-1 d)_i`` for diagnosis (sums to D^2).
+
+        Bins outside ``active_dims`` contribute exactly zero, because they are
+        not in the quadratic form at all.
+        """
         s, valid = self.vector(ens)
         d = s - self.mu
-        contrib = d * (self._prec @ d)
+        contrib = d * (self.precision @ d)
         names = self.labels or tuple(self.bins.labels())
         out = {f"contrib_{n}": float(v) for n, v in zip(names, contrib)}
-        out["mahalanobis2"] = float(d @ self._prec @ d)
+        out["mahalanobis2"] = float(contrib.sum())
         out["n_valid_bins"] = float(np.count_nonzero(valid))
+        out["n_active_bins"] = float(self.active_dim)
         return out
 
     def to_dict(self) -> Dict:
@@ -190,12 +239,17 @@ class RewardModel:
             "cov": self.cov.tolist(),
             "lam": float(self.lam),
             "cov_reg_condition_number": self.condition_number,
+            "cov_reg_condition_number_full": self.condition_number_full,
             "cov_condition_number": float(np.linalg.cond(self.cov))
             if np.linalg.matrix_rank(self.cov) == self.dim else float("inf"),
             "bins": self.bins.to_dict(),
             "ensemble_size": int(self.ensemble_size),
             "n_draws": int(self.n_draws),
             "labels": list(self.labels or self.bins.labels()),
+            "active_dims": [int(i) for i in self.active_dims],
+            "active_labels": [
+                (self.labels or tuple(self.bins.labels()))[i] for i in self.active_dims
+            ],
             "meta": dict(self.meta),
         }
 
@@ -224,6 +278,7 @@ class RewardModel:
             ensemble_size=int(d["ensemble_size"]),
             n_draws=int(d["n_draws"]),
             labels=tuple(d.get("labels", ())),
+            active_dims=tuple(int(i) for i in d.get("active_dims", ())),
             meta=dict(d.get("meta", {})),
         )
 
@@ -241,9 +296,16 @@ def stratified_ensembles(
 
     ``strata[i]`` labels chunk ``i`` (box, host-mass class, environment class...).
     Each draw takes as evenly as possible from every stratum, so one massive-host
-    chunk cannot dominate every ensemble. With ``replace_boxes`` the draw is a
-    box-level bootstrap: boxes are resampled with replacement first, which is the
-    correct independent unit here (chunks inside a box are not independent).
+    chunk cannot dominate every ensemble.
+
+    With ``replace_boxes`` the draw is a **box-level bootstrap**: boxes are
+    resampled with replacement and a box drawn twice contributes twice as many
+    chances, exactly as a bootstrap of the independent unit requires. Chunks
+    inside a box are not independent, so resampling chunks directly would
+    understate the ensemble covariance -- which is the whole quantity being
+    estimated. (An earlier version resampled boxes only to build a *set* of
+    eligible strata and then drew chunks uniformly across it; that discarded the
+    multiplicity and was a chunk bootstrap wearing a box bootstrap's name.)
     """
     rng = np.random.default_rng(int(seed))
     n = len(chunks)
@@ -256,24 +318,37 @@ def stratified_ensembles(
     for i, s in enumerate(strata):
         groups.setdefault(str(s), []).append(i)
     keys = sorted(groups)
+    boxes = sorted({c.box for c in chunks})
+    by_box: Dict[str, List[str]] = {}
+    for k in keys:
+        for b in sorted({chunks[i].box for i in groups[k]}):
+            by_box.setdefault(b, []).append(k)
 
     draws: List[List[int]] = []
     for _ in range(int(n_draws)):
         if replace_boxes:
-            boxes = sorted({chunks[i].box for i in range(n)})
-            picked = rng.choice(boxes, size=len(boxes), replace=True)
-            pool_keys = [k for k in keys if any(
-                chunks[i].box in picked for i in groups[k]
-            )] or keys
+            picked = list(rng.choice(boxes, size=len(boxes), replace=True))
+            # Within a resampled box only that box's chunks are eligible, and
+            # there is one slot per (resampled box, stratum) pair -- so a box
+            # drawn twice really does contribute its chunks twice.
+            eligible = {
+                (b, k): [i for i in groups[k] if chunks[i].box == b]
+                for b in set(picked) for k in by_box.get(b, [])
+            }
+            slots = [(b, k) for b in picked for k in by_box.get(b, [])]
         else:
-            pool_keys = keys
+            eligible = {(None, k): groups[k] for k in keys}
+            slots = [(None, k) for k in keys]
+        slots = [s for s in slots if eligible[s]]
+        if not slots:
+            raise ValueError("bootstrap resampling produced no eligible chunks")
+        rng.shuffle(slots)
         take: List[int] = []
-        order = list(pool_keys)
-        rng.shuffle(order)
         k = 0
         while len(take) < ensemble_size:
-            g = groups[order[k % len(order)]]
-            take.append(int(rng.choice(g)))
+            g = eligible[slots[k % len(slots)]]
+            if g:
+                take.append(int(rng.choice(g)))
             k += 1
         draws.append(take[:ensemble_size])
     return draws
@@ -289,12 +364,17 @@ def fit_reward_model(
     strata: Optional[Sequence[str]] = None,
     seed: int = 0,
     min_lambda: float = 1e-8,
+    active_dims: Optional[Sequence[int]] = None,
 ) -> RewardModel:
     """Estimate ``mu_HR`` and ``C_reg`` from HR chunk summaries by box bootstrap.
 
     ``shrinkage`` is relative: ``lambda = shrinkage * mean(diag(C))``, floored at
     ``min_lambda`` so a degenerate ``C`` (e.g. a synthetic test with identical
     draws) still inverts.
+
+    ``active_dims`` restricts the scored sub-block (see
+    :attr:`RewardModel.active_dims`); ``mu`` and ``C`` are still estimated on
+    every dimension so an excluded bin remains reportable.
     """
     draws = stratified_ensembles(
         hr_chunks, ensemble_size, n_draws, strata=strata, seed=seed
@@ -317,11 +397,13 @@ def fit_reward_model(
         mu=mu, cov=cov, lam=lam, bins=bins,
         ensemble_size=int(ensemble_size), n_draws=int(v.shape[0]),
         labels=tuple(bins.labels()),
+        active_dims=tuple(int(i) for i in active_dims) if active_dims is not None else (),
         meta={
             "shrinkage": float(shrinkage),
             "n_hr_chunks": int(len(hr_chunks)),
             "n_boxes": int(len({c.box for c in hr_chunks})),
             "n_draws_requested": int(n_draws),
             "n_draws_finite": int(v.shape[0]),
+            "box_bootstrap": True,
         },
     )

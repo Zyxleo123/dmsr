@@ -56,15 +56,30 @@ diffusion:
   min_snr_gamma: 5.0
 
 data:
-  crop_hr: 64            # multiple of scale_factor and of 2**num_levels
+  crop_hr: 64            # SCORED CORE, in HR cells; multiple of scale_factor
+  # Real neighbourhood supplied around the core, in HR cells. This is not a
+  # tuning knob: it is the same 48 cells sample_reward_oracle.sbatch uses as
+  # TILE_MARGIN, so a training voxel and an inference voxel see the same
+  # neighbourhood. Below the measured receptive-field half-width (41 cells) the
+  # model would be trained on circularly wrapped context that exists nowhere in
+  # the box -- at crop_hr=64 with no margin that is EVERY voxel, since 41 > 32 --
+  # and then asked at inference for a mapping it never saw.
+  #
+  # The cost is real and is why batch_size fell from 4 to 1: the input volume is
+  # (64 + 96)^3 = 160^3, 15.6x a bare 64^3 crop. grad_accum is raised to keep
+  # the effective batch at 8. If that does not fit, the lever is the receptive
+  # field (num_levels/blocks_per_level, see the table above), NOT the margin --
+  # shrinking the margin does not make the wraparound smaller, it only hides it.
+  context_margin: 48
+  smoke_context_margin: 0
   base_seed: 0           # which frozen SR2 realisation is the baseline
   train_length: 200000
   val_length: 512
 
 train:
   steps: 60000
-  batch_size: 4
-  grad_accum: 2
+  batch_size: 1          # 160^3 inputs; see data.context_margin
+  grad_accum: 8          # effective batch 8, as before
   lr: 1.0e-4
   weight_decay: 0.0
   warmup: 1000

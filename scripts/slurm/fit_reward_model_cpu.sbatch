@@ -21,9 +21,14 @@ _D="${SLURM_SUBMIT_DIR:-/zfsauton2/home/yixiz/DMSR/cosmo_sr_project}/scripts/slu
 source "$_D/_reward_common.sh" "$@"
 
 : "${FIT_BOXES:=}"             # empty = train split
-: "${ENSEMBLE_SIZE:=16}"
-: "${DRAWS:=400}"
-: "${SHRINKAGE:=0.1}"
+# All three default to EMPTY so the config is the single source of truth. A
+# hard-coded ENSEMBLE_SIZE=16 here silently fitted a B=16 reward against a
+# config that says B=8, and B=8 is not a free parameter: at chunk_hr=256 it is
+# exactly one box's worth of chunks, the independent unit the bootstrap
+# resamples. Set them only to sweep deliberately.
+: "${ENSEMBLE_SIZE:=}"
+: "${DRAWS:=}"
+: "${SHRINKAGE:=}"
 : "${MARGIN:=1.5}"
 : "${LOW_K_FRACTION:=0.1}"
 : "${SKIP_CALIBRATION:=0}"
@@ -34,9 +39,9 @@ require_input "$DMSR_REWARD_ROOT/catalog_cache" \
 python -u scripts/reward/fit_reward_model.py \
     --config "$REWARD_CFG" \
     ${FIT_BOXES:+--boxes "$FIT_BOXES"} \
-    --ensemble-size "$ENSEMBLE_SIZE" \
-    --draws "$DRAWS" \
-    --shrinkage "$SHRINKAGE"
+    ${ENSEMBLE_SIZE:+--ensemble-size "$ENSEMBLE_SIZE"} \
+    ${DRAWS:+--draws "$DRAWS"} \
+    ${SHRINKAGE:+--shrinkage "$SHRINKAGE"}
 
 if [ "$SKIP_CALIBRATION" != "1" ]; then
     python -u scripts/reward/calibrate_constraints.py \

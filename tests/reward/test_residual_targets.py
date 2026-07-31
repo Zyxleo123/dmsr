@@ -156,3 +156,59 @@ def test_white_noise_residual_is_mostly_above_the_lr_nyquist(fake_boxes):
     st = residual_stats(hr, base, scale_factor=SF, n_bins=8, channels=(0,))
     frac = st["spectra"]["ch0"]["frac_residual_power_below_lr_nyquist"]
     assert frac < 0.5
+
+
+# --------------------------------------------------------------------------- #
+# Context margin and the valid core
+# --------------------------------------------------------------------------- #
+def test_context_crops_carry_real_neighbourhood_around_the_core(fake_boxes):
+    """The context must be the box's own data, not a wrap of the core.
+
+    This is the whole point: with padding_mode=circular and a receptive field
+    wider than half the crop, a bare crop makes every voxel's neighbourhood
+    artificial, and full-box tiling then supplies a different one.
+    """
+    root, base_dir, boxes = fake_boxes
+    bps = resolve_boxes(boxes, root, base_dir=base_dir)
+    core, margin = 8, SF
+    ds = PairedResidualCrops(bps, crop_hr=core, scale_factor=SF, length=4, seed=0,
+                             context_margin=margin)
+    assert ds.core_hr == core
+    assert ds.crop_hr == core + 2 * margin
+    item = ds[0]
+    assert item["psi_base"].shape[-1] == core + 2 * margin
+    assert item["y_lr"].shape[-1] == (core + 2 * margin) // SF
+    assert int(item["core_hr"]) == core
+
+    # The crop must equal the box slice at the recorded origin, context included.
+    from cosmo_sr.data.crops import periodic_crop
+
+    bi = int(item["box_index"])
+    start = tuple(int(v) for v in item["hr_start"])
+    expect = periodic_crop(np.load(bps[bi].base), start, core, pad=margin)
+    assert np.allclose(item["psi_base"].numpy(), expect, atol=0)
+
+
+def test_a_context_margin_off_the_lr_lattice_is_refused(fake_boxes):
+    root, base_dir, boxes = fake_boxes
+    bps = resolve_boxes(boxes, root, base_dir=base_dir)
+    with pytest.raises(ValueError, match="context_margin"):
+        PairedResidualCrops(bps, crop_hr=8, scale_factor=SF, length=1,
+                            context_margin=SF - 1)
+
+
+def test_zero_margin_is_the_old_behaviour(fake_boxes):
+    root, base_dir, boxes = fake_boxes
+    bps = resolve_boxes(boxes, root, base_dir=base_dir)
+    a = PairedResidualCrops(bps, crop_hr=8, scale_factor=SF, length=1, seed=0)[0]
+    assert a["psi_base"].shape[-1] == 8
+    assert int(a["core_hr"]) == 8
+
+
+def test_two_cached_base_fields_for_one_box_are_refused(fake_boxes):
+    """Picking the first of two keys silently mixes baselines."""
+    root, base_dir, boxes = fake_boxes
+    np.save(base_dir / "set0_seed0_0badc0de.npy",
+            np.load(base_dir / "set0_seed0_deadbeef.npy"))
+    with pytest.raises(RuntimeError, match="cached base fields"):
+        resolve_boxes(boxes, root, base_dir=base_dir)

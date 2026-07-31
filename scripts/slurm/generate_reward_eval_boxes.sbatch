@@ -24,7 +24,12 @@ source "$_D/_reward_common.sh" "$@"
 : "${EVAL_RUN:=final}"
 : "${PRIOR_CKPT:=$DMSR_REWARD_ROOT/checkpoints/residual_prior/ckpt_best.pt}"
 : "${DISTILL_CKPT:=$DMSR_REWARD_ROOT/checkpoints/reward_distill_round_000/ckpt_best.pt}"
-: "${SPLIT:=test}"
+# 'final' = set13/14/15, the boxes nothing has looked at. NOT 'test': that
+# includes set12, which the SR2 subhalo study and the reward sanity check both
+# ran on, and which reward.yaml therefore declares as dev_boxes. Numbers from
+# set12 cannot carry a held-out claim, and the final table is the one place
+# that matters. Pass SPLIT=dev deliberately to look at set12.
+: "${SPLIT:=final}"
 : "${BOXES:=}"
 : "${N_SAMPLES:=4}"
 : "${SEED0:=1000}"

@@ -29,6 +29,7 @@ from _common import (add_common_args, banner, hr_path, load_reward_config,
                      lr_path, split_boxes, write_json)
 
 from cosmo_sr.reward import fields, paths
+from cosmo_sr.reward.base import find_base_field
 
 
 def main() -> None:
@@ -60,11 +61,11 @@ def main() -> None:
     rows = []
     lr_of_hr = []
     for b in boxes:
-        hits = sorted(paths.SR2_BASE_CACHE().glob(f"{b}_seed{args.base_seed}_*.npy"))
-        if not hits:
+        bp = find_base_field(b, args.base_seed)
+        if bp is None:
             print(f"  [{b}] no cached SR2 base, skipping", flush=True)
             continue
-        base = np.load(hits[0], mmap_mode="r")
+        base = np.load(bp, mmap_mode="r")
         hr = np.load(hr_path(cfg, b), mmap_mode="r")
         lr = np.load(lr_path(cfg, b))
 
