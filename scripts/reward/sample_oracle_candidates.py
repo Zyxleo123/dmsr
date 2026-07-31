@@ -34,7 +34,7 @@ from cosmo_sr.reward.sampling import (TileSpec, measure_receptive_field,
 
 
 def load_model(ckpt_path: str, cfg: dict, device, use_ema: bool = True):
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     mcfg = dict(cfg.get("model", {}))
     mcfg.pop("sigma_res", None)
     sigma = state.get("extra", {}).get("sigma_res")

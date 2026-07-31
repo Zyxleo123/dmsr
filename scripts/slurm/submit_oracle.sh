@@ -7,6 +7,10 @@
 #   bash scripts/slurm/submit_oracle.sh exp0         # exp0 prereqs + chain
 #   bash scripts/slurm/submit_oracle.sh gate_a       # just the prior training
 #   SKIP_SMOKE=1 bash scripts/slurm/submit_oracle.sh gate_a   # skip the smoke gate
+#   bash scripts/slurm/submit_oracle.sh gate_b       # sample/score/verdict, once Gate A finishes
+#   GATE_A_JOB=23271 bash scripts/slurm/submit_oracle.sh gate_b   # if squeue can't find it
+#   GATE_B_JOB=23310 bash scripts/slurm/submit_oracle.sh gate_c   # replay + distill, once Gate B's
+#                                                                 # aggregate job (job id above) finishes
 #   DRY=1 bash scripts/slurm/submit_oracle.sh        # print the commands, submit nothing
 #
 # If sbatch itself fails partway (e.g. QOSMaxSubmitJobPerUserLimit), the
@@ -258,6 +262,101 @@ if [[ "$STAGE" =~ ^(all|gate_a)$ ]]; then
         fi
     else
         echo "  !! no residual-prior job scripts found; skipping Gate A" >&2
+    fi
+fi
+
+# --- Gate B: can occupation be controlled at all, with the trained prior? --
+# Not part of "all" -- it needs Gate A's training job id to depend on
+# (afterok), and Gate A is normally submitted separately, hours or days
+# earlier. GATE_A_JOB can be passed explicitly; failing that, this looks for a
+# running/queued job named rw_prior (train_residual_prior.sbatch's job name)
+# and uses it. The reward-model fit has no such dependency -- its only input
+# (catalog_cache) already exists -- so it is submitted immediately rather than
+# waiting behind Gate A.
+if [[ "$STAGE" == "gate_b" ]]; then
+    if [ -r scripts/slurm/sample_reward_oracle.sbatch ]; then
+        GATE_A_JOB="${GATE_A_JOB:-}"
+        if [ -z "$GATE_A_JOB" ]; then
+            GATE_A_JOB=$(squeue -u "$USER" -h -o '%i %j' 2>/dev/null \
+                | awk '$2 == "rw_prior" { print $1; exit }')
+        fi
+        if [ -z "$GATE_A_JOB" ]; then
+            echo "  !! gate_b needs the job id of the (running or finished) Gate A" >&2
+            echo "  !! training job and none was found in squeue. Pass it explicitly:" >&2
+            echo "  !!     GATE_A_JOB=23271 bash $0 gate_b" >&2
+            echo "  !! skipping Gate B" >&2
+        else
+            echo "  gate_b: sampling will wait on Gate A job $GATE_A_JOB (afterok)" >&2
+            RUN_NAME="${RUN_NAME:-prior_k8}"
+            JID_FIT=$(sub "gate B: fit reward model (CPU)" \
+                scripts/slurm/fit_reward_model_cpu.sbatch)
+            die_if_aborted
+            # sample_reward_oracle.sbatch defaults BOXES to empty (use the
+            # config's val split), but the shared ENVFILE sets BOXES to
+            # Experiment 1's multi-box list ("set8 set9"), and _reward_common.sh
+            # exports positional args in order -- ENVFILE is sourced after
+            # RUN_NAME, so it would silently overwrite the script's own default
+            # before `: "${BOXES:=}"` ever runs. --boxes then gets one literal
+            # "set8 set9" string, and lr_path() looks for a file named that.
+            # Force it back to empty via SUB_OVERRIDES (applied last, see the
+            # note above) rather than letting the val split get clobbered.
+            SUB_OVERRIDES=("BOXES=")
+            JID_GEN=$(sub "gate B: sample K candidates (GPU)" \
+                --dependency=afterok:"$GATE_A_JOB" \
+                scripts/slurm/sample_reward_oracle.sbatch "RUN_NAME=$RUN_NAME")
+            SUB_OVERRIDES=()
+            die_if_aborted
+            JID_SCORE=$(sub "gate B: score candidates (CPU array)" \
+                --dependency=afterok:"$JID_GEN" \
+                scripts/slurm/catalog_reward_oracle_cpu.sbatch "RUN_NAME=$RUN_NAME")
+            die_if_aborted
+            sub "gate B: aggregate verdict (CPU)" \
+                --dependency=afterok:"$JID_SCORE:$JID_FIT" --array=0-0 \
+                scripts/slurm/catalog_reward_oracle_cpu.sbatch \
+                "RUN_NAME=$RUN_NAME" AGGREGATE=1 >/dev/null
+            die_if_aborted
+        fi
+    else
+        echo "  !! no sample_reward_oracle.sbatch found; skipping Gate B" >&2
+    fi
+fi
+
+# --- Gate C: reward-weighted fine-tune, if and only if Gate B passes -------
+# Not part of "all" -- it needs the job id of Gate B's AGGREGATE=1 verdict job
+# to depend on (afterok), and that job's name (rw_oracle_cat) is shared with
+# the per-shard scoring array, so unlike GATE_A_JOB it cannot be told apart in
+# squeue and MUST be passed explicitly. This queues now, behind Gate B, so it
+# runs the moment Gate B finishes rather than waiting for a human to notice --
+# but build_replay_cpu.sbatch reads gate_b.json's decision itself and exits 0
+# without building anything if Gate B did not pass (sec.6 of
+# docs/reward_residual_diffusion.md: distillation is gated on Gate B's
+# OCCUPATION verdict). A skip there cascades to the distill job via its own
+# require_input on the (unwritten) replay file.
+if [[ "$STAGE" == "gate_c" ]]; then
+    if [ -r scripts/slurm/build_replay_cpu.sbatch ] && [ -r scripts/slurm/train_reward_distill_round0.sbatch ]; then
+        GATE_B_JOB="${GATE_B_JOB:-}"
+        if [ -z "$GATE_B_JOB" ]; then
+            echo "  !! gate_c needs the job id of Gate B's AGGREGATE=1 verdict job" >&2
+            echo "  !! (printed as \"gate B: aggregate verdict (CPU) -> job N\" when" >&2
+            echo "  !! gate_b was submitted). Pass it explicitly:" >&2
+            echo "  !!     GATE_B_JOB=23310 bash $0 gate_c" >&2
+            echo "  !! skipping Gate C" >&2
+        else
+            echo "  gate_c: replay build will wait on Gate B verdict job $GATE_B_JOB (afterok)" >&2
+            RUN_NAME="${RUN_NAME:-prior_k8}"
+            ROUND="${ROUND:-round_000}"
+            JID_REPLAY=$(sub "gate C: build replay (CPU)" \
+                --dependency=afterok:"$GATE_B_JOB" \
+                scripts/slurm/build_replay_cpu.sbatch "RUN_NAME=$RUN_NAME" "ROUND=$ROUND")
+            die_if_aborted
+            sub "gate C: reward-weighted distill (GPU)" \
+                --dependency=afterok:"$JID_REPLAY" \
+                scripts/slurm/train_reward_distill_round0.sbatch "ROUND=$ROUND" >/dev/null
+            die_if_aborted
+        fi
+    else
+        echo "  !! build_replay_cpu.sbatch or train_reward_distill_round0.sbatch" >&2
+        echo "  !! not found; skipping Gate C" >&2
     fi
 fi
 

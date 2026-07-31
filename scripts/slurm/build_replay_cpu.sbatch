@@ -30,6 +30,25 @@ source "$_D/_reward_common.sh" "$@"
 require_input "$DMSR_REWARD_ROOT/oracle/$RUN_NAME/oracle_manifest.jsonl" \
     "scripts/slurm/catalog_reward_oracle_cpu.sbatch AGGREGATE=1"
 
+# Gate C runs only if Gate B passed: docs/reward_residual_diffusion.md sec.6
+# is explicit that distillation is gated on Gate B's OCCUPATION verdict, not
+# merely on the oracle manifest existing. Skip (exit 0) on any other decision
+# so a dependent train_reward_distill_round0.sbatch reports the same reason
+# via its own require_input on the (unwritten) replay file, instead of
+# training on a buffer that was never supposed to exist.
+GATE_B_JSON="$DMSR_REWARD_ROOT/oracle/$RUN_NAME/gate_b.json"
+require_input "$GATE_B_JSON" "scripts/slurm/catalog_reward_oracle_cpu.sbatch AGGREGATE=1"
+GATE_B_DECISION=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['gate']['decision'])" "$GATE_B_JSON")
+if [ "$GATE_B_DECISION" != "support_present_occupation" ]; then
+    echo ">>> Gate B decision for RUN_NAME=$RUN_NAME is '$GATE_B_DECISION', not"
+    echo ">>> 'support_present_occupation'. Gate C (replay + distillation) does"
+    echo ">>> not run on this verdict -- see sec.6 of"
+    echo ">>> docs/reward_residual_diffusion.md and $GATE_B_JSON for diagnosis."
+    echo ">>> skipping (exit 0) rather than blocking downstream with no reason."
+    exit 0
+fi
+echo "=== Gate B decision: $GATE_B_DECISION -- proceeding with replay"
+
 EXTRA=()
 [ "$NO_CHECKSUM" = "1" ] && EXTRA+=(--no-checksum)
 

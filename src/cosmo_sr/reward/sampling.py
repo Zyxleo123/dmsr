@@ -346,12 +346,18 @@ def sample_residual_box(
     verify_margin: bool = True,
     progress: bool = False,
     clip_log: Optional[list] = None,
+    init_noise: Optional[np.ndarray | torch.Tensor] = None,
 ) -> np.ndarray:
     """One full-box residual realisation ``dPsi`` in catnorm units.
 
     The initial noise is drawn on the CPU from ``seed`` so a realisation depends
     on the seed alone, never on the device or the tile order -- same guarantee
     (and the same reason) as :func:`cosmo_sr.tts.sampling.super_resolve_srs_seeded`.
+
+    ``init_noise`` overrides that draw with an explicit tensor, which is what
+    lets a search (CEM) perturb a good noise vector instead of only jumping to
+    an unrelated seed. ``seed`` still drives the ``churn`` draws, so an explicit
+    noise vector only fully determines the sample when ``cfg.churn == 0``.
 
     ``clip_log`` collects the per-step ``x0_clip`` statistics in standardized
     residual units; see :func:`cosmo_sr.reward.diffusion.ddim_sample`. A
@@ -376,7 +382,15 @@ def sample_residual_box(
                      device=device)
 
     gen = torch.Generator(device="cpu").manual_seed(int(seed))
-    u = torch.randn(tuple(base.shape), generator=gen, dtype=torch.float32)
+    if init_noise is None:
+        u = torch.randn(tuple(base.shape), generator=gen, dtype=torch.float32)
+    else:
+        u = torch.as_tensor(np.asarray(init_noise), dtype=torch.float32).clone()
+        if tuple(u.shape) != tuple(base.shape):
+            raise ValueError(
+                f"init_noise shape {tuple(u.shape)} != field shape "
+                f"{tuple(base.shape)}"
+            )
     sched = CosineSchedule()
     ts = torch.linspace(cfg.t_max, cfg.t_min, int(cfg.n_steps) + 1)
     origins = spec.origins()
