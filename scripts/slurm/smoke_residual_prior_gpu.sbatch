@@ -38,14 +38,21 @@ echo "=== smoke run -> $RUN_DIR"
 
 # The smoke run is 6 steps on a tiny model: it cannot pass the real Gate A and
 # is not meant to. What it CAN answer mechanically is "did anything produce a
-# NaN, and does a sampled residual have spread", which is why the criteria are
-# evaluated here rather than left to a human reading metrics.csv. Unevaluated
-# criteria are allowed; a hard FAIL still stops the chain, because the long job
-# would fail the same way eight hours later.
+# NaN, and does a sampled residual have spread".
+#
+# So only those two criteria are ENFORCED here (--enforce 2,5). Everything else
+# is still computed and written to gate_a_smoke.json as advisory, but cannot
+# block: this job is --strict, its failure strands the real training job on
+# DependencyNeverSatisfied, and a residual-RMS or power-spectrum criterion that
+# a six-step model was never going to satisfy would do exactly that for no
+# reason. The physical criteria are decided after real training, by
+# gate_a_check_cpu.sbatch.
+: "${SMOKE_ENFORCE:=2,5}"
 python -u scripts/reward/gate_a_check.py \
     --config "$REWARD_CFG" \
     --run-dir "$RUN_DIR" \
     --out "$RUN_DIR/gate_a_smoke.json" \
+    --enforce "$SMOKE_ENFORCE" \
     --allow-unevaluated \
     --strict \
     --loss-drop -1e9 \
@@ -54,6 +61,7 @@ python -u scripts/reward/gate_a_check.py \
          echo "!!! That is deliberate: it would fail the same way, eight hours later."
          exit 1; }
 
-echo "=== Gate A smoke verdict -> $RUN_DIR/gate_a_smoke.json"
-echo "=== the REAL Gate A runs after training:"
-echo "===   python scripts/reward/gate_a_check.py --run-dir <prior run dir>"
+echo "=== Gate A smoke verdict -> $RUN_DIR/gate_a_smoke.json (enforced: $SMOKE_ENFORCE)"
+echo "=== the REAL Gate A runs after training, and needs the tile scan:"
+echo "===   sbatch scripts/slurm/gate_a_tile_scan_gpu.sbatch"
+echo "===   sbatch scripts/slurm/gate_a_check_cpu.sbatch"

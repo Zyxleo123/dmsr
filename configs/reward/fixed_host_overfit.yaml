@@ -1,0 +1,31 @@
+# Rung 3 of the escalation ladder (docs/reward_residual_diffusion.md §5):
+# deliberately overfit a handful of fixed massive hosts.
+#
+# This model is a DIAGNOSTIC, not a candidate. It answers one question -- can
+# reward be raised on fixed hosts at all -- and a checkpoint trained on four
+# chunks of one box does not generalise and must never be evaluated as if it
+# did, nor promoted into the Gate B / distillation path.
+base: residual_prior.yaml
+
+data:
+  # Filled in at submit time from select_fixed_hosts.py via --fixed-hosts.
+  # Left null so the config is honest about being incomplete on its own.
+  fixed_host_chunks: null
+
+train:
+  # Short by design: overfitting a few chunks is meant to be quick and decisive.
+  # If reward has not moved in a few hundred steps on data the model sees over
+  # and over, more steps is not the missing ingredient.
+  steps: 300
+  val_every: 50
+  ckpt_every: 100
+  # No EMA smoothing: EMA exists to average away sampling noise across a long
+  # run, and here the last-step weights are exactly what we want to inspect.
+  ema_decay: 0.0
+
+output:
+  run_dir: null
+
+wandb:
+  name: fixed_host_overfit
+  group: rung3

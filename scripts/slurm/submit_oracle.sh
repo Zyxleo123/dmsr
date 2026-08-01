@@ -249,17 +249,35 @@ fi
 # Independent of everything above, so it starts training immediately. If
 # Experiment 1 comes back negative, scancel it -- that is the whole reason it is
 # a sibling rather than a dependent.
+# Gate A is THREE jobs, not one. Training writes metrics.csv; the tile scan
+# (GPU) answers criterion 6, which the training job cannot -- it never tiles; the
+# check (CPU, seconds) reads both and writes the gate_a.json that
+# sample_reward_oracle.sbatch gates on. Submitting only the training job leaves
+# criterion 6 "not_evaluated", so gate_a.json says passed: false and Gate B
+# refuses to sample -- with nothing in the repo able to produce the missing
+# artifact. The last job's id is what `gate_b` must depend on.
 if [[ "$STAGE" =~ ^(all|gate_a)$ ]]; then
-    if [ -r scripts/slurm/smoke_residual_prior_gpu.sbatch ]; then
-        if [ "${SKIP_SMOKE:-0}" = "1" ]; then
+    if [ -r scripts/slurm/train_residual_prior.sbatch ]; then
+        if [ "${SKIP_SMOKE:-0}" = "1" ] || [ ! -r scripts/slurm/smoke_residual_prior_gpu.sbatch ]; then
             echo "  !! SKIP_SMOKE=1: submitting gate A training with no smoke gate" >&2
-            sub "gate A prior training (GPU)" \
-                scripts/slurm/train_residual_prior.sbatch >/dev/null
+            JT=$(sub "gate A prior training (GPU)" \
+                scripts/slurm/train_residual_prior.sbatch)
         else
             JS=$(sub "gate A smoke (GPU)" scripts/slurm/smoke_residual_prior_gpu.sbatch)
-            sub "gate A prior training (GPU)" --dependency=afterok:"$JS" \
-                scripts/slurm/train_residual_prior.sbatch >/dev/null
+            die_if_aborted
+            JT=$(sub "gate A prior training (GPU)" --dependency=afterok:"$JS" \
+                scripts/slurm/train_residual_prior.sbatch)
         fi
+        die_if_aborted
+        JSCAN=$(sub "gate A tile scan, criterion 6 (GPU)" \
+            --dependency=afterok:"$JT" \
+            scripts/slurm/gate_a_tile_scan_gpu.sbatch)
+        die_if_aborted
+        JGA=$(sub "gate A verdict (CPU)" --dependency=afterok:"$JSCAN" \
+            scripts/slurm/gate_a_check_cpu.sbatch)
+        die_if_aborted
+        echo "  gate_a: Gate B must depend on the VERDICT job, not the training" >&2
+        echo "  gate_a: job:  GATE_A_JOB=$JGA bash $0 gate_b" >&2
     else
         echo "  !! no residual-prior job scripts found; skipping Gate A" >&2
     fi
@@ -275,10 +293,21 @@ fi
 # waiting behind Gate A.
 if [[ "$STAGE" == "gate_b" ]]; then
     if [ -r scripts/slurm/sample_reward_oracle.sbatch ]; then
+        # The job to wait on is the Gate A VERDICT job (rw_gate_a), which is what
+        # writes gate_a.json with criterion 6 decided. Falling back to the
+        # training job (rw_prior) is only right if the scan and check have
+        # already run; it is kept for a chain submitted before those existed.
         GATE_A_JOB="${GATE_A_JOB:-}"
         if [ -z "$GATE_A_JOB" ]; then
             GATE_A_JOB=$(squeue -u "$USER" -h -o '%i %j' 2>/dev/null \
+                | awk '$2 == "rw_gate_a" { print $1; exit }')
+        fi
+        if [ -z "$GATE_A_JOB" ]; then
+            GATE_A_JOB=$(squeue -u "$USER" -h -o '%i %j' 2>/dev/null \
                 | awk '$2 == "rw_prior" { print $1; exit }')
+            [ -n "$GATE_A_JOB" ] && echo "  !! waiting on the TRAINING job $GATE_A_JOB;" \
+                "the tile scan and verdict jobs must still run before it, or" \
+                "Gate A will read passed: false" >&2
         fi
         if [ -z "$GATE_A_JOB" ]; then
             echo "  !! gate_b needs the job id of the (running or finished) Gate A" >&2
@@ -306,8 +335,18 @@ if [[ "$STAGE" == "gate_b" ]]; then
                 scripts/slurm/sample_reward_oracle.sbatch "RUN_NAME=$RUN_NAME")
             SUB_OVERRIDES=()
             die_if_aborted
-            JID_SCORE=$(sub "gate B: score candidates (CPU array)" \
+            # The a=0 baselines are their own array, ahead of the candidates:
+            # every candidate shard holds candidates from every box, so letting
+            # the shards score baselines has several of them running Rockstar on
+            # the same box through the same work directory. See BASELINES in
+            # catalog_reward_oracle_cpu.sbatch.
+            JID_BASE=$(sub "gate B: score per-box baselines (CPU array)" \
                 --dependency=afterok:"$JID_GEN" \
+                scripts/slurm/catalog_reward_oracle_cpu.sbatch \
+                "RUN_NAME=$RUN_NAME" BASELINES=1)
+            die_if_aborted
+            JID_SCORE=$(sub "gate B: score candidates (CPU array)" \
+                --dependency=afterok:"$JID_BASE" \
                 scripts/slurm/catalog_reward_oracle_cpu.sbatch "RUN_NAME=$RUN_NAME")
             die_if_aborted
             sub "gate B: aggregate verdict (CPU)" \
@@ -367,8 +406,13 @@ if [[ "$STAGE" == "gate_c" ]]; then
                 "RUN_NAME=$REPLAY_RUN" "SPLIT=train" "GATE_B_RUN=$RUN_NAME")
             SUB_OVERRIDES=()
             die_if_aborted
-            JID_TSCORE=$(sub "gate C: score TRAIN candidates (CPU array)" \
+            JID_TBASE=$(sub "gate C: score per-box baselines (CPU array)" \
                 --dependency=afterok:"$JID_TGEN" \
+                scripts/slurm/catalog_reward_oracle_cpu.sbatch \
+                "RUN_NAME=$REPLAY_RUN" BASELINES=1)
+            die_if_aborted
+            JID_TSCORE=$(sub "gate C: score TRAIN candidates (CPU array)" \
+                --dependency=afterok:"$JID_TBASE" \
                 scripts/slurm/catalog_reward_oracle_cpu.sbatch "RUN_NAME=$REPLAY_RUN")
             die_if_aborted
             JID_TAGG=$(sub "gate C: credit + manifest for TRAIN run (CPU)" \

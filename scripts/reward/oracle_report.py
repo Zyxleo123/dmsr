@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 """Stage 6c (CPU): assemble ensembles, score them, and decide Gate B.
 
-**One group is one box.** At ``chunk_hr=256`` a box is exactly 8 chunks and the
-reward is fitted at ``B=8``, so a group is a complete box: the independent
-cosmological unit, the unit the bootstrap resamples, and the unit the reward's
-covariance describes. Every candidate, the frozen baseline and the HR reference
-are then scored on *identical* chunk ids, so a comparison is paired and its
-spread is noise in the residual rather than in the choice of chunks.
+**One group is one box, and a box is scored whole.** The reward statistic is the
+direct full-periodic-box catalog (``*__fullbox.jsonl``), not the pooled chunks:
+chunk attribution rejects every halo whose Rvir sphere straddles a chunk
+boundary, that rejection was measured to rise with host mass, and summing chunks
+cannot put those objects back. The chunk summaries are still read and still
+matter -- they are what ``marginal_contributions`` needs to attribute an
+improvement to a Lagrangian region for the replay buffer -- but nothing scores
+them.
 
 An earlier version drew ``B`` chunks stratified *across* boxes: the baseline
 pooled all ``B``, but a candidate exists for only one box, so it was scored on
@@ -74,7 +76,7 @@ def _groups(base_by_box, ensemble_size, candidate_boxes, seed):
     return groups
 
 
-def _catalog_diversity(records):
+def _catalog_diversity(records, feasible_only: bool = True):
     """Spread of the CATALOG across candidates of one group, per group.
 
     Field diversity is not the quantity Gate B needs. SR2's documented failure
@@ -83,15 +85,25 @@ def _catalog_diversity(records):
     candidate produces the same occupation curve -- and then best-of-K has
     nothing to select from no matter how many samples are drawn. These are the
     numbers that say whether the catalog itself moved.
+
+    Only FEASIBLE candidates count. Spread contributed by a candidate that is
+    already rejected -- one that wrecked the low-k field, or emptied a reliable
+    host bin -- is not spread best-of-K can select from, so counting it would let
+    the diversity floor be cleared by exactly the samples the gate throws away.
     """
     out = {}
     by_group = {}
     for r in records:
+        if feasible_only and not r.get("feasible", False):
+            continue
         by_group.setdefault(r["group"], []).append(r)
+    for g in {r["group"] for r in records}:
+        by_group.setdefault(g, [])
     for g, rs in by_group.items():
         if len(rs) < 2:
             out[g] = {"n": len(rs), "occupation_rel_spread": float("nan"),
-                      "R_occ_spread": float("nan")}
+                      "R_occ_spread": float("nan"),
+                      "note": "fewer than 2 feasible candidates"}
             continue
         occ = np.asarray([r["occupation"] for r in rs], dtype=np.float64)
         with np.errstate(invalid="ignore"):
@@ -102,6 +114,7 @@ def _catalog_diversity(records):
                            dtype=np.float64)
         out[g] = {
             "n": len(rs),
+            "feasible_only": bool(feasible_only),
             # Per host bin, then averaged over the bins that had hosts.
             "occupation_rel_spread": float(np.nanmean(rel)) if np.isfinite(rel).any()
             else float("nan"),
@@ -156,6 +169,13 @@ def main() -> None:
                     choices=["R_occ", "R_abund", "R_cat"],
                     help="which reward per-chunk credit is measured in; must "
                          "match what selection is decided on (default R_occ)")
+    ap.add_argument("--allow-chunk-pooled", action="store_true",
+                    help="score pooled chunks when a full-box summary is missing "
+                         "(diagnostic only: pooled chunks drop every "
+                         "boundary-crossing halo, mass-dependently)")
+    ap.add_argument("--allow-empty-reliable-bins", action="store_true",
+                    help="do NOT mark a candidate infeasible for having zero "
+                         "hosts in a reliable bin (diagnostic only)")
     ap.add_argument("--allow-uncalibrated", action="store_true",
                     help="report a verdict even though constraints.calibrated is "
                          "false (diagnostic only: the feasibility filter, and so "
@@ -195,12 +215,37 @@ def main() -> None:
             return {}
         return {s.chunk_id: s for s in read_summaries(p)}
 
+    def full_box_of(row):
+        """The whole-box summary a row is SCORED on, or None."""
+        p = row.get("full_box_summary")
+        if p and Path(p).is_file():
+            return pool(read_summaries(p))
+        return None
+
     base_by_box = {r["box"]: summaries_of(r) for r in base_rows}
-    hr_by_box = {}
+    base_full = {r["box"]: full_box_of(r) for r in base_rows}
+    hr_by_box, hr_full = {}, {}
     for b in boxes:
         p = paths.CATALOG_CACHE() / f"{b}__hr__hr.jsonl"
         if p.is_file():
             hr_by_box[b] = {s.chunk_id: s for s in read_summaries(p)}
+        fp = paths.CATALOG_CACHE() / f"{b}__hr__hr__fullbox.jsonl"
+        if fp.is_file():
+            hr_full[b] = pool(read_summaries(fp))
+
+    # Scoring on pooled chunks instead of the full box would compare a candidate
+    # against a reward model fitted on a different statistic, so it is refused
+    # rather than silently downgraded.
+    missing_full = sorted(b for b, v in base_full.items() if v is None)
+    if missing_full and not args.allow_chunk_pooled:
+        raise SystemExit(
+            f"no full-box summary for the baseline of {missing_full}. Gate B "
+            f"scores the direct full-periodic-box catalog; chunk-pooled vectors "
+            f"are missing every boundary-crossing object and are not the "
+            f"statistic the reward model was fitted on. Re-run the scoring "
+            f"array (scripts/reward/score_oracle.py) with --overwrite, or pass "
+            f"--allow-chunk-pooled for a diagnostic-only report."
+        )
 
     occ_cfg = dict(rcfg.get("occupation", {}))
     reliable = [int(i) for i in occ_cfg.get("reliable_host_bins", [0, 1, 2, 3])]
@@ -208,6 +253,7 @@ def main() -> None:
     sparse = [int(i) for i in occ_cfg.get("sparse_host_bins", [])]
     need_reliable = int(occ_cfg.get("min_improved_reliable_bins", 2))
     need_upper = int(occ_cfg.get("min_improved_upper_bins", 1))
+    min_cat_div = float(occ_cfg.get("min_catalog_occupation_spread", 0.02))
 
     groups = _groups(base_by_box, B, {r["box"] for r in cand_rows}, args.group_seed)
     if args.groups and len(groups) > int(args.groups):
@@ -227,12 +273,21 @@ def main() -> None:
     rng_pick = np.random.default_rng(int(args.random_seed))
     for gi, (gbox, keys) in enumerate(groups):
         gname = f"group{gi}_{gbox}"
-        base_ens = pool([base_by_box[b][c] for b, c in keys])
+        # SCORED on the whole box; the chunk pool is only the fallback the
+        # --allow-chunk-pooled escape hatch permits.
+        base_ens = base_full.get(gbox) or pool([base_by_box[b][c] for b, c in keys])
         r_base = model.reward(base_ens)
         base_scores = model.scores(base_ens, reliable)
         base_gap = model.occupation_gap(base_ens)
-        if all(b in hr_by_box for b, _ in keys):
+        base_empty = model.empty_host_bins(base_ens, reliable)
+        if base_empty:
+            print(f"  ! {gname}: the FROZEN BASELINE has no hosts in reliable "
+                  f"bin(s) {base_empty}; every comparison in those bins is "
+                  f"against a filled-in value", flush=True)
+        hr_ens = hr_full.get(gbox)
+        if hr_ens is None and all(b in hr_by_box for b, _ in keys):
             hr_ens = pool([hr_by_box[b][c] for b, c in keys])
+        if hr_ens is not None:
             r_hr = model.reward(hr_ens)
             hr_occ = model.occupation_curve(hr_ens).tolist()
         else:
@@ -254,8 +309,22 @@ def main() -> None:
                 print(f"  ! {r['tag']}: has {len(ens)}/{len(keys)} chunks of "
                       f"{gname}; excluded", flush=True)
                 continue
-            cand_ens = pool(list(ens.values()))
+            cand_full = full_box_of(r)
+            cand_ens = cand_full or pool(list(ens.values()))
             reward = model.reward(cand_ens)
+            # An empty reliable host bin is filled with mu, so it contributes
+            # EXACTLY ZERO to the distance: a candidate can raise R_occ by
+            # deleting the hosts whose occupation it cannot reproduce, and the
+            # quadratic form cannot tell. The "bins improved" test does not catch
+            # it either -- an empty bin is NaN there, and only two reliable bins
+            # have to improve. So an empty reliable bin makes the candidate
+            # infeasible instead of scoring it.
+            empty_bins = model.empty_host_bins(cand_ens, reliable)
+            if empty_bins and not args.allow_empty_reliable_bins:
+                r["feasible"] = False
+                r["violations"] = list(r.get("violations", [])) + [
+                    f"empty_reliable_host_bin_{i}" for i in empty_bins
+                ]
             # Credit in the score selection is decided on. Gate B is decided on
             # occupation, so the replay buffer is weighted by occupation credit;
             # the joint figure is kept alongside it for diagnosis, never as the
@@ -281,6 +350,8 @@ def main() -> None:
                 "residual_path": r.get("residual_path"),
                 "residual_scale": r.get("residual_scale"),
                 "catalog_summary": cand_ens.to_dict(),
+                "catalog_scope": "full_box" if cand_full is not None else "pooled_chunks",
+                "empty_reliable_host_bins": empty_bins,
                 "catalog_reward": reward,
                 # The score the elite cut is taken on: the same one the credit
                 # is measured in, so selection and weighting agree.
@@ -417,12 +488,23 @@ def main() -> None:
     # median of K essentially by construction: a >0 criterion measures that
     # sampling noise exists, not that occupation can be controlled. The same
     # gate_target the joint score is held to now applies to occupation.
+    #
+    # CATALOG diversity is part of the criterion, not a footnote next to it. If
+    # every feasible candidate of a group produces the same occupation curve,
+    # "the best of K beat a random draw by 20%" is measuring which draw the RNG
+    # called random, not a controllable degree of freedom -- and that is SR2's
+    # original failure (field moves, subhalos do not) reproduced in the residual.
+    def _cat_div_ok(g):
+        v = cat_div.get(g["group"], {}).get("occupation_rel_spread", float("nan"))
+        return bool(np.isfinite(v) and v >= min_cat_div)
+
     occ_groups = [
         g for g in group_reports
         if g["n_improved_reliable"] >= need_reliable
         and g["n_improved_upper"] >= need_upper
         and np.isfinite(g["occ_reduction_vs_random"])
         and g["occ_reduction_vs_random"] >= args.gate_target
+        and _cat_div_ok(g)
     ]
     n_occ_ok = len(occ_groups)
     joint_ok = n_ok >= 2 and feas_frac > 0
@@ -453,6 +535,17 @@ def main() -> None:
         "sparse_host_bins_excluded": sparse,
         "min_improved_reliable_bins": need_reliable,
         "min_improved_upper_bins": need_upper,
+        "min_catalog_occupation_spread": min_cat_div,
+        "per_group_catalog_occupation_spread": [
+            cat_div.get(g["group"], {}).get("occupation_rel_spread", float("nan"))
+            for g in group_reports
+        ],
+        "per_group_catalog_diversity_ok": [_cat_div_ok(g) for g in group_reports],
+        "per_group_n_empty_reliable_bin_candidates": [
+            sum(1 for r in records
+                if r["group"] == g["group"] and r.get("empty_reliable_host_bins"))
+            for g in group_reports
+        ],
         "per_group_n_improved_reliable": [g["n_improved_reliable"] for g in group_reports],
         "per_group_n_improved_upper": [g["n_improved_upper"] for g in group_reports],
         "per_group_occ_reduction_vs_mean": [g["occ_reduction_vs_mean"] for g in group_reports],
@@ -468,9 +561,15 @@ def main() -> None:
             "Gate B passes only on OCCUPATION: >= "
             f"{need_reliable} reliable host bins improved, including >= "
             f"{need_upper} of the upper reliable bins ({upper}), beating a "
-            f"single random draw by >= {100 * args.gate_target:.0f}%, reproduced "
+            f"single random draw by >= {100 * args.gate_target:.0f}%, with a "
+            f"catalog occupation spread >= {min_cat_div} among the FEASIBLE "
+            "candidates, reproduced "
             "on >= 2 boxes, with the "
-            f"sparse bins {sparse} excluded from the criterion. A joint R_cat "
+            f"sparse bins {sparse} excluded from the criterion. Candidates with "
+            "an empty reliable host bin are infeasible: an empty bin is filled "
+            "with mu and would otherwise score a perfect zero for having deleted "
+            "its hosts. Every score is taken on the DIRECT FULL-BOX catalog. "
+            "A joint R_cat "
             "improvement alone is reported as 'abundance_only_improvement', "
             "not a pass. A negative result shows only that ORDINARY SAMPLES "
             "from the CURRENT prior do not contain accessible good candidates; "

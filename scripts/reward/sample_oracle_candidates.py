@@ -16,9 +16,12 @@ candidate instead of two, and the replay buffer needs exactly this array.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
+
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -47,6 +50,47 @@ def load_model(ckpt_path: str, cfg: dict, device, use_ema: bool = True):
         else state["model"]
     model.load_state_dict(sd)
     return model.to(device).eval()
+
+
+def field_fingerprint(**parts) -> str:
+    """Hash of everything a saved field depends on.
+
+    A run name is not provenance. Reusing one with a different checkpoint,
+    sampler, tiling or dtype used to keep the old ``.npy`` and write a new
+    manifest describing it, and nothing downstream could tell -- the evaluation
+    stage then aggregated whatever JSON happened to be in the directory. The
+    fingerprint is written next to each field and compared before any reuse, so a
+    changed input regenerates instead of being relabelled.
+
+    The checkpoint enters by size and mtime rather than by content hash: these
+    are multi-hundred-MB files read from scratch, and a checkpoint that is
+    overwritten in place always changes at least its mtime.
+    """
+    payload = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def ckpt_identity(path) -> Dict:
+    p = Path(path).resolve()
+    st = p.stat()
+    return {"path": str(p), "size": int(st.st_size), "mtime": int(st.st_mtime)}
+
+
+def read_fingerprint(path: Path) -> Optional[str]:
+    p = path.with_suffix(".fingerprint.json")
+    if not p.is_file():
+        return None
+    try:
+        return str(json.loads(p.read_text()).get("fingerprint"))
+    except (ValueError, OSError):
+        return None
+
+
+def write_fingerprint(path: Path, fp: str, parts: Dict) -> None:
+    path.with_suffix(".fingerprint.json").write_text(
+        json.dumps({"fingerprint": fp, "inputs": parts}, indent=2,
+                   sort_keys=True, default=str)
+    )
 
 
 def main() -> None:
@@ -112,6 +156,17 @@ def main() -> None:
             f"written core"
         )
 
+    common = {
+        "checkpoint": ckpt_identity(args.checkpoint),
+        "use_ema": not args.no_ema,
+        "model_config": hashlib.sha256(
+            Path(args.model_config).read_bytes()).hexdigest()[:32],
+        "diffusion": diff.__dict__,
+        "tile": {"core": spec.core, "margin": spec.margin},
+        "dtype": args.dtype,
+        "redshift": float(cfg["data"].get("redshift", 0.0)),
+    }
+
     rows = []
     for box in boxes:
         lr = np.load(lr_path(cfg, box))
@@ -122,11 +177,21 @@ def main() -> None:
         for j in range(k):
             seed = int(args.seed0) + j
             path = fields / f"{box}_resid_seed{seed}.npy"
+            parts = {**common, "box": box, "seed": seed,
+                     "base": str(Path(base_path).resolve())}
+            fp = field_fingerprint(**parts)
             if path.is_file() and not args.overwrite:
-                print(f"[{box} k={j}] exists", flush=True)
-                rows.append({"box": box, "seed": seed, "residual": str(path),
-                             "regenerated": False})
-                continue
+                old = read_fingerprint(path)
+                if old == fp:
+                    print(f"[{box} k={j}] exists", flush=True)
+                    rows.append({"box": box, "seed": seed, "residual": str(path),
+                                 "fingerprint": fp, "regenerated": False})
+                    continue
+                # Same filename, different inputs. Keeping it would put a field
+                # from another checkpoint/sampler under this run's manifest.
+                print(f"[{box} k={j}] REGENERATING: {path.name} was produced "
+                      f"with different inputs (fingerprint "
+                      f"{old or 'missing'} != {fp})", flush=True)
             t0 = time.time()
             clip_log: list = []
             resid = sample_residual_box(
@@ -144,6 +209,7 @@ def main() -> None:
             tmp = path.with_suffix(".tmp.npy")
             np.save(tmp, resid)
             tmp.replace(path)
+            write_fingerprint(path, fp, parts)
             dt = time.time() - t0
             rms = float(np.sqrt(np.mean(resid[0:3].astype(np.float64) ** 2)))
             print(f"[{box} k={j}] seed={seed} rms={rms:.4g} "
@@ -151,6 +217,7 @@ def main() -> None:
                   f"({dt:.0f}s)", flush=True)
             rows.append({
                 "box": box, "seed": seed, "residual": str(path),
+                "fingerprint": fp,
                 "residual_rms_disp": rms, "seconds": dt, "regenerated": True,
                 "base": str(base_path),
                 "x0_clip": float(diff.x0_clip),

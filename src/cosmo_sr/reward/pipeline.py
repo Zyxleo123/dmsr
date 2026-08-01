@@ -12,7 +12,8 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 
 from ..eval.rockstar import HaloCatalog, load_rockstar_ascii, run_rockstar_on_field
-from .catalog import CatalogBins, ChunkSummary, summarize_catalog
+from .catalog import (CatalogBins, ChunkSummary, summarize_catalog,
+                      summarize_full_box)
 from .geometry import ChunkGrid, PurityGrid, assign_halos_to_chunks, chunk_purity_grid
 
 __all__ = ["CatalogResult", "existing_catalog", "field_to_chunk_summaries"]
@@ -21,13 +22,16 @@ __all__ = ["CatalogResult", "existing_catalog", "field_to_chunk_summaries"]
 class CatalogResult:
     def __init__(self, summaries: Dict[int, ChunkSummary], catalog: HaloCatalog,
                  purity: PurityGrid, volumes: np.ndarray, timings: Dict[str, float],
-                 assignment: np.ndarray):
+                 assignment: np.ndarray, full_box: Optional[ChunkSummary] = None):
         self.summaries = summaries
         self.catalog = catalog
         self.purity = purity
         self.volumes = volumes
         self.timings = timings
         self.assignment = assignment
+        # The unbiased whole-box statistic. ``summaries`` is the chunk-attributed
+        # one, which exists for credit assignment, not for scoring.
+        self.full_box = full_box
 
     @property
     def assigned_fraction(self) -> float:
@@ -98,10 +102,16 @@ def field_to_chunk_summaries(
     summaries = summarize_catalog(
         cat, assign, bins, volumes, box=box, source=source, chunk_ids=grid.all_ids()
     )
+    # Same catalog, no purity mask, nominal volume: the statistic the reward is
+    # defined on. See summarize_full_box for why this is not "chunks, pooled".
+    full = summarize_full_box(
+        cat, bins, float(grid.boxsize_mpc_h ** 3), box=box, source=source
+    )
     if not keep_gadget:
         for g in work.glob("*.gadget2"):
             g.unlink(missing_ok=True)
     return CatalogResult(
         summaries, cat, purity, volumes,
         {"halo_finder_s": t_halo, "attribution_s": t_assign}, assign,
+        full_box=full,
     )

@@ -94,18 +94,26 @@ def main() -> None:
     banner(f"{len(kept)} elite chunks from {len(rows)} scored chunks "
            f"({len(ensembles)} ensembles)")
 
-    forbidden = set(split_boxes(cfg, "val")) | set(split_boxes(cfg, "test"))
-    if args.allow_val:
-        forbidden = set(split_boxes(cfg, "test"))
+    # --allow-val permits VAL boxes and nothing else. It must never widen to the
+    # test split: `if leaked and not args.allow_val` used to skip the check
+    # entirely once the flag was set, so a run over test boxes -- which
+    # `forbidden` still listed, correctly -- went straight into the buffer.
+    # Whatever is left in `forbidden` is forbidden, flag or no flag.
+    forbidden = set(split_boxes(cfg, "test"))
+    if not args.allow_val:
+        forbidden |= set(split_boxes(cfg, "val"))
     leaked = sorted({r["box"] for r in kept} & forbidden)
-    if leaked and not args.allow_val:
+    if leaked:
         # The oracle deliberately runs on val boxes, so this is the normal path,
         # not an accident: say so loudly instead of silently training on them.
         print(
             f"  ! {leaked} are held-out boxes. An offline replay buffer built "
-            f"from them turns validation into training data. Re-run the oracle "
-            f"on train boxes, or pass --allow-val and treat every later number "
-            f"as in-sample.",
+            f"from them turns held-out data into training data. Re-run the "
+            f"oracle on train boxes"
+            + ("" if args.allow_val else
+               ", or pass --allow-val (VAL ONLY) and treat every later number "
+               "as in-sample")
+            + ".",
             flush=True,
         )
         raise SystemExit(

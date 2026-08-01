@@ -108,6 +108,7 @@ def main() -> None:
                 "tag": tag, "arm": row["arm"], "box": row["box"],
                 "sample": int(row["sample"]), "seed": int(row["seed"]),
                 "residual": row.get("residual"), "base": row.get("base"),
+                "fingerprint": row.get("fingerprint"),
                 "n_halos": int(res.catalog.n),
                 "n_hosts": int(res.catalog.hosts().n),
                 "n_subs": int(res.catalog.subhalos().n),
@@ -125,10 +126,36 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------ aggregate --
-    files = sorted(per_dir.glob("*.json"))
-    if not files:
+    # ONLY the fields this manifest describes. Globbing the directory pulled in
+    # every JSON a previous run of the same run-name had left there, so a
+    # regenerated arm was averaged together with the arm it replaced -- and a
+    # tag says nothing about which checkpoint produced it.
+    want = {f"{r['box']}_{r['arm']}_s{r['sample']}": r for r in rows}
+    recs, stale = [], []
+    for p in sorted(per_dir.glob("*.json")):
+        rec = json.loads(p.read_text())
+        exp = want.get(rec.get("tag"))
+        if exp is None:
+            stale.append(p.name)
+            continue
+        fp = exp.get("fingerprint")
+        if fp and rec.get("fingerprint") and rec["fingerprint"] != fp:
+            stale.append(p.name)
+            continue
+        recs.append(rec)
+    if stale:
+        print(f"  ! ignoring {len(stale)} per-field result(s) not described by "
+              f"this manifest: {stale[:6]}{' ...' if len(stale) > 6 else ''}",
+              flush=True)
+    if not recs:
         raise SystemExit(f"nothing to aggregate in {per_dir}")
-    recs = [json.loads(p.read_text()) for p in files]
+    missing = sorted(set(want) - {r["tag"] for r in recs})
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} field(s) in the manifest have no per-field result: "
+            f"{missing[:6]}. Run every shard before aggregating -- a table "
+            f"missing an arm's samples is not the comparison it claims to be."
+        )
 
     rm_path = Path(args.reward_model) if args.reward_model else \
         paths.subdir("reward_model") / "reward_model.json"
@@ -151,6 +178,27 @@ def main() -> None:
         if model is not None:
             r["optimized"]["catalog_reward"] = model.reward(ens)
             r["optimized"]["mahalanobis2"] = model.mahalanobis2(ens)
+
+    # best-of-K is a SELECTED arm: the K draws exist so one can be chosen by
+    # reward, which is the control for "did distillation beat just sampling the
+    # prior harder?". Selection happens here, not at generation time, because it
+    # needs the catalogs. Every other arm keeps all its samples.
+    bok = [r for r in recs if r["arm"] == "bestofk"]
+    if bok and model is None:
+        print("  ! no reward model: the bestofk arm cannot be selected and is "
+              "dropped rather than reported as an unselected average", flush=True)
+        recs = [r for r in recs if r["arm"] != "bestofk"]
+    elif bok:
+        keep = []
+        for b in sorted({r["box"] for r in bok}):
+            cand = [r for r in bok if r["box"] == b]
+            best = max(cand, key=lambda r: r["optimized"]["catalog_reward"])
+            best["selected_from"] = len(cand)
+            keep.append(best)
+            print(f"  bestofk[{b}]: selected sample {best['sample']} of "
+                  f"{len(cand)} (D2={best['optimized']['mahalanobis2']:.4g})",
+                  flush=True)
+        recs = [r for r in recs if r["arm"] != "bestofk"] + keep
 
     arms = sorted({r["arm"] for r in recs})
     table = {}
@@ -236,7 +284,14 @@ def _verdict(table):
     out = []
     if "hr" not in table:
         out.append("no HR arm: differences are relative only.")
-    for arm in ("prior", "distill"):
+    for arm, why in (("samecomp", "same-compute supervised control"),
+                     ("bestofk", "best-of-K from the prior"),
+                     ("abundance", "abundance-only reward control")):
+        if arm not in table:
+            out.append(f"MISSING ARM {arm} ({why}): a distill-vs-prior "
+                       f"difference cannot be attributed to the occupation "
+                       f"reward without it.")
+    for arm in ("prior", "distill", "samecomp", "bestofk", "abundance"):
         if arm not in table or "sr2" not in table:
             continue
         d0 = table["sr2"].get("mahalanobis2", {}).get("mean", float("nan"))
@@ -252,6 +307,20 @@ def _verdict(table):
             if np.isfinite(hr):
                 trend = (" toward HR" if abs(s1 - hr) < abs(s0 - hr) else " away from HR")
             out.append(f"{arm}: subhalos per host {s0:.3f} -> {s1:.3f}{trend}.")
+    # The controls, read as controls: distillation only earns the claim if it
+    # beats the same optimisation budget without a reward, and beats selecting
+    # from the prior it started from.
+    d_dist = table.get("distill", {}).get("mahalanobis2", {}).get("mean", float("nan"))
+    for ctrl, claim in (("samecomp", "extra optimisation alone"),
+                        ("bestofk", "sampling the prior harder"),
+                        ("abundance", "any catalog reward, not occupation")):
+        d_ctrl = table.get(ctrl, {}).get("mahalanobis2", {}).get("mean", float("nan"))
+        if np.isfinite(d_dist) and np.isfinite(d_ctrl):
+            out.append(
+                f"distill vs {ctrl}: D2 {d_dist:.4g} vs {d_ctrl:.4g}"
+                + ("." if d_dist < d_ctrl
+                   else f" -- NOT better; {claim} explains the result.")
+            )
     if "prior" in table and "distill" in table:
         sp = table["prior"]["subhalo_count_scatter"]
         sd = table["distill"]["subhalo_count_scatter"]

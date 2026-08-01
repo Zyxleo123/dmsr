@@ -24,7 +24,15 @@ from cosmo_sr.reward.reward import fit_reward_model
 
 @pytest.fixture
 def model(hr_chunks, bins):
-    return fit_reward_model(hr_chunks, bins, ensemble_size=8, n_draws=300, seed=0)
+    # method="bootstrap", covariance="full": these tests are about the
+    # block-vs-joint-precision algebra, which needs off-diagonal structure to be
+    # a real distinction. The production default (whole_box, covariance="auto")
+    # diagonalizes with this fixture's 4 boxes and 5 active dims -- correctly,
+    # since 4 boxes cannot identify a 5-d covariance -- but a diagonal covariance
+    # makes every block trivially independent and collapses exactly the property
+    # under test.
+    return fit_reward_model(hr_chunks, bins, ensemble_size=8, n_draws=300, seed=0,
+                            method="bootstrap", covariance="full")
 
 
 def _ens(like, *, n_sub=None, occ_num=None, n_host=None):

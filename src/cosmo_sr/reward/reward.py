@@ -4,16 +4,34 @@
     C_reg    = C + lambda I .
 
 ``s(E)`` is the pooled summary vector of :mod:`cosmo_sr.reward.catalog`; ``mu_HR``
-and ``C`` are estimated from HR chunk summaries by drawing ensembles of the same
-size and stratification as the ones being scored, so the covariance describes
-the sampling noise of an ensemble rather than of a single chunk.
+and ``C`` describe the distribution of that vector over the **independent unit**,
+which is a whole box.
 
-The ridge ``lambda I`` is not cosmetic. With ``J + I ~ 11`` correlated bins and
-only a few hundred bootstrap draws, the raw ``C`` is close to singular and its
-inverse would put essentially unbounded weight on the least-constrained
-direction -- a reward optimiser would find that direction and nothing else. The
-shrinkage is reported alongside the condition number of ``C_reg`` so the
-regularisation is always visible in the manifest.
+Fitting is therefore a *whole-box* estimate by default
+(``method="whole_box"``): every HR box is pooled into one vector, and ``mu`` and
+``C`` are the mean and covariance of those vectors. This is the statistic Gate B
+scores -- at ``chunk_hr=256`` an ensemble is exactly one box's eight chunks --
+so the fitted moments describe the thing being compared and nothing else. The
+older ``method="bootstrap"`` path resampled boxes and then drew ``B`` individual
+chunks *across* the resampled boxes; those mixed-box pseudo-ensembles are not
+whole-box summaries, and the covariance they produce does not describe the Gate B
+statistic. It is kept only for the audit scripts that compare the two.
+
+With ~8-12 boxes and ~10 active dimensions the off-diagonal covariance is not
+empirically identifiable, so the whole-box fit does not pretend to measure it:
+``covariance="auto"`` uses a diagonal ``C`` whenever there are fewer than ``2D``
+boxes and a strongly shrunk one (``off_diagonal_shrinkage`` toward the diagonal)
+otherwise. ``covariance="full"`` is available and deliberately not the default.
+
+The ridge ``lambda I`` is not cosmetic either. With ``J + I ~ 11`` correlated
+bins and a handful of independent boxes, the raw ``C`` is close to singular and
+its inverse would put essentially unbounded weight on the least-constrained
+direction -- a reward optimiser would find that direction and nothing else.
+``lambda = shrinkage * mean(diag(C)[active])``: the mean is taken over the
+**active** dimensions alone, so excluding a near-empty bin from the reward
+cannot change the ridge applied to the bins that are scored. The shrinkage is
+reported alongside the condition number of ``C_reg`` so the regularisation is
+always visible in the manifest.
 """
 from __future__ import annotations
 
@@ -24,7 +42,13 @@ import numpy as np
 
 from .catalog import CatalogBins, ChunkSummary, EnsembleSummary, pool, summary_vector
 
-__all__ = ["RewardModel", "fit_reward_model", "stratified_ensembles"]
+__all__ = [
+    "RewardModel",
+    "box_vectors",
+    "fit_reward_model",
+    "shrink_covariance",
+    "stratified_ensembles",
+]
 
 
 @dataclass
@@ -107,6 +131,26 @@ class RewardModel:
 
     def mahalanobis2(self, ens: EnsembleSummary) -> float:
         return self.block_mahalanobis2(ens, self._active)
+
+    def empty_host_bins(self, ens: EnsembleSummary,
+                        which: Optional[Sequence[int]] = None) -> List[int]:
+        """Host-bin indices (0-based within the host block) that have no hosts.
+
+        An empty bin is filled with ``mu`` by :func:`summary_vector`, so it
+        contributes *exactly zero* to the Mahalanobis distance -- i.e. a
+        candidate is rewarded, in that bin, for having deleted every host in it.
+        Nothing in the quadratic form can notice; the caller has to. Gate B uses
+        this to mark such a candidate infeasible rather than to score it.
+
+        ``which`` restricts the check to a subset of host bins (in practice the
+        reliable ones). ``None`` checks the host bins the reward is active on.
+        """
+        empty = np.asarray(ens.empty_host_bins(), dtype=bool)
+        if which is None:
+            j = self.bins.n_sub_bins
+            which = [int(i) - j for i in self._active
+                     if j <= int(i) < j + self.bins.n_host_bins]
+        return [int(i) for i in which if 0 <= int(i) < empty.size and empty[int(i)]]
 
     def reward(self, ens: EnsembleSummary) -> float:
         """``-D^2``. Maximal (0) exactly when ``s(E) == mu_HR``."""
@@ -354,56 +398,177 @@ def stratified_ensembles(
     return draws
 
 
+def box_vectors(
+    chunks: Sequence[ChunkSummary],
+    bins: CatalogBins,
+    *,
+    full_box: Optional[Dict[str, EnsembleSummary]] = None,
+) -> Tuple[List[str], np.ndarray, np.ndarray]:
+    """``(boxes, vectors, valid)``: one pooled summary vector per box.
+
+    This is the Gate B statistic: a whole box, pooled. ``full_box`` supplies a
+    direct full-periodic-box summary for a box (see
+    :func:`cosmo_sr.reward.pipeline.field_to_chunk_summaries`), which is used in
+    preference to the pooled chunks -- pooling chunks can never recover the
+    boundary-crossing objects the chunk purity mask discarded.
+    """
+    by_box: Dict[str, List[ChunkSummary]] = {}
+    for c in chunks:
+        by_box.setdefault(str(c.box), []).append(c)
+    boxes = sorted(set(by_box) | set(full_box or {}))
+    vecs, valids = [], []
+    for b in boxes:
+        ens = (full_box or {}).get(b)
+        if ens is None:
+            ens = pool(by_box[b])
+        s, valid = summary_vector(ens, bins)
+        vecs.append(s)
+        valids.append(valid)
+    return boxes, np.asarray(vecs, dtype=np.float64), np.asarray(valids, dtype=bool)
+
+
+def shrink_covariance(
+    cov: np.ndarray,
+    n_samples: int,
+    *,
+    estimator: str = "auto",
+    off_diagonal_shrinkage: float = 0.5,
+) -> Tuple[np.ndarray, str]:
+    """Shrink ``cov`` toward its diagonal. Returns ``(C, estimator_used)``.
+
+    ``auto`` is the honest default for this pipeline: a ``D x D`` covariance
+    estimated from ``n_samples`` independent boxes has at most ``n_samples - 1``
+    nonzero eigenvalues, so with ``n_samples < 2D`` the off-diagonal structure is
+    a property of the sample, not of the universe. Below that bar the estimator
+    keeps only the diagonal; above it, it keeps a strongly shrunk version.
+    """
+    cov = np.atleast_2d(np.asarray(cov, dtype=np.float64))
+    d = cov.shape[0]
+    used = str(estimator)
+    if used == "auto":
+        used = "diagonal" if int(n_samples) < 2 * d else "shrunk"
+    if used == "full":
+        return cov, used
+    diag = np.diag(np.diag(cov))
+    if used == "diagonal":
+        return diag, used
+    if used == "shrunk":
+        a = float(np.clip(off_diagonal_shrinkage, 0.0, 1.0))
+        return (1.0 - a) * cov + a * diag, used
+    raise ValueError(f"unknown covariance estimator {estimator!r}")
+
+
 def fit_reward_model(
     hr_chunks: Sequence[ChunkSummary],
     bins: CatalogBins,
     *,
-    ensemble_size: int = 16,
+    ensemble_size: Optional[int] = None,
     n_draws: int = 400,
     shrinkage: float = 0.1,
     strata: Optional[Sequence[str]] = None,
     seed: int = 0,
     min_lambda: float = 1e-8,
     active_dims: Optional[Sequence[int]] = None,
+    method: str = "whole_box",
+    covariance: str = "auto",
+    off_diagonal_shrinkage: float = 0.5,
+    full_box: Optional[Dict[str, EnsembleSummary]] = None,
 ) -> RewardModel:
-    """Estimate ``mu_HR`` and ``C_reg`` from HR chunk summaries by box bootstrap.
+    """Estimate ``mu_HR`` and ``C_reg`` from HR summaries.
 
-    ``shrinkage`` is relative: ``lambda = shrinkage * mean(diag(C))``, floored at
-    ``min_lambda`` so a degenerate ``C`` (e.g. a synthetic test with identical
-    draws) still inverts.
+    ``method="whole_box"`` (default) pools each box into one vector and takes the
+    mean and covariance over boxes -- the same statistic Gate B scores. The
+    covariance is shrunk toward its diagonal by :func:`shrink_covariance`,
+    because ~10 boxes cannot identify a ~10-dimensional covariance.
+
+    ``method="bootstrap"`` is the older mixed-box draw
+    (:func:`stratified_ensembles`); it needs ``ensemble_size`` and ``n_draws``
+    and is kept for the audit scripts alone.
+
+    ``shrinkage`` is relative: ``lambda = shrinkage * mean(diag(C)[active])``,
+    floored at ``min_lambda`` so a degenerate ``C`` (e.g. a synthetic test with
+    identical boxes) still inverts. The mean is over the *active* dimensions, so
+    excluding a bin cannot change the ridge on the bins that are scored.
 
     ``active_dims`` restricts the scored sub-block (see
     :attr:`RewardModel.active_dims`); ``mu`` and ``C`` are still estimated on
     every dimension so an excluded bin remains reportable.
     """
-    draws = stratified_ensembles(
-        hr_chunks, ensemble_size, n_draws, strata=strata, seed=seed
-    )
-    vectors = []
-    for idx in draws:
-        ens = pool([hr_chunks[i] for i in idx])
-        s, _ = summary_vector(ens, bins)
-        vectors.append(s)
-    v = np.asarray(vectors, dtype=np.float64)
-    finite = np.all(np.isfinite(v), axis=1)
-    if not finite.any():
-        raise RuntimeError("every bootstrap draw produced a non-finite summary vector")
-    v = v[finite]
+    n_boxes = len({c.box for c in hr_chunks} | set(full_box or {}))
+    if method == "whole_box":
+        boxes, v, valid = box_vectors(hr_chunks, bins, full_box=full_box)
+        if v.shape[0] < 2:
+            raise ValueError(
+                f"whole-box covariance needs at least 2 boxes, got {v.shape[0]}"
+            )
+        finite = np.all(np.isfinite(v), axis=1)
+        if not finite.any():
+            raise RuntimeError("every box produced a non-finite summary vector")
+        v = v[finite]
+        raw = np.atleast_2d(np.cov(v, rowvar=False, ddof=1))
+        cov, estimator = shrink_covariance(
+            raw, v.shape[0], estimator=covariance,
+            off_diagonal_shrinkage=off_diagonal_shrinkage,
+        )
+        per_box = [len([c for c in hr_chunks if c.box == b]) for b in boxes]
+        size = int(np.median(per_box)) if per_box else 1
+        meta = {
+            "method": "whole_box",
+            "estimator": estimator,
+            "off_diagonal_shrinkage": float(off_diagonal_shrinkage),
+            "boxes": [b for b, f in zip(boxes, finite) if f],
+            "n_boxes_dropped_nonfinite": int(np.count_nonzero(~finite)),
+            "chunks_per_box": per_box,
+            "n_empty_bins_per_box": [int(np.count_nonzero(~row)) for row in valid],
+            "cov_raw_diagonal": np.diag(raw).tolist(),
+        }
+        n_draws_eff = int(v.shape[0])
+    elif method == "bootstrap":
+        if not ensemble_size:
+            raise ValueError("method='bootstrap' requires ensemble_size")
+        draws = stratified_ensembles(
+            hr_chunks, int(ensemble_size), n_draws, strata=strata, seed=seed
+        )
+        vectors = []
+        for idx in draws:
+            ens = pool([hr_chunks[i] for i in idx])
+            s, _ = summary_vector(ens, bins)
+            vectors.append(s)
+        v = np.asarray(vectors, dtype=np.float64)
+        finite = np.all(np.isfinite(v), axis=1)
+        if not finite.any():
+            raise RuntimeError("every bootstrap draw produced a non-finite summary vector")
+        v = v[finite]
+        cov = np.atleast_2d(
+            np.cov(v, rowvar=False) if v.shape[0] > 1 else np.zeros((v.shape[1],) * 2)
+        )
+        estimator = "full"
+        size = int(ensemble_size)
+        meta = {
+            "method": "bootstrap",
+            "estimator": estimator,
+            "n_draws_requested": int(n_draws),
+            "box_bootstrap": True,
+        }
+        n_draws_eff = int(v.shape[0])
+    else:
+        raise ValueError(f"unknown fit method {method!r}")
+
     mu = v.mean(axis=0)
-    cov = np.cov(v, rowvar=False) if v.shape[0] > 1 else np.zeros((v.shape[1],) * 2)
-    cov = np.atleast_2d(cov)
-    lam = max(float(shrinkage) * float(np.mean(np.diag(cov))), float(min_lambda))
+    act = (list(range(cov.shape[0])) if active_dims is None
+           else [int(i) for i in active_dims])
+    lam = max(float(shrinkage) * float(np.mean(np.diag(cov)[act])), float(min_lambda))
     return RewardModel(
         mu=mu, cov=cov, lam=lam, bins=bins,
-        ensemble_size=int(ensemble_size), n_draws=int(v.shape[0]),
+        ensemble_size=size, n_draws=n_draws_eff,
         labels=tuple(bins.labels()),
         active_dims=tuple(int(i) for i in active_dims) if active_dims is not None else (),
         meta={
             "shrinkage": float(shrinkage),
+            "lambda_over_active_dims_only": True,
             "n_hr_chunks": int(len(hr_chunks)),
-            "n_boxes": int(len({c.box for c in hr_chunks})),
-            "n_draws_requested": int(n_draws),
+            "n_boxes": int(n_boxes),
             "n_draws_finite": int(v.shape[0]),
-            "box_bootstrap": True,
+            **meta,
         },
     )

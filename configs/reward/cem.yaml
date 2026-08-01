@@ -1,0 +1,30 @@
+# Rung 2 of the escalation ladder (docs/reward_residual_diffusion.md §5): CEM
+# search over the diffusion noise. Gate B asks whether good residuals appear by
+# chance; this asks whether they exist in the action space at all.
+#
+# Deliberately small. The question is binary -- does directed search move R_occ
+# when undirected best-of-K does not -- and a flat result at this budget is
+# already the evidence rung 3 is designed to follow up.
+base: reward.yaml
+
+cem:
+  population: 8          # candidates generated per box per iteration
+  elites: 2              # survivors that seed the next iteration
+  iterations: 5          # chained by scripts/slurm/submit_cem.sh
+
+  # Perturbation width in units of the unit-variance initial noise, decayed each
+  # iteration (sigma_i = sigma0 * decay**(i-1)). 0.3 keeps a child recognisably
+  # near its parent; children are renormalised back onto the unit shell so the
+  # search cannot win by inflating the residual amplitude.
+  sigma0: 0.3
+  decay: 0.7
+
+  # Explicit noise injection only determines the sample when the sampler draws
+  # nothing else, so churn must be 0 here -- cem_search.py refuses otherwise.
+  # This overrides the prior's diffusion block, which already sets 0.0.
+  churn: 0.0
+
+  # Two val boxes, not all four: an existence question does not need the
+  # sampling precision that a Gate B verdict does, and per-iteration Rockstar
+  # cost scales with population x boxes.
+  boxes: [set8, set9]

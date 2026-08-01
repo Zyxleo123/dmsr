@@ -147,8 +147,21 @@ reward:
   # box bootstrap already resamples. B=16 here would silently span two boxes.
   ensemble_size_B: 8
   num_ensembles_K: 8
-  # lambda = shrinkage * mean(diag(C)); reported with cond(C_reg) in every manifest.
+  # lambda = shrinkage * mean(diag(C)[active]); reported with cond(C_reg) in
+  # every manifest. The mean is over the ACTIVE dimensions only, so excluding the
+  # sparse host bin cannot change the ridge on the bins that are scored.
   shrinkage: 0.1
+  # How C is estimated over the whole-box vectors. There are 8-12 independent
+  # boxes and 10 active dimensions, so a full covariance has at most n-1 nonzero
+  # eigenvalues and its off-diagonal block is a property of the sample rather
+  # than of the universe.
+  #   auto      diagonal below 2D boxes, shrunk above (the default)
+  #   diagonal  keep variances only
+  #   shrunk    (1-a) C + a diag(C), a = off_diagonal_shrinkage
+  #   full      no shrinkage; for the audit scripts, not for scoring
+  covariance_estimator: auto
+  off_diagonal_shrinkage: 0.5
+  # Used only by the legacy bootstrap fit (scripts/reward/audit_reward_covariance.py).
   bootstrap_draws: 400
   bootstrap_seed: 0
   # Stratify ensembles over box, host-mass class and environment class so no
@@ -183,6 +196,13 @@ reward:
     # least this many must be upper-reliable (1e13 or 3.16e13).
     min_improved_reliable_bins: 2
     min_improved_upper_bins: 1
+    # Gate B also requires the CATALOG to vary across the feasible candidates of
+    # a group: relative spread of the occupation curve, averaged over the host
+    # bins that had hosts. Below this the "best of K" is selecting sampling
+    # noise, not a controllable degree of freedom -- SR2's original failure
+    # (field moves, subhalos do not) reproduced in the residual. Same floor as
+    # the field-diversity constraint, since it is the same kind of statement.
+    min_catalog_occupation_spread: 0.02
 
 constraints:
   calibrated: false

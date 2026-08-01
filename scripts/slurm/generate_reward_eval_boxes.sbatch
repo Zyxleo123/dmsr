@@ -2,11 +2,25 @@
 # Stage 9a (GPU): ordinary random samples from every arm, on held-out boxes.
 #
 # The distilled arm gets exactly the same number of random draws as the prior and
-# no selection. Best-of-K appears in the final table as its own arm, taken from
-# the oracle run; it is never mixed into the prior or distilled numbers.
+# no selection. Best-of-K is its own arm -- a disjoint block of PRIOR draws that
+# the CPU stage selects one of by reward -- and is never mixed into the prior or
+# distilled numbers.
+#
+# Arms and the claim each one protects:
+#   sr2        the frozen baseline
+#   prior      supervised residual prior, average sample
+#   distill    reward-weighted student, average sample
+#   bestofk    "distillation beat sampling the prior harder"
+#   samecomp   "distillation beat the same optimisation budget with no reward"
+#   abundance  "the OCCUPATION reward did it, not any catalog reward"
+# The last three are controls. Without them a distill-vs-prior difference has
+# three standing explanations, so eval_catalogs.py names each missing arm in its
+# verdict rather than reporting the comparison as if it were clean.
 #
 #   sbatch scripts/slurm/generate_reward_eval_boxes.sbatch
-#   sbatch scripts/slurm/generate_reward_eval_boxes.sbatch N_SAMPLES=8 SPLIT=test
+#   sbatch scripts/slurm/generate_reward_eval_boxes.sbatch N_SAMPLES=8 SPLIT=dev
+#   sbatch scripts/slurm/generate_reward_eval_boxes.sbatch \
+#       SAME_COMPUTE_CKPT=.../prior_long/ckpt_best.pt BEST_OF_K=8
 #
 #SBATCH --job-name=rw_eval_gen
 #SBATCH --partition=general
@@ -32,6 +46,11 @@ source "$_D/_reward_common.sh" "$@"
 : "${SPLIT:=final}"
 : "${BOXES:=}"
 : "${N_SAMPLES:=4}"
+# Controls. Empty = that arm is skipped, and eval_catalogs.py says so in the
+# verdict instead of quietly reporting a two-arm comparison.
+: "${SAME_COMPUTE_CKPT:=$DMSR_REWARD_ROOT/checkpoints/residual_prior_samecompute/ckpt_best.pt}"
+: "${ABUNDANCE_CKPT:=$DMSR_REWARD_ROOT/checkpoints/reward_distill_abundance/ckpt_best.pt}"
+: "${BEST_OF_K:=8}"
 : "${SEED0:=1000}"
 : "${RESIDUAL_SCALE:=1.0}"
 : "${TILE_CORE:=128}"
@@ -41,18 +60,24 @@ source "$_D/_reward_common.sh" "$@"
 require_input "$PRIOR_CKPT" "scripts/slurm/train_residual_prior.sbatch"
 require_input "$DMSR_REWARD_ROOT/cache/sr2_base" "scripts/slurm/cache_sr2_base.sbatch"
 
-DISTILL_ARG=()
-if [[ -r "$DISTILL_CKPT" ]]; then
-    DISTILL_ARG=(--distill-ckpt "$DISTILL_CKPT")
-else
-    echo ">>> no distilled checkpoint at $DISTILL_CKPT: generating the prior arm only."
-fi
+ARM_ARGS=()
+add_arm() {   # $1 = flag, $2 = checkpoint, $3 = what it is
+    if [[ -n "$2" && -r "$2" ]]; then
+        ARM_ARGS+=("$1" "$2")
+    else
+        echo ">>> no $3 checkpoint at ${2:-<unset>}: that arm is SKIPPED."
+    fi
+}
+add_arm --distill-ckpt "$DISTILL_CKPT" "distilled"
+add_arm --same-compute-ckpt "$SAME_COMPUTE_CKPT" "same-compute supervised"
+add_arm --abundance-ckpt "$ABUNDANCE_CKPT" "abundance-only distilled"
 
 python -u scripts/reward/generate_eval_boxes.py \
     --config "$REWARD_CFG" --model-config "$MODEL_CFG" \
     --run-name "$EVAL_RUN" \
     --prior-ckpt "$PRIOR_CKPT" \
-    "${DISTILL_ARG[@]}" \
+    "${ARM_ARGS[@]}" \
+    --best-of-k "$BEST_OF_K" \
     --split "$SPLIT" ${BOXES:+--boxes "$BOXES"} \
     --n-samples "$N_SAMPLES" --seed0 "$SEED0" --base-seed "$BASE_SEED" \
     --residual-scale "$RESIDUAL_SCALE" \

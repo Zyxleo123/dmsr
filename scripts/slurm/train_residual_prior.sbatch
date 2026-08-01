@@ -85,14 +85,25 @@ python -u scripts/reward/train_residual_prior.py \
 
 echo "=== prior -> $RUN_DIR (ckpt_best.pt, ckpt_last.pt, metrics.csv)"
 
-# Gate A is decided HERE, mechanically, and written to gate_a.json. Not strict:
-# a failing Gate A must not strand Gate B on DependencyNeverSatisfied with no
-# explanation -- sample_reward_oracle.sbatch reads the verdict and says why it
-# is not sampling.
+# A PROVISIONAL Gate A from the training metrics alone. Criterion 6 (tile-size
+# independence) cannot be decided here -- this job never tiles -- so it comes out
+# "not_evaluated" and the verdict is necessarily passed: false. That is not a
+# result about the model; it is the missing job saying so.
+#
+# The REAL verdict is written by gate_a_check_cpu.sbatch, after
+# gate_a_tile_scan_gpu.sbatch has produced tile_scan.json. Both are chained
+# behind this job by scripts/slurm/submit_oracle.sh gate_a. Writing the
+# provisional file to its own name keeps it from being mistaken for the verdict
+# Gate B reads.
 python -u scripts/reward/gate_a_check.py \
     --config "$REWARD_CFG" \
     --run-dir "$RUN_DIR" \
+    --out "$RUN_DIR/gate_a_provisional.json" \
     ${SIGMA_JSON:+--audit "$DMSR_REWARD_ROOT/audits/residual_target_audit/residual_target_audit.json"} \
     || echo ">>> gate_a_check.py itself errored; treat Gate A as UNDECIDED"
 
-echo "=== Gate A verdict -> $RUN_DIR/gate_a.json"
+echo "=== provisional Gate A (no tile scan) -> $RUN_DIR/gate_a_provisional.json"
+echo "=== the DECIDING verdict needs two more jobs:"
+echo "===   sbatch scripts/slurm/gate_a_tile_scan_gpu.sbatch"
+echo "===   sbatch scripts/slurm/gate_a_check_cpu.sbatch"
+echo "=== (submit_oracle.sh gate_a chains both automatically)"

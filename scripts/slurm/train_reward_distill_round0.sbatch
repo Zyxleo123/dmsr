@@ -42,10 +42,17 @@ source "$_D/_reward_common.sh" "$@"
 
 # ---- optimisation -----------------------------------------------------------
 : "${STEPS:=20000}"
-: "${BATCH_SIZE:=4}"
-: "${GRAD_ACCUM:=2}"
+# 160^3 inputs (crop 64 + 2x48 context, inherited from residual_prior.yaml) and
+# two graphs per accumulation step -- paired and elite -- plus the frozen
+# teacher. Batch 1 x accum 8 keeps the effective batch at 8, the same as the
+# prior. Do not raise BATCH_SIZE without also raising CONTEXT_MARGIN's cost
+# argument; see the note in configs/reward/distill_round0.yaml.
+: "${BATCH_SIZE:=1}"
+: "${GRAD_ACCUM:=8}"
 : "${LR:=3.0e-5}"
 : "${CROP_HR:=64}"
+: "${CONTEXT_MARGIN:=48}"   # must match the prior's, or student and teacher
+                            # see different neighbourhoods
 : "${CKPT_EVERY:=1000}"
 : "${VAL_EVERY:=1000}"
 : "${NUM_WORKERS:=${SLURM_CPUS_PER_TASK:-8}}"
@@ -65,6 +72,7 @@ python -u scripts/reward/train_reward_distill.py \
     ${RESUME:+--resume "$RESUME"} \
     --set data.root="$DATA" \
     --set data.crop_hr="$CROP_HR" \
+    --set data.context_margin="$CONTEXT_MARGIN" \
     --set data.base_seed="$BASE_SEED" \
     --set distill.paired_fraction="$PAIRED_FRACTION" \
     --set distill.tau="$TAU" \

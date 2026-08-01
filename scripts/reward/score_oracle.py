@@ -35,6 +35,16 @@ def main() -> None:
     ap.add_argument("--run-name", required=True)
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
+    ap.add_argument("--baselines", default="shard0",
+                    choices=["shard0", "only", "skip", "all"],
+                    help="who scores the per-box a=0 baseline. Every shard holds "
+                         "candidates from every box, so 'all' has each of them "
+                         "writing the SAME {box}_base output through the SAME "
+                         "Rockstar work directory, with an existence check and "
+                         "no lock -- concurrent Rockstar runs then corrupt each "
+                         "other's catalog. 'shard0' (default) keeps them on one "
+                         "task; 'only' scores baselines and no candidates, for a "
+                         "prerequisite array; 'skip' assumes that array ran.")
     ap.add_argument("--with-hr", action="store_true", default=True,
                     help="compute HR-referenced constraints (val boxes have HR)")
     ap.add_argument("--no-density", action="store_true",
@@ -55,19 +65,30 @@ def main() -> None:
     out = paths.ORACLE(args.run_name)
     manifest = json.loads((out / "candidates.json").read_text())
     cands = [c for c in manifest["candidates"]]
-    mine = cands[args.shard::max(1, args.num_shards)]
+    shard, n_shards = int(args.shard), max(1, int(args.num_shards))
+    mine = [] if args.baselines == "only" else cands[shard::n_shards]
     scored_dir = out / "scored"
     scored_dir.mkdir(parents=True, exist_ok=True)
     summary_dir = out / "summaries"
     summary_dir.mkdir(parents=True, exist_ok=True)
     a = float(manifest.get("residual_scale", 1.0))
 
-    banner(f"scoring {len(mine)}/{len(cands)} candidates (shard {args.shard})")
+    banner(f"scoring {len(mine)}/{len(cands)} candidates (shard {shard}), "
+           f"baselines={args.baselines}")
 
     # Baseline (a = 0) is scored once per box: it is the counterfactual every
-    # marginal contribution is measured against.
-    boxes = sorted({c["box"] for c in mine})
-    for box in boxes:
+    # marginal contribution is measured against. It must be scored by exactly ONE
+    # task -- see the --baselines help.
+    all_boxes = sorted({c["box"] for c in cands})
+    if args.baselines == "only":
+        base_boxes = all_boxes[shard::n_shards]
+    elif args.baselines == "shard0":
+        base_boxes = all_boxes if shard == 0 else []
+    elif args.baselines == "all":
+        base_boxes = sorted({c["box"] for c in mine})
+    else:
+        base_boxes = []
+    for box in base_boxes:
         _score_one(cfg, freeze, grid, bins, cons, geo, dcfg, out, scored_dir,
                    summary_dir, box=box, seed=None, residual_path=None,
                    base_path=None, residual_scale=0.0, args=args, manifest=manifest)
@@ -149,7 +170,15 @@ def _score_one(cfg, freeze, grid, bins, cons, geo, dcfg, out, scored_dir, summar
         )
         write_summaries(summary_dir / f"{tag}.jsonl",
                         [res.summaries[c] for c in sorted(res.summaries)])
+        # The whole-box summary goes in its OWN file: it is the reward statistic,
+        # the chunk file is the credit-assignment statistic, and anything that
+        # pools a summaries file must not accidentally add the box to its own
+        # chunks. See cosmo_sr.reward.catalog.summarize_full_box.
+        write_summaries(summary_dir / f"{tag}__fullbox.jsonl", [res.full_box])
         row.update({
+            "full_box_summary": str(summary_dir / f"{tag}__fullbox.jsonl"),
+            "n_hosts_full_box": int(res.full_box.n_host_total),
+            "n_subs_full_box": int(res.full_box.n_sub_total),
             "n_halos": int(res.catalog.n),
             "n_hosts": int(res.catalog.hosts().n),
             "n_subs": int(res.catalog.subhalos().n),

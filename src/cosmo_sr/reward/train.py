@@ -32,7 +32,8 @@ from ..train.common import (CSVLogger, amp_components, build_lr_schedule,
                             grad_global_norm, init_run_dir, maybe_init_wandb,
                             save_checkpoint, select_device, system_metrics)
 from ..utils.seed import seed_everything
-from .diffusion import DiffusionConfig, denoising_loss, unwhiten, whiten
+from .diffusion import (DiffusionConfig, denoising_loss, unwhiten, valid_core,
+                        whiten)
 from .model import ResidualDenoiser, build_residual_denoiser
 from .replay import ReplayEntry, elite_weights, read_replay
 from .targets import PairedResidualCrops, resolve_boxes
@@ -561,7 +562,16 @@ def run_training(cfg: Dict, *, mode: str = "prior", smoke: bool = False,
                 if teacher is not None and lam_ref > 0:
                     with torch.no_grad():
                         ref = teacher(aux["u_t"], aux["t"], **aux["cond"])
-                    l_ref = F.mse_loss(aux["eps_hat"], ref)
+                    # Restricted to the valid core, exactly like L_sup. The
+                    # forward pass covers the whole context-expanded 160^3
+                    # window, but its outer shell saw a circularly wrapped
+                    # neighbourhood that exists nowhere in the box; matching the
+                    # teacher there spends capacity agreeing about a mapping
+                    # full-box tiling will never ask for -- and it is 94% of the
+                    # voxels at crop_hr=64, context_margin=48.
+                    l_ref = valid_core(
+                        (aux["eps_hat"] - ref) ** 2, _core_of(b)
+                    ).mean()
                     total = total + lam_ref * l_ref
                     agg["loss_ref"] = agg.get("loss_ref", 0.0) + float(l_ref.detach())
 
@@ -671,15 +681,27 @@ def _sup_loss(model, batch, diff: DiffusionConfig, device, weight=None):
 def _validate(model, loader, diff: DiffusionConfig, device, n_batches: int = 8) -> Dict[str, float]:
     model.eval()
     losses, rms = [], []
-    for i, b in enumerate(loader):
-        if i >= n_batches:
-            break
-        # Fixed timestep grid so validation is comparable across steps rather
-        # than dominated by which t happened to be drawn.
-        torch.manual_seed(1000 + i)
-        loss, _ = _sup_loss(model, b, diff, device)
-        losses.append(float(loss))
-        rms.append(float(b["residual"].pow(2).mean().sqrt()))
+    # Validation reseeds the global generator so its timestep/noise draw is a
+    # fixed grid, comparable across steps rather than dominated by which t
+    # happened to come up. That reseed must not escape: leaving it in place made
+    # every validation event restart the TRAINING noise sequence from the same
+    # point, so the run's stochasticity had period val_every and two runs
+    # differing only in val_every were not the same experiment. Save and restore.
+    cpu_state = torch.get_rng_state()
+    cuda_states = (torch.cuda.get_rng_state_all()
+                   if torch.cuda.is_available() else None)
+    try:
+        for i, b in enumerate(loader):
+            if i >= n_batches:
+                break
+            torch.manual_seed(1000 + i)
+            loss, _ = _sup_loss(model, b, diff, device)
+            losses.append(float(loss))
+            rms.append(float(b["residual"].pow(2).mean().sqrt()))
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
     model.train()
     return {
         "val_loss": float(np.mean(losses)) if losses else float("nan"),

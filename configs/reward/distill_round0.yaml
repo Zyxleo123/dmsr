@@ -31,8 +31,17 @@ distill:
 
 train:
   steps: 20000
-  batch_size: 4
-  grad_accum: 2
+  # batch_size 1, NOT the 4 this used to inherit from a pre-context config.
+  # distill_round0 inherits residual_prior's data.context_margin = 48, so an
+  # input is 160^3, not 64^3 -- which is exactly why the prior itself dropped to
+  # batch 1 (see the note in residual_prior.yaml). Distillation is then strictly
+  # heavier than the prior at the same batch size: every accumulation step holds
+  # a paired graph AND an elite graph, and with lambda_ref > 0 a frozen teacher's
+  # activations as well. Effective batch stays 8 through grad_accum, matching the
+  # prior, so the student is not trained under a different batch than its
+  # teacher.
+  batch_size: 1
+  grad_accum: 8
   lr: 3.0e-5
   warmup: 500
   val_every: 1000

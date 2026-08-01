@@ -61,6 +61,14 @@ def main() -> None:
     ap.add_argument("--out", default=None, help="default <run-dir>/gate_a.json")
     ap.add_argument("--allow-unevaluated", action="store_true",
                     help="criteria that need a second job do not block the pass")
+    ap.add_argument("--enforce", default=None,
+                    help="comma list of criterion numbers that may BLOCK the "
+                         "pass, e.g. '2,5'. Everything else is still computed "
+                         "and reported, with status 'advisory'. This exists for "
+                         "the smoke job: six steps on a tiny model cannot "
+                         "satisfy the physical criteria, and letting them fail "
+                         "there would strand the real training job on a verdict "
+                         "about a model that was never meant to pass.")
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero when the gate does not pass. Use this only "
                          "where a FAILING gate must stop a chain outright (the "
@@ -186,8 +194,20 @@ def main() -> None:
     c["8_density"] = _verdict(ok8 if parts else None,
                               "; ".join(parts) or "no density diagnostics logged")
 
+    # Criteria outside --enforce are downgraded to "advisory": reported in full,
+    # never load-bearing. Downgrading rather than dropping keeps the numbers in
+    # gate_a.json, so a smoke run's diagnostics are still readable.
+    enforced = None
+    if args.enforce:
+        enforced = {s.strip() for s in str(args.enforce).split(",") if s.strip()}
+        for k in list(c):
+            if k.split("_", 1)[0] not in enforced:
+                c[k] = {**c[k], "status": "advisory",
+                        "raw_status": c[k]["status"]}
+
     failed = [k for k, v in c.items() if v["status"] == "fail"]
     unevaluated = [k for k, v in c.items() if v["status"] == "not_evaluated"]
+    advisory = [k for k, v in c.items() if v["status"] == "advisory"]
     passed = not failed and (args.allow_unevaluated or not unevaluated)
 
     out = Path(args.out) if args.out else run / "gate_a.json"
@@ -197,18 +217,26 @@ def main() -> None:
         "criteria": c,
         "failed": failed,
         "not_evaluated": unevaluated,
+        "advisory": advisory,
+        "enforced": sorted(enforced) if enforced else "all",
         "allow_unevaluated": bool(args.allow_unevaluated),
+        "tile_scan": str(args.tile_scan) if args.tile_scan else None,
         "passed": bool(passed),
         "note": (
             "All eight criteria of docs/reward_residual_diffusion.md sec. 3a. "
             "Gate B must not be submitted against a run whose gate_a.json says "
-            "passed: false -- the reward numbers would be measuring the bug."
+            "passed: false -- the reward numbers would be measuring the bug. "
+            "Criterion 6 needs scripts/reward/tile_scan.py's JSON; the full "
+            "chain (train -> tile scan -> this check) is submitted by "
+            "scripts/slurm/submit_oracle.sh gate_a."
         ),
     })
 
-    banner(f"Gate A: {'PASS' if passed else 'FAIL'}")
+    banner(f"Gate A: {'PASS' if passed else 'FAIL'}"
+           + (f" (enforcing {sorted(enforced)})" if enforced else ""))
     for k in sorted(c):
-        mark = {"pass": "ok ", "fail": "FAIL", "not_evaluated": "-- "}[c[k]["status"]]
+        mark = {"pass": "ok ", "fail": "FAIL", "not_evaluated": "-- ",
+                "advisory": "note"}[c[k]["status"]]
         print(f"  [{mark}] {k}: {c[k]['detail']}", flush=True)
     print(f"  -> {out}", flush=True)
     if args.strict and not passed:

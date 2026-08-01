@@ -34,8 +34,14 @@ __all__ = [
     "load_bins",
     "pool",
     "summarize_catalog",
+    "summarize_full_box",
     "summary_vector",
 ]
+
+# ``chunk_id`` of a whole-periodic-box summary. Negative so it can never collide
+# with a real chunk id, and so a full-box row in a summaries file is skipped by
+# anything iterating over chunks.
+FULL_BOX_CHUNK_ID = -1
 
 
 @dataclass(frozen=True)
@@ -361,6 +367,70 @@ def summarize_catalog(
             n_excluded_resolution=int(np.count_nonzero(~(host_ok | sub_res_ok | is_host))),
         )
     return out
+
+
+def summarize_full_box(
+    cat: HaloCatalog,
+    bins: CatalogBins,
+    volume_mpc3: float,
+    *,
+    box: str,
+    source: str,
+) -> ChunkSummary:
+    """The same counts, taken on the WHOLE periodic box with no chunk mask.
+
+    Rockstar already runs on the full periodic box; it is the chunk *attribution*
+    that then throws objects away. A halo whose Rvir sphere straddles a chunk
+    boundary is not contaminated in any physical sense -- the box is periodic and
+    the halo is entirely real -- but the purity mask drops it, and the drop rate
+    was measured to rise with host mass, i.e. it removes preferentially the hosts
+    the occupation reward is about. Summing chunks cannot put them back.
+
+    So the reward statistic (Gate B) is taken here, on everything the halo finder
+    found, with the nominal box volume. Chunk summaries stay exactly as they are
+    and keep their one job: *marginal credit*, attributing an improvement to a
+    Lagrangian region so the replay buffer can weight it.
+
+    Returned as a :class:`ChunkSummary` with ``chunk_id = FULL_BOX_CHUNK_ID`` so
+    it shares the pooling and serialisation machinery; ``meta['scope']`` says
+    what it is.
+    """
+    ids = np.asarray(cat.ids, dtype=np.int64)
+    parent = np.asarray(cat.parent_ids, dtype=np.int64)
+    mvir = np.asarray(cat.mvir, dtype=np.float64)
+    num_p = np.asarray(cat.num_p, dtype=np.int64)
+
+    is_host = parent < 0
+    host_ok = is_host & (num_p >= bins.min_host_particles)
+    sub_ok = (~is_host) & (num_p >= bins.min_sub_particles)
+
+    host_rows = np.nonzero(host_ok)[0]
+    id_to_row = {int(ids[r]): int(r) for r in host_rows}
+    keep_sub, sub_host_row = [], []
+    for r in np.nonzero(sub_ok)[0]:
+        hr_row = id_to_row.get(int(parent[r]))
+        if hr_row is None:      # host below the resolution cut: not a pair we can use
+            continue
+        keep_sub.append(int(r))
+        sub_host_row.append(hr_row)
+
+    sub_edges = np.asarray(bins.sub_mass_edges, dtype=np.float64)
+    host_edges = np.asarray(bins.host_mass_edges, dtype=np.float64)
+    ssel = np.asarray(keep_sub, dtype=np.int64)
+    hosts_of = np.asarray(sub_host_row, dtype=np.int64)
+    n_host, _ = np.histogram(mvir[host_rows], bins=host_edges)
+    n_sub, _ = np.histogram(mvir[ssel] if ssel.size else np.zeros(0), bins=sub_edges)
+    occ_num, _ = np.histogram(
+        mvir[hosts_of] if hosts_of.size else np.zeros(0), bins=host_edges)
+    return ChunkSummary(
+        box=str(box), chunk_id=FULL_BOX_CHUNK_ID, source=str(source),
+        n_sub=n_sub.astype(np.float64), n_host=n_host.astype(np.float64),
+        occ_numerator=occ_num.astype(np.float64), volume_mpc3=float(volume_mpc3),
+        n_sub_total=int(ssel.size), n_host_total=int(host_rows.size),
+        n_excluded_boundary=0,
+        n_excluded_resolution=int(np.count_nonzero(~(host_ok | sub_ok))),
+        meta={"scope": "full_box"},
+    )
 
 
 def write_summaries(path: str | Path, summaries: Iterable[ChunkSummary]) -> Path:

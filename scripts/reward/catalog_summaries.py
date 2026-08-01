@@ -30,7 +30,8 @@ from cosmo_sr.eval.rockstar import (default_rockstar_binary, load_rockstar_ascii
                                     run_rockstar_on_field)
 from cosmo_sr.reward import paths
 from cosmo_sr.reward.base import find_base_field
-from cosmo_sr.reward.catalog import summarize_catalog, write_summaries
+from cosmo_sr.reward.catalog import (summarize_catalog, summarize_full_box,
+                                     write_summaries)
 from cosmo_sr.reward.geometry import assign_halos_to_chunks, chunk_purity_grid
 
 
@@ -71,7 +72,10 @@ def main() -> None:
     stem = f"{args.box}__{args.source}__{tag}"
     summary_path = cache / f"{stem}.jsonl"
     meta_path = cache / f"{stem}.json"
-    if summary_path.is_file() and not args.overwrite:
+    # Both files must exist: a cache written before the full-box summary existed
+    # would otherwise silently keep the reward fit on chunk-pooled vectors.
+    if summary_path.is_file() and (cache / f"{stem}__fullbox.jsonl").is_file() \
+            and not args.overwrite:
         print(f"cached -> {summary_path}", flush=True)
         return
 
@@ -141,12 +145,22 @@ def main() -> None:
         chunk_ids=grid.all_ids(),
     )
     write_summaries(summary_path, [summaries[c] for c in sorted(summaries)])
+    # The whole-box statistic, unmasked, in its own file: this is what the reward
+    # model is fitted on and what Gate B scores. The per-chunk file above stays
+    # the credit-assignment statistic.
+    full = summarize_full_box(cat, bins, float(grid.boxsize_mpc_h ** 3),
+                              box=args.box, source=args.source)
+    full_path = cache / f"{stem}__fullbox.jsonl"
+    write_summaries(full_path, [full])
 
     n_assigned = int(np.count_nonzero(assign >= 0))
     core_frac = float(volumes.sum() / (grid.boxsize_mpc_h ** 3))
     write_json(meta_path, {
         "box": args.box, "source": args.source, "tag": tag,
         "field": str(field_path), "catalog": str(cat_path),
+        "full_box_summary": str(full_path),
+        "n_hosts_full_box": int(full.n_host_total),
+        "n_subs_full_box": int(full.n_sub_total),
         "n_halos": int(cat.n),
         "n_hosts": int(cat.hosts().n), "n_subs": int(cat.subhalos().n),
         "n_assigned": n_assigned,
