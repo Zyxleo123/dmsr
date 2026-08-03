@@ -6,10 +6,21 @@ when they would become justified and which objective to use. This document is th
 implementation record: what exists, what was tested on CPU, what has to run on a
 GPU, and what the decision rule is.
 
-**Status: nothing has been trained yet.** Every stage is implemented and covered by
-CPU tests; the GPU stages are scripts for the user to submit. The decision table at
-the end is therefore a *rule*, not a result — Gate B has not been run, so the honest
-current verdict is **support unknown**.
+**Status as of 2026-08-01: Gate A failed, Gate B ran anyway and is void.**
+See **[residual_prior_diagnosis.md](residual_prior_diagnosis.md)** for the results
+and the diagnosis. In short: the residual prior is conditioned correctly and
+correlates with the true residual at high `k` (`r = 0.33`), but only 11% of its
+power is coherent signal, so composing it destroys the density field and Gate B's
+candidates contained 1-6 halos per box. Gate B was sampled seven hours *before*
+the Gate A verdict was written, so its numbers measure the bug, exactly as §3a
+warns. **The support question remains unanswered** — no valid candidate has yet
+reached the reward.
+
+The reward model and the constraint calibration both succeeded and are sound; two
+caveats (a diagonal `C` that puts 71% of `R_cat` on abundance, and a
+`low_k_change_max` that rejects ground truth) are recorded in the diagnosis doc.
+
+The decision table at the end is therefore still a *rule*, not a result.
 
 **The scientific target is `<N_sub | M_host>`, the mean number of subhalos in
 hosts of mass `M_host`.** SR2's occupation function is nearly *flat* where HR

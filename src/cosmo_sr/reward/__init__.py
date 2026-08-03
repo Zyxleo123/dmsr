@@ -36,15 +36,43 @@ attributes a halo by an Eulerian purity test and *drops* it when the test fails,
 which was measured to reject hosts in proportion to their mass. ``tiles``
 attributes every object *fractionally* by its member particles' Lagrangian
 origin, rejecting nothing. Both are live; see ``docs/catalog_reward_oracle.md``.
+
+The host-conditioned local editor
+---------------------------------
+A separate, self-contained line that does **not** use the residual prior above.
+Instead of asking a field model to correct 512^3 cells, it composes
+
+    Psi_out = Psi_SR2 + E(Psi_SR2, C, a)
+
+from an analytic operator ``E`` that only moves particles it explicitly claims,
+a set of proposed subhalo tokens ``C``, and a low-dimensional action ``a``:
+
+``local_editor``    Tokens, the bounded action codec, host particle pools, and
+                    the local contraction/cooling transformation.
+``local_reward``    Object-level Rockstar reward -- did *this proposal* create a
+                    genuinely new subhalo in the requested host?
+``cem``             Bounded, resumable cross-entropy search over ``a``.
+``action_flow``     Conditional flow ``q_theta(a | h, c)`` and its mandatory
+                    Gaussian-mixture baseline.
+``token_bootstrap`` Variable-cardinality ``C_h`` by bootstrapping normalised
+                    training-host catalogs.
+
+Nothing in that group loads the HR field, paired residuals, HR subhalo positions
+or HR member ids; ``tests/reward/test_no_hr_leak.py`` enforces it. See
+``docs/local_editor_runbook.md``.
 """
 from __future__ import annotations
 
 __all__ = [
+    "action_flow",
     "base",
     "catalog",
+    "cem",
     "constraints",
     "diffusion",
     "geometry",
+    "local_editor",
+    "local_reward",
     "model",
     "oracle_hr",
     "paths",
@@ -52,4 +80,5 @@ __all__ = [
     "reward",
     "targets",
     "tiles",
+    "token_bootstrap",
 ]

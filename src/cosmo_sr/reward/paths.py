@@ -16,10 +16,12 @@ __all__ = [
     "CATALOG_CACHE",
     "CHECKPOINTS",
     "EVAL",
+    "LOCAL_EDITOR",
     "ORACLE",
     "REPLAY",
     "RESIDUAL_CACHE",
     "SR2_BASE_CACHE",
+    "local_editor_root",
     "reward_root",
     "subdir",
     "zfs_root",
@@ -81,3 +83,25 @@ def REPLAY(round_name: str = "", create: bool = False) -> Path:
 
 def EVAL(run_name: str = "", create: bool = False) -> Path:
     return subdir("eval", run_name, create=create) if run_name else subdir("eval", create=create)
+
+
+def local_editor_root() -> Path:
+    """Root of the host-conditioned local-editor line.
+
+    A *sibling* of the reward root, not a subdirectory of it. The two lines
+    share code (catalogs, constraints, Rockstar plumbing) but not conclusions,
+    and keeping their artifacts apart means a local-editor run can never be
+    mistaken for evidence about the residual prior when someone globs a
+    directory six months from now. Override with ``DMSR_LOCAL_EDITOR_ROOT``.
+    """
+    env = os.environ.get("DMSR_LOCAL_EDITOR_ROOT")
+    if env:
+        return Path(env)
+    return zfs_root() / "DMSR" / "dmsr_local_editor"
+
+
+def LOCAL_EDITOR(*parts: str, create: bool = False) -> Path:
+    p = local_editor_root().joinpath(*parts)
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
+    return p

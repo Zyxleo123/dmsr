@@ -1,0 +1,25 @@
+---
+description: Large artifacts must go on scratch, never home
+alwaysApply: true
+---
+
+# Scratch for large outputs
+
+Home (`/zfsauton2/home/yixiz`, including this repo) has a tight quota. Stage-1
+Rockstar previously filled it with `*.gadget2` (~3.6 GB) and `*.particles`
+(~9 GB) per catalog.
+
+**Write bulky run products under scratch:**
+
+- Scratch root: `/zfsauton/scratch/yixiz/DMSR/`
+- SR2 study default: `/zfsauton/scratch/yixiz/DMSR/sr2_baseline/`
+- Data already on scratch: `/zfsauton/scratch/yixiz/DMSR/paired_catnorm/`
+
+**Must not land on home:** GADGET dumps, Rockstar `*.particles`, full-box field
+caches, large per-object JSONL, TTS candidate fields.
+
+**OK on home:** code, configs, small manifests, markdown/JSON summaries; optional
+symlinks from `runs/...` → scratch.
+
+Default SLURM/`--out`/`OUTBASE` to scratch. Keep `FULL_PARTICLE_CHUNKS=0` unless
+particle dumps are explicitly directed to scratch.
