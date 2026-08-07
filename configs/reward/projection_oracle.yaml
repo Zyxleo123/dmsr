@@ -1,0 +1,71 @@
+# Phase 1.2 -- the projection oracle.
+#
+# Inherits the single source of truth for data, splits, chunk geometry, catalog
+# bins and the reward model from reward.yaml, and adds only what this experiment
+# decides: which coarse allowances to try, on which boxes, with which SR2 seeds.
+#
+# What this config is FOR: choosing `alpha_disp` and `alpha_vel` for
+# cosmo_sr.reward.correction. It is not a training config and the stage it drives
+# writes no training data -- paired HR is read to construct the sweep and for
+# nothing else.
+base: reward.yaml
+
+projection_oracle:
+  # Diagnostic boxes. These are val-split boxes with paired HR; set12 (dev) may
+  # be added, the final_eval boxes may not -- opening them here would spend the
+  # held-out split on a constraint choice.
+  boxes: [set8, set9, set10, set11]
+
+  # Fixed SR2 seeds. Several, because "the null projection costs 12% of the
+  # occupation" read off one realisation is a statement about that realisation.
+  # Every arm is built on top of the SAME base field for a given seed, so the
+  # comparison between arms is paired at the seed level as well as the box level.
+  base_seeds: [0, 1, 2]
+
+  # T_alpha(r) = P_N r + alpha * P_R r.
+  #   alpha = 0  hard null projection: the LR-visible part of the residual is
+  #              deleted outright.
+  #   alpha = 1  Psi_HR exactly (T_1 = I), the upper reference every arm is
+  #              compared against.
+  # The intermediate points are geometric-ish rather than uniform: if the coarse
+  # component matters at all, it is far more likely to matter at the 10% level
+  # than to be linear in alpha.
+  alphas: [0.0, 0.1, 0.25, 0.5, 1.0]
+
+  # joint      alpha_disp = alpha_vel
+  # disp_only  alpha_disp swept, alpha_vel = 1  -> chooses alpha_disp
+  # vel_only   alpha_vel swept,  alpha_disp = 1 -> chooses alpha_vel
+  # The two single-field sweeps are what make the allowances separable; the
+  # joint sweep alone cannot tell which field needed the coarse component.
+  sweeps: [joint, disp_only, vel_only]
+
+  # Host recovery is measured against the HR catalog. 0 counts every HR host
+  # Rockstar reports; raise it to restrict recovery to hosts the reward's
+  # reliable bins actually cover.
+  mhost_min: 0.0
+
+  # Radial bins for every power-spectrum diagnostic.
+  n_bins: 24
+  # HR cells per streaming slab when the projected field is assembled. Must be a
+  # multiple of data.scale_factor, or a block mean would be computed from part of
+  # its block.
+  slab: 64
+
+  report:
+    # Box bootstrap. Seeds are averaged inside a box first (they are repeats of
+    # one realisation, not independent samples), then boxes are resampled with
+    # replacement, and every comparison against alpha=1 is paired on the box.
+    n_boot: 2000
+    bootstrap_seed: 0
+    ci: 0.95
+    # The decision rule reads exactly these. Occupation is the scientific
+    # target; host recovery catches "occupation improved because hosts were
+    # deleted"; density catches "the catalog improved and the field did not".
+    primary_metrics: [R_occ_reliable, host_recovery_fraction, density_power_error]
+
+# Which channels carry displacement and which carry velocity. Consumed by the
+# correction transform, the calibration job and this oracle, so the grouping is
+# stated once.
+correction:
+  disp_channels: [0, 1, 2]
+  vel_channels: [3, 4, 5]

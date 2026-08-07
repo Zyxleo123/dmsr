@@ -1,0 +1,119 @@
+\documentclass[aspectratio=169]{beamer}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{amsmath}
+\usetikzlibrary{arrows.meta,positioning,fit,calc}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamerfont{frametitle}{size=\Large}
+
+\title{Reward-Only Residual Refinement: Target, Constraints, Compute, Next Steps}
+\author{}
+\date{}
+
+\begin{document}
+
+% ----------------------
+\begin{frame}{Why the true residual is the wrong target}
+\small
+Target: $r = \Psi_{\mathrm{HR}} - \Psi_{\mathrm{SR2}}$, regressed directly and DDIM-sampled back.
+
+\vspace{0.2cm}
+\centering
+\begin{tabular}{l c c}
+\hline
+Quantity & Value & Reference \\
+\hline
+Coherence $r(k)$, high-$k$ (predicted vs.\ true residual) & 0.33 & 1.0 = perfect \\
+Amplitude ratio (disp / vel), predicted vs.\ true & 1.9$\times$ / 2.3$\times$ & 1.0 = correct \\
+Density $\sigma$ ratio at full amplitude ($\alpha=1$) & \alert{0.165} & SR2 alone: 1.018 \\
+\texttt{low\_k\_change} at $\alpha=1$ & 1.17 & ceiling 0.14 \\
+\texttt{low\_k\_change} of the \emph{true} residual itself & 0.29--0.42 & same ceiling \\
+\hline
+\end{tabular}
+
+\vspace{0.3cm}
+\begin{block}{Reading}
+The model isn't refining SR2, it's overwriting at $\sim\!2\times$ the correct
+scale: density collapses monotonically for every $\alpha>0$, and even the
+correct residual moves large scales more than a naive fidelity threshold
+tolerates. Erasing SR2's existing structure to splice in HR's breaks the
+coarse/fine phase coherence that produces halos.
+\end{block}
+\end{frame}
+
+% ----------------------
+\begin{frame}{Controlling amplitude: bounded action via $\tanh$ and $s$}
+\small
+Every proposed edit is bounded before composition:
+\[
+u = s \odot \tanh(h), \qquad
+\delta = P_N u + \alpha\, P_R u,
+\]
+with \textbf{separate $s$ (and $\alpha$) for displacement and velocity}.
+
+\vspace{0.3cm}
+\begin{itemize}
+    \item $s$ caps the largest edit any policy may propose, calibrated
+          per-channel rather than left to the network to discover.
+    \item Saturated fraction of $\tanh$ is measured on every call: a policy
+          pinned against its bound has a vanished gradient, and its samples
+          are set by $s$, not by the network — a diagnosable failure mode.
+    \item $\alpha$ (coarse allowance) is fixed by the projection oracle, not
+          learned: $\alpha_{\mathrm{disp}}=0.25$, $\alpha_{\mathrm{vel}}=0$
+          recovers most of the occupation gap without the density collapse
+          seen at $\alpha=1$.
+\end{itemize}
+\end{frame}
+
+% ----------------------
+\begin{frame}{Rockstar compute: full box vs.\ chunk}
+\small
+\centering
+\begin{tabular}{l c c}
+\hline
+Granularity & Time & Notes \\
+\hline
+Full box (100 Mpc/$h$) & \textbf{17--20 min} halo-find & + 1.6--1.9 min particle stream \\
+One chunk (128$^3$, 25 Mpc/$h$) & \textbf{16--27 s} (mean $\approx$19 s) & 64 chunks tile one box \\
+\hline
+\end{tabular}
+
+\vspace{0.4cm}
+\begin{block}{Online-RL implication}
+Scoring \emph{every} chunk every step ($64\times19\,\mathrm s\approx20$ CPU-min)
+costs as much as one full-box Rockstar run — no savings. Scoring only the
+$K$ chunks a training step actually touches ($K\times19\,\mathrm s$) is cheaper,
+but still $\gg$ one gradient step ($\sim$20--35 s/step) — Rockstar, not the
+network, will dominate wall-clock unless $K$ is kept small.
+\end{block}
+\end{frame}
+
+% ----------------------
+\begin{frame}{Next step: flow-matching loss vs.\ an RL loss}
+\small
+\textbf{Ordinary flow-matching loss} — reproduces the residual prior's known
+failure mode (previous slides): no reward signal, no guarantee the sampled
+residual improves the catalog.
+
+\vspace{0.25cm}
+\textbf{RL alternative:}
+\begin{enumerate}
+    \item Reverse the SDE/ODE to $x_0$ for a sampled chunk.
+    \item Assemble, run Rockstar, compute the chunk's catalog reward $R(x_0)$.
+    \item Advantage against the frozen baseline: $A = R(x_0) - R(\Psi_{\mathrm{SR2}})$.
+    \item Update with either:
+    \begin{itemize}
+        \item \textbf{DDPO}: $\nabla_\theta J = \mathbb E\big[A \sum_t \nabla_\theta \log p_\theta(x_{t-1}\mid x_t, c)\big]$
+        \item \textbf{Weighted reward fine-tuning}: $w=\mathrm{clip}(\exp(A/\tau), w_{\min}, w_{\max})$,
+              $\mathcal L = \mathbb E[w\,\|\epsilon-\epsilon_\theta\|_2^2]$
+    \end{itemize}
+\end{enumerate}
+
+\vspace{0.2cm}
+Both reuse the same chunk-Rockstar-then-attribute pipeline and the same
+$\tanh$/$s$/$\alpha$ bounds already in place.
+\end{frame}
+
+\end{document}

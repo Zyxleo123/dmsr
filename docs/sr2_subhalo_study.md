@@ -90,6 +90,56 @@ absent_peak / diffuse_peak).
 
 Bootstrap: treat **boxes** as the independent unit (never crops or seeds).
 
+## Stage 1b — abundance / occupancy / position report
+
+Reads the frozen Stage-1 catalogs only (no model, no GPU) and separates the
+three failure axes: *how many* halos, *how many subs per host*, and *where*.
+
+```bash
+sbatch scripts/slurm/sr2_subhalo_report_cpu.sbatch
+# redraw figures from metrics.npz without re-parsing catalogs:
+sbatch scripts/slurm/sr2_subhalo_report_cpu.sbatch SR2_STAGE=plot
+```
+
+Overrides are `SR2_`-prefixed (`SR2_BOX`, `SR2_SEEDS`, `SR2_MATCH_SEEDS`,
+`SR2_OUT`, …) because the cluster login environment already exports generic
+names such as `SCRATCH=/home/scratch/$USER`.
+
+Analysis writes `metrics.npz` + `summary.json` under
+`$SR2_ROOT/stage1/subhalo_report`; plotting reads only those. Parsed catalogs
+are cached as `cache/<box>_<tag>.npz`.
+
+**Measured results: [`sr2_subhalo_results.md`](sr2_subhalo_results.md).**
+
+Figures: `fig1` HMF/SHMF + ratio, `fig2` Vmax function, `fig3`
+\(\langle N_{\rm sub}|M_{\rm host}\rangle\) and \(P(N_{\rm sub}\ge1)\),
+`fig4` host-match completeness / HR→SR nearest-neighbour distance / matched-pair
+displacement, `fig5` matched-pair mass & Vmax bias plus spurious-SR fraction,
+`fig6` slab position map and a zoom on the most massive HR host.
+
+## Stage 1c — particle identity (SR2 vs HR)
+
+Stage 1b asks *how many* halos, *how many subs*, and *where*. It cannot ask
+whether a matched pair is made of the **same mass elements**, and that is the
+question a pointwise SR2→HR residual depends on: particle IDs are the flat
+Lagrangian index in both boxes, so membership compares exactly, as sets of
+integers.
+
+```bash
+bash scripts/slurm/submit_particle_identity.sh
+```
+
+See [`docs/sr2_particle_identity.md`](sr2_particle_identity.md) for the leaf
+attribution, the three granularities (identity / radius / chunk), the
+translation-vs-reshuffle split, and the seed-vs-seed control that decides
+whether a disagreement is something a residual could repair at all.
+Measured results (set8, \(z=0\)) are in
+[`docs/sr2_particle_identity_results.md`](sr2_particle_identity_results.md):
+matched hosts share a median Jaccard of **0.042** and subhalos **0.000**, the
+required correction is \(7\,R_{\rm vir}\) of *incoherent* scatter, and two SR2
+seeds agree at Jaccard 0.906 — so the mismatch is systematic, not sampling
+noise. That last number also bears on Gate A.
+
 ## Stage 2 — nested oracle TTS / Gate A
 
 ```bash

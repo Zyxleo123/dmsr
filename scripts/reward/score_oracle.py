@@ -26,7 +26,7 @@ from _common import (add_common_args, banner, bins_of, chunk_grid, constraints_o
 from cosmo_sr.reward import paths
 from cosmo_sr.reward.base import find_base_field
 from cosmo_sr.reward.catalog import write_summaries
-from cosmo_sr.reward.constraints import check_feasible, constraint_values
+from cosmo_sr.reward.constraints import check_constraints, constraint_values
 from cosmo_sr.reward.pipeline import field_to_chunk_summaries
 
 
@@ -139,7 +139,7 @@ def _score_one(cfg, freeze, grid, bins, cons, geo, dcfg, out, scored_dir, summar
     )
     # Diversity is an ensemble-level quantity; oracle_report fills it in once all
     # candidates for a box exist. Leave it NaN here and do not judge it yet.
-    feasible, violations = check_feasible(
+    chk = check_constraints(
         {**vals, "diversity": float("nan")}, _relax_diversity(cons)
     )
     t_cons = time.time() - t0
@@ -148,8 +148,13 @@ def _score_one(cfg, freeze, grid, bins, cons, geo, dcfg, out, scored_dir, summar
         "box": box, "seed": seed, "tag": tag,
         "residual_path": residual_path, "base_path": base_path,
         "residual_scale": float(residual_scale),
-        "constraints": vals, "feasible_field": bool(feasible),
-        "violations": violations,
+        "constraints": vals, "feasible_field": bool(chk["feasible"]),
+        "violations": chk["violations"],
+        # Non-blocking breaches. A candidate can be feasible and still carry a
+        # `critical` one -- that is the point of the severity map, and it is why
+        # these travel on the row instead of being recomputed downstream.
+        "constraint_warnings": chk["warnings"],
+        "constraint_critical": chk["critical"],
         "seconds_constraints": t_cons,
         "checkpoint": manifest.get("checkpoint"),
     }
@@ -197,15 +202,15 @@ def _score_one(cfg, freeze, grid, bins, cons, geo, dcfg, out, scored_dir, summar
 
 
 def _relax_diversity(cons):
-    from cosmo_sr.reward.constraints import ConstraintSet
+    """The same constraints with the ensemble-level bound switched off.
 
-    return ConstraintSet(
-        low_k_change_max=cons.low_k_change_max,
-        displacement_power_error_max=cons.displacement_power_error_max,
-        density_power_error_max=cons.density_power_error_max,
-        lr_consistency_error_max=cons.lr_consistency_error_max,
-        diversity_min=None,
-    )
+    `replace` rather than a field-by-field rebuild: a rebuild silently dropped
+    `calibrated` and would now drop `severity` too, which is exactly the kind of
+    provenance loss those flags exist to prevent.
+    """
+    from dataclasses import replace
+
+    return replace(cons, diversity_min=None)
 
 
 if __name__ == "__main__":

@@ -64,7 +64,7 @@ from cosmo_sr.eval.particles import particle_mass_msun_h  # noqa: E402
 from cosmo_sr.eval.rockstar import run_rockstar_on_field  # noqa: E402
 from cosmo_sr.reward import paths  # noqa: E402
 from cosmo_sr.reward.constraints import (  # noqa: E402
-    check_feasible, constraint_values, load_constraints,
+    check_constraints, constraint_values, load_constraints,
 )
 from cosmo_sr.reward.local_editor import (  # noqa: E402
     HostPool, action_from_values, apply_edits, build_host_pool,
@@ -420,10 +420,13 @@ def main(argv=None) -> int:
             dis_norm_kpc_h=float(d.get("dis_norm_kpc_h", 6000.0)), redshift=z_red,
             compute_density=bool(args.with_density),
         )
-        ok, viol = check_feasible(vals, cons)
+        chk = check_constraints(vals, cons)
+        ok, viol = chk["feasible"], chk["violations"]
         row["constraints"] = vals
         row["feasible_field"] = bool(ok)
         row["violations"] = viol
+        row["constraint_warnings"] = chk["warnings"]
+        row["constraint_critical"] = chk["critical"]
 
         proxies = []
         for plan, action in zip(plans, actions):

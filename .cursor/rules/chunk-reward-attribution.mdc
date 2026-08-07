@@ -1,0 +1,33 @@
+---
+description: Chunk catalog reward — full-box find, local host credit; set8 audit results
+alwaysApply: true
+---
+
+# Chunk reward attribution
+
+Canonical write-up: `cosmo_sr_project/docs/chunk_reward_attribution.md`.
+
+## Rule
+
+**Halo finding uses full-box (or margin-context) Rockstar. Reward credit is local
+(host → 64³ by centre).** Do not train on bare periodic Lagrangian crops.
+
+- Naive crop Rockstar (`audit_chunk_rockstar.py`) ranks HR > SR2 but absolute
+  `R_occ` is misspecified (whole-box μ,C on a 25 Mpc fake universe).
+- Host-level `E_cat` (`audit_host_chunk_reward.py`) uses existing full-box
+  catalogs; terms are separate: miss, FP, Huber(Δlog M), Huber(ΔN_sub), W1(mass ratio).
+
+## set8 snapshot (2026-08-04, HR vs SR2 base)
+
+Global `E_cat(base|HR) ≈ 4.68` — dominated by **dlogM ~64%**, **dN_sub ~30%**,
+miss ≈ 0. Chunk 128³ table:
+
+| chunk | E_cat | naive ΔR_occ | naive Δn_sub |
+|------:|------:|-------------:|-------------:|
+| 0 | 5.12 | +5783 | +654 |
+| 1 | 2.47 | +3087 | +436 |
+| 2 | 5.17 | +6241 | +775 |
+| 3 | 4.55 | +7722 | +537 |
+
+corr(E_cat, Δn_sub) ≈ 0.86. Reports under
+`$DMSR_REWARD_ROOT/audits/{chunk_rockstar,host_chunk_reward}/`.

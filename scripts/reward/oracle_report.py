@@ -38,7 +38,7 @@ from _common import (add_common_args, banner, bins_of, constraints_of,
 
 from cosmo_sr.reward import paths
 from cosmo_sr.reward.catalog import pool, read_summaries
-from cosmo_sr.reward.constraints import check_feasible, diversity_value
+from cosmo_sr.reward.constraints import check_constraints, diversity_value
 from cosmo_sr.reward.replay import marginal_contributions
 from cosmo_sr.reward.reward import RewardModel
 
@@ -264,10 +264,15 @@ def main() -> None:
     for r in cand_rows:
         vals = dict(r["constraints"])
         vals["diversity"] = float(div.get(r["box"], float("nan")))
-        feas, viol = check_feasible(vals, cons)
+        chk = check_constraints(vals, cons)
         r["constraints"] = vals
-        r["feasible"] = bool(feas)
-        r["violations"] = viol
+        r["feasible"] = bool(chk["feasible"])
+        r["violations"] = chk["violations"]
+        # Non-blocking breaches are re-derived here rather than read off the row,
+        # because `diversity` only becomes measurable at this stage and the
+        # severity map may have changed since the row was scored.
+        r["constraint_warnings"] = chk["warnings"]
+        r["constraint_critical"] = chk["critical"]
 
     records, group_reports = [], []
     rng_pick = np.random.default_rng(int(args.random_seed))
@@ -373,6 +378,8 @@ def main() -> None:
                 "constraint_values": r["constraints"],
                 "feasible": bool(r["feasible"]),
                 "violations": r["violations"],
+                "constraint_warnings": r.get("constraint_warnings", []),
+                "constraint_critical": r.get("constraint_critical", []),
                 "marginal_contributions": {str(k): float(v) for k, v in marg.items()},
                 "marginal_contributions_score": args.credit_score,
                 "marginal_contributions_R_cat": {

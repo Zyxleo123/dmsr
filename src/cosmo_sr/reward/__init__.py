@@ -21,8 +21,13 @@ Layout
 ``paths``        $ZFS artifact locations (nothing bulky lands on home).
 ``geometry``     Lagrangian chunk grid, Eulerian purity grid, core mask.
 ``base``         Frozen SR2 wrapper + residual composition.
+``correction``   The one ``u -> delta`` transform: block projections, the coarse
+                 allowance ``alpha``, bounded ``s * tanh`` actions.
 ``diffusion``    Continuous-time VP cosine schedule, eps loss, DDIM sampler.
 ``model``        Conditional 3D residual denoiser (reuses ``Map2MapUNet3D``).
+``gaussian_policy``  One-step multiscale Gaussian residual U-Net: sampled
+                 coefficient fields with an exact log-probability, for
+                 reward-only training with no paired residual targets.
 ``targets``      Paired residual targets ``dPsi* = Psi_HR - Psi_base`` + cache.
 ``catalog``      Chunk-level catalog summaries (SHMF + occupation) and pooling.
 ``reward``       Ensemble Mahalanobis catalog reward against HR.
@@ -69,7 +74,9 @@ __all__ = [
     "catalog",
     "cem",
     "constraints",
+    "correction",
     "diffusion",
+    "gaussian_policy",
     "geometry",
     "local_editor",
     "local_reward",

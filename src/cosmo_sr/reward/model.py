@@ -11,8 +11,23 @@ plumbing on top:
 * ``t`` and the redshift ``z`` are sinusoidally embedded, summed, and injected
   as FiLM, so a single checkpoint can serve several redshifts once matched
   ``z != 0`` pairs exist;
-* the output head is zero-initialised, so an untrained model predicts ``eps = 0``
-  and the composed field starts exactly at the frozen SR2 output;
+* the output head is zero-initialised, so an untrained model predicts ``eps = 0``.
+  That does **not** make the sampled residual zero, and it does not make the
+  composed field equal the frozen SR2 output. A DDIM/DDPM sample starts from
+  ``u_T ~ N(0, I)`` and each step is a function of that draw: with
+  ``eps_hat = 0`` the update reduces to ``u_0_hat = u_t / alpha_t`` and
+  ``u_next = alpha_next * u_0_hat`` (plus ``sigma_next * eps_hat = 0``), i.e. the
+  initial noise *rescaled* -- and rescaled by a factor that diverges as
+  ``alpha(t_max) -> 0``, which is the only reason ``x0_clip`` exists (see
+  :class:`~cosmo_sr.reward.diffusion.DiffusionConfig`). A zero head therefore
+  yields a residual of the clip's amplitude, not of zero amplitude.
+
+  The single exact statement is: **only ``residual_scale = 0`` recovers the
+  frozen SR2 output bit for bit**, because
+  :func:`~cosmo_sr.reward.base.compose` short-circuits and returns ``psi_base``
+  untouched rather than adding ``0 * dPsi``. Nothing about the initialisation of
+  this module can substitute for that. ``tests/reward/test_zero_init_claim.py``
+  pins this down so the claim cannot come back.
 * normalisation defaults to ``"channel"``
   (:class:`~cosmo_sr.models.flow_unet.ChannelGroupNorm3d`), not ``nn.GroupNorm``.
   GroupNorm reduces over space, so a tile of size A and a tile of size B

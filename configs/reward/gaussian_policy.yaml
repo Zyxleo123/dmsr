@@ -1,0 +1,241 @@
+# Phase 2: the one-step multiscale Gaussian residual U-Net, trained by REWARD ONLY.
+#
+# No paired-HR term appears anywhere below. Paired data enters this line at
+# exactly two points, both of them calibration and neither of them a training
+# target:
+#   * correction.scales_path -- the amplitude bound, from
+#     scripts/reward/calibrate_correction_scales.py;
+#   * correction.alpha_disp / alpha_vel -- the coarse allowance, from the
+#     projection oracle.
+# Both are single numbers chosen before training, not per-example supervision.
+base: reward.yaml
+
+model:
+  channels: 6
+  scale_factor: 8
+  # The Map2MapUNet3D design, unchanged: width 48, two levels, two residual
+  # blocks per level, pointwise ChannelGroupNorm3d, SiLU, circular padding, no
+  # attention. Depth is chosen by TILING COST, not capacity -- the measured
+  # receptive-field table in residual_prior.yaml applies verbatim, and
+  # levels=2/blocks=2 gives ~8 Mpc/h of context at 5.4x tiling overhead.
+  width: 48
+  num_levels: 2
+  blocks_per_level: 2
+  kernel_size: 3
+  num_groups: 8
+  norm: channel
+  activation: silu
+  padding_mode: circular
+  use_attention: false      # "no attention initially"
+  use_checkpoint: true
+  condition_on_base: true
+  condition_on_lr: true
+  # Fixed, parameter-free interpolation when the per-scale coefficient fields are
+  # combined. `nearest` is block-constant, which is exactly the geometry the
+  # P_N / P_R decomposition is defined on, so an action at the coarse scale maps
+  # onto whole LR blocks instead of straddling them.
+  upsample: nearest
+
+  # --- exploration -------------------------------------------------------- #
+  # Nonzero, and small. A zero sigma is a policy with no support: reward-weighted
+  # likelihood only ever reweights samples the policy already produces, so a
+  # distribution that proposes nothing can never be corrected. These are in units
+  # of the calibrated amplitude (the correction transform turns h into a bounded
+  # edit), so they are dimensionless.
+  #
+  # Coarse < middle/fine deliberately. The coarse scales are the ones the LR
+  # field already constrains and the ones `alpha` bounds; spending exploration
+  # there first fails low_k_change before proposing anything useful.
+  sigma_init:
+    coarse: 0.05
+    middle: 0.15
+    fine: 0.15
+  # Displacement and velocity explore independently. 1.0 means "use the group's
+  # calibrated amplitude as-is"; lower one of them to search a single field.
+  sigma_init_disp_scale: 1.0
+  sigma_init_vel_scale: 1.0
+  sigma_min: 0.001
+  sigma_max: 3.0
+
+# --- the correction transform ----------------------------------------------
+correction:
+  # MEASURED, run proj0 (2026-08-04): 172 rows, 4 val boxes x 3 SR2 seeds,
+  # 15 arms, real Rockstar, box bootstrap paired on the box.
+  #
+  # The hard null projection is REJECTED. Every alpha < 1 is damaged on all
+  # three primary metrics, monotonically, and no smaller allowance was
+  # statistically indistinguishable from alpha = 1. Fraction of the SR2 -> HR
+  # occupation gap (R_occ_reliable) recovered, with the field cost:
+  #
+  #   arm            gap closed   low_k_change   density_power_error
+  #   SR2                 0%        0            0.023
+  #   alpha = 0          69.0%      ~0           0.954      <- density COLLAPSES
+  #   alpha = 0.1        70.9%      0.034        0.853
+  #   alpha = 0.25       75.1%      0.086        0.699
+  #   alpha = 0.5        85.3%      0.172        0.439
+  #   alpha = 1 (= HR)  100%        0.344        ~0
+  #
+  # The decisive number is not the occupation gap -- alpha = 0 still recovers
+  # 69% of it -- but the DENSITY. Applying HR's within-block component without
+  # its coarse component makes the density field 40x worse than not editing at
+  # all (0.954 vs SR2's 0.023). The two parts of the residual are not separable:
+  # moving particles inside a block without the coherent bulk motion of the
+  # block destroys the phase coherence that produces the density field.
+  #
+  # Split by field (disp_a0 / vel_a0), the damage is almost entirely
+  # DISPLACEMENT: killing the coarse displacement costs 32.9% of the gap and all
+  # of the density damage; killing the coarse velocity costs only 2.5% and no
+  # density damage, while cutting low_k_change from 0.344 to 0.058.
+  # alpha_vel = 0 is therefore a cheap way to shrink the coarse footprint if the
+  # feasibility budget demands it -- it is not free (the CI on R_occ_reliable
+  # excludes zero), just nearly so.
+  mode: block_leaky
+  alpha_disp: 1.0
+  alpha_vel: 1.0
+  disp_channels: [0, 1, 2]
+  vel_channels: [3, 4, 5]
+  # Amplitude bounds s, MEASURED over the 8 train boxes by
+  # scripts/reward/calibrate_correction_scales.py at bound_sigma = 3:
+  #   fine_disp   0.3114  (rms 0.1038, 1.21% of voxels above the bound)
+  #   coarse_disp 0.1885  (rms 0.0628, 1.01% above)
+  #   fine_vel    2.5231  (rms 0.8410, 2.15% above)
+  #   coarse_vel  1.0758  (rms 0.3586, 1.99% above)
+  # The coarse component is 0.61x the fine one for displacement and 0.43x for
+  # velocity, which is why they carry separate bounds.
+  scales_path: /zfsauton/scratch/yixiz/DMSR/dmsr_reward/audits/correction_scales/correction_scales.json
+  # Curriculum multiplier on s. The sampler sweeps this; 0.0 is the bit-exact
+  # SR2 fallback.
+  amplitude: 1.0
+  # Removing the box-wide mean displacement/velocity is optional because it is a
+  # choice about the action space. Both are exact symmetries of a periodic box
+  # (a translation and a boost), so they change no halo statistic while spending
+  # amplitude budget -- but a policy whose action space is silently mean-free has
+  # a bound that means something different from what this file says.
+  remove_mean_disp: false
+  remove_mean_vel: false
+  saturated_abs: 0.99
+
+# --- candidate sampling -----------------------------------------------------
+sampling:
+  split: val
+  boxes: []                 # empty = the split
+  k: 16                     # candidates per (box, amplitude)
+  seed0: 0
+  base_seed: 0
+  residual_scale: 1.0
+  tile_core: 128
+  # policy_receptive_field's probe size is 2*margin+16, so a too-small margin
+  # also makes a too-small probe: on a 112-cell torus (margin=48) the impulse
+  # wraps circularly and reads back as reach=79, an artifact of the probe, not
+  # the model. At 192 cells (margin=88) the probe is far from the boundary
+  # (reach 47 vs a 96-cell radius) and gives a stable measurement: true
+  # half-width ~47.
+  #
+  # MEASURED minimum margin is 56 (jobs 25585/25625: rf=47 at both 192^3 and
+  # 256^3 probes, converged; tile_margin_for already folds in the safety cells).
+  # margin=64 -> a 256^3 tile, and that OOM'd a width-48 forward pass on a 24 GB
+  # A5000 (jobs 25570/25586: 21.4 GB in use, 3 GiB allocation refused). 56 is the
+  # measured requirement exactly, giving a 240^3 tile -- 18% less volume -- and
+  # the sampler re-measures and hard-exits if the margin is ever too small, so
+  # this is checked rather than assumed. Core stays 128 because it must divide
+  # 512 and the next value down (64) is 8x the tiles for 0.4x the tile volume.
+  # The GPU jobs also set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True: 3.6
+  # of those 21.4 GB were reserved-but-unallocated fragmentation.
+  tile_margin: 56
+  tile_batch: 1
+  # The amplitude curriculum: small, medium, large, in units of the calibrated
+  # scales. Sampled as separate arms so the support gate can report which
+  # amplitude has support rather than averaging over all of them.
+  amplitude_curriculum: [0.25, 0.5, 1.0]
+  # Scales whose coefficient fields are written to disk. The rest are regenerated
+  # exactly from (action_seed, policy hash) at training time -- the noise is a
+  # global coordinate-aligned field, so regeneration is bit-exact and a 1.6 GB
+  # fine-scale dump per candidate is avoidable.
+  store_action_scales: [coarse]
+
+# --- the support gate (Phase 2.3) ------------------------------------------
+support_gate:
+  # Report thresholds, NOT scientific truths. They say when this pipeline has
+  # enough signal to be worth a long training run; they do not define success.
+  min_feasible_positive: 5
+  min_ess: 8.0
+  # Occupation must improve in at least this many reliable host bins, of which at
+  # least this many must be upper-reliable -- the same rule Gate B applies, so a
+  # support decision and a promotion decision cannot disagree about what
+  # "improved" means.
+  min_improved_reliable_bins: 2
+  min_improved_upper_bins: 1
+  # Above this, the bound rather than the network is setting the edit, and the
+  # samples are artifacts of `s`.
+  max_tanh_saturation: 0.05
+  # Below this, the catalog does not respond to the action at all -- SR2's own
+  # failure mode (field moves, subhalos do not) reproduced in the policy.
+  min_occupation_spread: 0.02
+  min_subhalo_count_spread: 0.02
+  # Positive candidates carrying no `critical` constraint breach. reward.yaml
+  # downgrades density_power_error from blocking to `critical`, so a candidate
+  # whose density has collapsed is now FEASIBLE and can be positive on the
+  # catalog -- that is exactly the proj0 alpha=0 mode (69% of the occupation gap,
+  # density 40x worse than not editing). Without this the gate could pass on a
+  # set of improvements that are all that mode. 0 disables.
+  min_clean_positive: 1
+
+# --- reward-only training ---------------------------------------------------
+train:
+  steps: 20000
+  batch_size: 2
+  lr: 0.0001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  ema_decay: 0.999
+  log_every: 50
+  ckpt_every: 1000
+  seed: 0
+  amp: false
+  # Scored core and the real context around it, in HR cells. The context is not a
+  # refinement: the model pads circularly, so on a bare crop every voxel whose
+  # receptive field exceeds crop/2 sees the crop wrapped onto itself -- a
+  # neighbourhood that exists nowhere in the box. Matching the sampler's margin
+  # is what makes training and full-box inference the same operation.
+  crop_hr: 128
+  # Tracks sampling.tile_margin exactly -- see the note there. If these two ever
+  # differ, training and full-box inference are no longer the same operation.
+  context_margin: 56
+
+  # L_G = -sum_i w_i log pi_theta(a_i | B_i, Y_i) / sum_i w_i
+  #       + beta * KL(pi_theta || pi_ref) + lambda_edit * C_edit
+  #
+  # There is NO HR reconstruction term. Adding one would make "the policy
+  # improved the catalog" unfalsifiable: the model would be fitting HR whatever
+  # the reward did.
+  beta_kl: 0.01
+  lambda_edit: 0.001
+  # Divide the summed log-probability by the number of action elements before it
+  # enters the loss. This is a learning-rate convention only -- it rescales the
+  # gradient by a constant -- and it is applied so `lr` means the same thing at
+  # any crop size. The log-probability itself is the exact unnormalised sum.
+  normalize_log_prob: true
+
+  # pi_ref is a FROZEN COPY of the initial policy. Its KL is closed form (both
+  # are diagonal Gaussians), so no sampling enters the regulariser.
+  reference: init
+  # Variance floor. The first elite is one sample; letting it collapse sigma is
+  # how a reward-weighted run stops exploring after its first lucky candidate.
+  sigma_floor: 0.02
+
+  replay:
+    round: round_000
+    # Selection is the EXISTING rule, unchanged: the full ensemble must be
+    # feasible and top-quantile, and the chunk's own leave-one-out contribution
+    # must be positive. See cosmo_sr.reward.replay.
+    elite_quantile: 0.2
+    require_positive_marginal: true
+    tau: 1.0
+    a_max: 5.0
+    w_max: 10.0
+    # Regenerate a_s from (action_seed, behaviour checkpoint) instead of reading
+    # stored coefficient fields, and check the reconstruction against the stored
+    # behaviour log-probability. Exact, because the noise is global and
+    # coordinate-aligned.
+    verify_behavior_log_prob: true
+    log_prob_tolerance: 0.001

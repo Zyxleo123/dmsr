@@ -48,7 +48,7 @@ from _common import (  # noqa: E402
 
 from cosmo_sr.eval.rockstar import run_rockstar_on_field  # noqa: E402
 from cosmo_sr.reward.catalog import EnsembleSummary  # noqa: E402
-from cosmo_sr.reward.constraints import check_feasible, constraint_values  # noqa: E402
+from cosmo_sr.reward.constraints import check_constraints, constraint_values  # noqa: E402
 from cosmo_sr.reward.oracle_hr import (  # noqa: E402
     InterventionSpec, Target, apply_intervention, ids_to_lattice,
     lagrangian_mask, random_control_sites, recovery_report,
@@ -223,11 +223,14 @@ def main(argv=None) -> int:
             dis_norm_kpc_h=float(d.get("dis_norm_kpc_h", 6000.0)),
             redshift=float(d.get("redshift", 0.0)),
         )
-        ok, viol = check_feasible(vals, cons)
+        chk = check_constraints(vals, cons)
         row["constraints"] = vals
-        row["feasible"] = bool(ok)
-        row["violations"] = viol
-        print(f"    constraints: feasible={ok} {viol}", flush=True)
+        row["feasible"] = bool(chk["feasible"])
+        row["violations"] = chk["violations"]
+        row["constraint_warnings"] = chk["warnings"]
+        row["constraint_critical"] = chk["critical"]
+        print(f"    constraints: feasible={chk['feasible']} {chk['violations']} "
+              f"{chk['warnings']}", flush=True)
 
     row["wall_min"] = (time.time() - t0) / 60.0
     append_jsonl(row_path, row)

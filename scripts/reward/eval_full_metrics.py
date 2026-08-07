@@ -20,7 +20,7 @@ from _common import (add_common_args, banner, constraints_of, hr_path,
                      load_reward_config, lr_path, write_json)
 
 from cosmo_sr.reward import fields, paths
-from cosmo_sr.reward.constraints import check_feasible, constraint_values, diversity_value
+from cosmo_sr.reward.constraints import check_constraints, constraint_values, diversity_value
 from cosmo_sr.reward.heldout import bootstrap_ci
 
 
@@ -138,14 +138,16 @@ def main() -> None:
         dv = [v for k, v in div.items() if k.startswith(f"{arm}/")]
         entry["diversity"] = float(np.mean(dv)) if dv else float("nan")
 
-        feas, viol = check_feasible(
+        chk = check_constraints(
             {k: entry[k]["mean"] for k in
              ("low_k_change", "displacement_power_error", "density_power_error",
               "lr_consistency_error")} | {"diversity": entry["diversity"]},
             cons,
         )
-        entry["feasible_on_average"] = bool(feas)
-        entry["violations"] = viol
+        entry["feasible_on_average"] = bool(chk["feasible"])
+        entry["violations"] = chk["violations"]
+        entry["constraint_warnings"] = chk["warnings"]
+        entry["constraint_critical"] = chk["critical"]
         table[arm] = entry
 
     write_json(out / "field_eval.json", {
@@ -164,7 +166,11 @@ def main() -> None:
               f"T_err={t['displacement_power_error']['mean']:.4g} "
               f"dens={t['density_power_error']['mean']:.4g} "
               f"div={t['diversity']:.4g} "
-              f"{'OK' if t['feasible_on_average'] else 'INFEASIBLE ' + ','.join(t['violations'])}",
+              f"{'OK' if t['feasible_on_average'] else 'INFEASIBLE ' + ','.join(t['violations'])}"
+              + (" !! " + ",".join(t["constraint_critical"]) if t["constraint_critical"]
+                 else "")
+              + (" (warn: " + ",".join(t["constraint_warnings"]) + ")"
+                 if t["constraint_warnings"] else ""),
               flush=True)
     print(f"  -> {out / 'field_eval.json'}", flush=True)
 

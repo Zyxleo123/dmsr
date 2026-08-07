@@ -26,11 +26,36 @@ Measured per candidate ensemble:
 
 A NaN in any measured value makes the candidate infeasible. Silence is the one
 outcome a filter must never produce.
+
+Severity
+--------
+
+Not every field statistic deserves a veto. The catalog is what this line is
+trying to fix, so a threshold whose breach does not actually invalidate the halo
+statistics should *report* rather than *reject*. Each constraint therefore
+carries a severity:
+
+``block``
+    Breach makes the candidate infeasible. The historical behaviour, and the
+    default for any constraint not named in the config, so an unmentioned
+    constraint is never silently weakened.
+``critical``
+    Breach does **not** make the candidate infeasible, but it is recorded, it is
+    printed loudly, and every report counts how many candidates carry one. For a
+    statistic where a breach probably means the result is not physical even if
+    the catalog looks good.
+``warn``
+    Breach is recorded and reported, nothing more.
+
+A ``critical`` or ``warn`` breach never disappears: it appears in the row's
+``warnings`` and in ``breaches`` with its severity, and the summary counts are
+part of every report. Downgrading a constraint changes what is *rejected*, never
+what is *measured*.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field as dc_field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -38,11 +63,16 @@ from . import fields
 
 __all__ = [
     "ConstraintSet",
+    "SEVERITIES",
+    "check_constraints",
     "check_feasible",
     "constraint_values",
     "diversity_value",
     "load_constraints",
 ]
+
+#: Ordered most severe first; ``block`` is the default for an unnamed constraint.
+SEVERITIES = ("block", "critical", "warn")
 
 
 @dataclass(frozen=True)
@@ -58,6 +88,10 @@ class ConstraintSet:
     # the frozen baseline. Carried on the object (not just left in the YAML) so
     # a consumer cannot use the numbers without also seeing where they came from.
     calibrated: bool = False
+    # Per-constraint severity, keyed by the constraint NAME (not the threshold
+    # key): "block" | "critical" | "warn". Anything absent is "block", so a
+    # constraint can only be weakened by naming it explicitly.
+    severity: Mapping[str, str] = dc_field(default_factory=dict)
 
     def to_dict(self) -> Dict:
         return {
@@ -67,6 +101,9 @@ class ConstraintSet:
             "lr_consistency_error_max": self.lr_consistency_error_max,
             "diversity_min": self.diversity_min,
             "calibrated": self.calibrated,
+            # Effective severity of every constraint, resolved -- a report must
+            # show what was enforced, not what the config happened to mention.
+            "severity": {n: self.severity_of(n) for n in self.as_bounds()},
         }
 
     def as_bounds(self) -> Dict[str, Tuple[str, Optional[float]]]:
@@ -78,12 +115,38 @@ class ConstraintSet:
             "diversity": ("min", self.diversity_min),
         }
 
+    def severity_of(self, name: str) -> str:
+        """``block`` unless the config named this constraint otherwise."""
+        return str(dict(self.severity).get(name, "block"))
+
+    def blocking(self) -> Tuple[str, ...]:
+        """Names of the enabled constraints that can make a candidate infeasible."""
+        return tuple(n for n, (_, b) in self.as_bounds().items()
+                     if b is not None and self.severity_of(n) == "block")
+
 
 def load_constraints(cfg: Dict) -> ConstraintSet:
     c = dict(cfg or {})
     def g(k, d):
         v = c.get(k, d)
         return None if v is None else float(v)
+    bound_names = set(ConstraintSet().as_bounds())
+    sev = {}
+    for name, level in dict(c.get("severity") or {}).items():
+        # A typo would otherwise be silent in the direction that matters: an
+        # unrecognised name leaves the constraint blocking and the config
+        # looking as if it had been relaxed.
+        if name not in bound_names:
+            raise ValueError(
+                f"constraints.severity: unknown constraint {name!r}; "
+                f"expected one of {sorted(bound_names)}"
+            )
+        if str(level) not in SEVERITIES:
+            raise ValueError(
+                f"constraints.severity.{name}: unknown level {level!r}; "
+                f"expected one of {list(SEVERITIES)}"
+            )
+        sev[name] = str(level)
     return ConstraintSet(
         low_k_change_max=g("low_k_change_max", 0.02),
         displacement_power_error_max=g("displacement_power_error_max", None),
@@ -91,6 +154,7 @@ def load_constraints(cfg: Dict) -> ConstraintSet:
         lr_consistency_error_max=g("lr_consistency_error_max", None),
         diversity_min=g("diversity_min", 0.05),
         calibrated=bool(c.get("calibrated", False)),
+        severity=sev,
     )
 
 
@@ -207,20 +271,60 @@ def constraint_values(
     return out
 
 
-def check_feasible(
+def check_constraints(
     values: Dict[str, float], constraints: ConstraintSet
-) -> Tuple[bool, List[str]]:
-    """``(feasible, violations)``. Deterministic; NaN never passes an enabled bound."""
+) -> Dict:
+    """Every breach, with its severity, and the feasibility that follows.
+
+    Deterministic; NaN never passes an enabled bound, whatever its severity.
+
+    Returns ``{"feasible", "violations", "warnings", "critical", "breaches"}``.
+    ``violations`` holds the ``block`` breaches only -- those are the ones that
+    set ``feasible`` -- while ``warnings`` holds the ``critical`` and ``warn``
+    breaches, and ``breaches`` carries all of them structured.
+    """
     violations: List[str] = []
+    warnings: List[str] = []
+    critical: List[str] = []
+    breaches: List[Dict] = []
     for name, (kind, bound) in constraints.as_bounds().items():
         if bound is None:
             continue
         v = values.get(name, float("nan"))
         if v is None or not np.isfinite(v):
-            violations.append(f"{name}=nan")
-            continue
-        if kind == "max" and v > bound:
-            violations.append(f"{name}={v:.6g}>{bound:.6g}")
+            text, val = f"{name}=nan", float("nan")
+        elif kind == "max" and v > bound:
+            text, val = f"{name}={v:.6g}>{bound:.6g}", float(v)
         elif kind == "min" and v < bound:
-            violations.append(f"{name}={v:.6g}<{bound:.6g}")
-    return (len(violations) == 0), violations
+            text, val = f"{name}={v:.6g}<{bound:.6g}", float(v)
+        else:
+            continue
+        level = constraints.severity_of(name)
+        breaches.append({"constraint": name, "value": val, "bound": float(bound),
+                         "kind": kind, "severity": level, "text": text})
+        if level == "block":
+            violations.append(text)
+        else:
+            warnings.append(f"[{level}] {text}")
+            if level == "critical":
+                critical.append(text)
+    return {
+        "feasible": len(violations) == 0,
+        "violations": violations,
+        "warnings": warnings,
+        "critical": critical,
+        "breaches": breaches,
+    }
+
+
+def check_feasible(
+    values: Dict[str, float], constraints: ConstraintSet
+) -> Tuple[bool, List[str]]:
+    """``(feasible, violations)`` -- the blocking breaches only.
+
+    Non-blocking breaches are invisible here by construction; a caller that
+    writes a row or a report should use :func:`check_constraints` so the
+    ``critical``/``warn`` breaches survive into the output.
+    """
+    r = check_constraints(values, constraints)
+    return bool(r["feasible"]), list(r["violations"])

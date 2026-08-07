@@ -125,22 +125,14 @@ def stage_propose(cfg: Dict, args) -> int:
     return 0
 
 
-def stage_aggregate(cfg: Dict, args) -> int:
-    boxes = ([b.strip() for b in args.boxes.split(",") if b.strip()]
-             or list(cfg.get("search_boxes", [])))
-    rows: List[Dict] = []
-    for box in boxes:
-        rows.extend(read_jsonl(rows_path(args.run_name, box)))
-    scored = [r for r in rows
-              if r.get("scored") and int(r.get("round", -1)) == int(args.round)]
-    cem_rows = [r for r in scored if r.get("arm") == "cem"
-                and r.get("control", "none") == "none"]
-    if not cem_rows:
-        print(f">>> GATE: no scored CEM rows for round {args.round} in {boxes}.")
-        print(">>> produced by: local_editor_candidates_cpu.sbatch")
-        print(">>> exiting 0 so dependents report the same rather than stranding.")
-        return 0
+def _refit_modes(cfg: Dict, args, cem_rows: List[Dict]) -> Dict[str, Dict]:
+    """Replay one round's CEM rows into the per-mode states and refit.
 
+    Split out from :func:`stage_aggregate` because only this half needs the
+    ``cem`` arm. The Gate 1 verdict is computed from every scored row, so a
+    round with no CEM rows -- which is exactly what the ``gate1`` stage
+    produces, random plus its controls and nothing else -- must still reach it.
+    """
     n_hosts = int(cfg.get("cem", {}).get("proposals_per_box", 8))
     n_cand = int(args.candidates or cfg.get("cem", {}).get("candidates_per_round", 28))
     per_mode = _per_mode_counts(cfg, n_cand, n_hosts)
@@ -180,12 +172,11 @@ def stage_aggregate(cfg: Dict, args) -> int:
                 "inert": int(o.n_active_particles) == 0,
             })
 
-    summary: Dict = {"pipeline": PIPELINE, "run_name": args.run_name,
-                     "round": int(args.round), "boxes": boxes, "modes": {}}
+    modes: Dict[str, Dict] = {}
     for m, (run, state, _) in runs.items():
         recs = per_mode_rows.get(m, [])
         if not recs:
-            summary["modes"][m] = {"n": 0, "note": "no scored rows this round"}
+            modes[m] = {"n": 0, "note": "no scored rows this round"}
             continue
         z = np.stack([r["z"] for r in recs])
         rew = np.asarray([r["reward"] for r in recs], dtype=np.float64)
@@ -208,7 +199,7 @@ def stage_aggregate(cfg: Dict, args) -> int:
                                   "boxes": [r["box"] for r in recs]})
         nxt, info = state.update(z, rew, feas)
         n_inert = int(sum(1 for r in recs if r["inert"]))
-        summary["modes"][m] = {
+        modes[m] = {
             "n": len(recs), "n_success": n_succ,
             "n_detected": int(sum(1 for r in recs if r["detected"])),
             "n_feasible": int(np.count_nonzero(feas)),
@@ -228,6 +219,40 @@ def stage_aggregate(cfg: Dict, args) -> int:
                   "the claimed set. Raise editor.bounds.source_radius_rvir's "
                   "lower bound -- those Rockstar runs bought nothing.",
                   flush=True)
+    return modes
+
+
+def stage_aggregate(cfg: Dict, args) -> int:
+    boxes = ([b.strip() for b in args.boxes.split(",") if b.strip()]
+             or list(cfg.get("search_boxes", [])))
+    rows: List[Dict] = []
+    for box in boxes:
+        rows.extend(read_jsonl(rows_path(args.run_name, box)))
+    scored = [r for r in rows
+              if r.get("scored") and int(r.get("round", -1)) == int(args.round)]
+    if not scored:
+        print(f">>> GATE: no scored rows at all for round {args.round} in {boxes}.")
+        print(">>> produced by: local_editor_candidates_cpu.sbatch")
+        print(">>> exiting 0 so dependents report the same rather than stranding.")
+        return 0
+
+    cem_rows = [r for r in scored if r.get("arm") == "cem"
+                and r.get("control", "none") == "none"]
+    summary: Dict = {"pipeline": PIPELINE, "run_name": args.run_name,
+                     "round": int(args.round), "boxes": boxes, "modes": {}}
+    if cem_rows:
+        summary["modes"] = _refit_modes(cfg, args, cem_rows)
+    else:
+        # The `gate1` stage scores the random arm and its three controls and
+        # never the `cem` arm, so there is no population to refit -- but the
+        # verdict that stage exists to produce is computed below from every
+        # scored row. Returning here (as this script used to) made the Gate 1
+        # job exit 0 having written no gate1.json, which reads like a clean run.
+        summary["modes"] = {}
+        summary["note"] = "no cem-arm rows this round; CEM refit skipped"
+        print(f">>> no scored CEM rows for round {args.round}: reporting Gate 1 "
+              f"from the {len(scored)} non-CEM rows and skipping the refit.",
+              flush=True)
 
     gate = gate1_verdict(
         scored,

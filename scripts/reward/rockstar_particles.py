@@ -41,6 +41,9 @@ from cosmo_sr.eval.rockstar import (  # noqa: E402
     load_rockstar_ascii, run_rockstar_on_particles,
 )
 from cosmo_sr.eval.particles import field_to_particles  # noqa: E402
+from cosmo_sr.eval.particle_identity import (  # noqa: E402
+    build_owner_index, check_owner_consistency, stream_owner_assignment,
+)
 from cosmo_sr.reward.pipeline import existing_catalog  # noqa: E402
 from cosmo_sr.reward.tiles import (  # noqa: E402
     TileGrid, check_member_consistency, direct_full_box_stats,
@@ -92,6 +95,20 @@ def catalogs_agree(a, b) -> dict:
     return out
 
 
+def must_rerun_halo_finder(work: Path, tag: str, reuse: bool) -> bool:
+    """Is the existing catalog directory usable as a cache?
+
+    Only if it still holds the member table. Every stage below streams that
+    table, and a *successful* run deletes it, so a catalog directory without one
+    is the leftover of a completed run rather than a cache. Reusing it skips the
+    halo finder in seconds and then fails with "Rockstar wrote no .particles
+    table", which reads as a config error and is not one (jobs 26257/26258).
+    """
+    if not reuse:
+        return True
+    return not any(Path(work, f"{tag}_rockstar").glob("*.particles"))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     add_common_args(ap)
@@ -117,6 +134,11 @@ def main(argv=None) -> int:
                     help="JSON with {'halo_ids': [...]}; their member particle "
                          "ids are written alongside the tile weights in the same "
                          "streaming pass (Experiment 1 mask construction)")
+    ap.add_argument("--write-assignment", action="store_true",
+                    help="also write <box>_<tag>_owner.npy: the catalog id of "
+                         "the object each particle is bound to, indexed by "
+                         "Lagrangian particle id (SR2-vs-HR identity study). "
+                         "Costs one extra streaming pass over the same table.")
     ap.add_argument("--keep-particles", action="store_true",
                     help="do NOT delete the ~7 GB ASCII table (debugging only)")
     ap.add_argument("--chunk-rows", type=int, default=8_000_000)
@@ -134,7 +156,13 @@ def main(argv=None) -> int:
     npz = work / f"{box}_{tag}_tilew.npz"
     jsonl = paths.subdir("tile_cache", create=True) / f"{box}__{source}__{tag}.jsonl"
 
-    if args.reuse and npz.is_file() and jsonl.is_file():
+    owner_npy = work / f"{box}_{tag}_owner.npy"
+    # A cached run that predates --write-assignment has the npz but no owner
+    # array, and the only way to get one is to find halos again -- so the
+    # request has to defeat the reuse short-circuit.
+    if args.reuse and npz.is_file() and jsonl.is_file() and (
+        not args.write_assignment or owner_npy.is_file()
+    ):
         banner(f"{box}/{tag}: tile weights already cached -> {npz}")
         return 0
 
@@ -160,8 +188,24 @@ def main(argv=None) -> int:
         redshift=float(d.get("redshift", 0.0)),
     )
     del field
+    # Every stage below streams the .particles table, and a *successful* run
+    # deletes it -- so a reusable catalog directory with no table is not a
+    # usable cache, it is the leftover of a completed run. Reusing it would
+    # skip the halo finder in seconds and then fail with "Rockstar wrote no
+    # .particles table", blaming the config for a caching decision. Measured on
+    # jobs 26257/26258: --write-assignment against the Experiment-0 catalogs.
+    #
+    # Re-running rmtree's this work directory and rebuilds every artifact in it
+    # from the same field, so they stay mutually consistent. The authoritative
+    # frozen catalog lives in a different tree ($REWARD_ROOT/halos/), is not
+    # touched, and --verify-frozen compares the new catalog against it -- run
+    # with that flag if you care whether the halo finder reproduced itself.
+    rerun = must_rerun_halo_finder(work, tag, args.reuse)
+    if args.reuse and rerun:
+        banner(f"{box}/{tag}: catalog present but member table already deleted; "
+               "re-running the halo finder (the streaming passes need it)")
     cat = run_rockstar_on_particles(
-        particles, work, tag=tag, cfg=PARTICLE_CFG, overwrite=not args.reuse,
+        particles, work, tag=tag, cfg=PARTICLE_CFG, overwrite=rerun,
     )
     del particles
     t_halo = time.time() - t0
@@ -221,6 +265,29 @@ def main(argv=None) -> int:
         print("!!! member table and ASCII catalog disagree; refusing to write "
               "tile summaries from it.", file=sys.stderr)
         return 3
+
+    if args.write_assignment:
+        # Leaf attribution: which object each particle is bound to, one entry
+        # per Lagrangian id. The tile weights above cannot substitute for it --
+        # they are per-object histograms, and the identity study needs the
+        # membership of individual particles on both sides of the comparison.
+        t0 = time.time()
+        banner("streaming per-particle owner assignment")
+        owner = stream_owner_assignment(
+            pfiles[0], grid.ng_hr ** 3, chunk_rows=args.chunk_rows
+        )
+        np.save(owner_npy, owner)
+        oc = check_owner_consistency(cat, build_owner_index(owner))
+        report["owner_npy"] = str(owner_npy)
+        report["owner_stream_min"] = (time.time() - t0) / 60.0
+        report["owner_consistency"] = oc
+        print(f"    owner array -> {owner_npy} "
+              f"({owner.size} particles, {oc['frac_particles_unowned']:.3f} "
+              f"unowned) in {report['owner_stream_min']:.1f} min", flush=True)
+        print(f"    len(members) == num_p for {oc['n_exact']}/"
+              f"{oc['n_catalog_objects']} objects "
+              f"(max |diff| {oc['max_abs_diff']})", flush=True)
+        del owner
 
     if args.extract_members:
         req = json.loads(Path(args.extract_members).read_text())
