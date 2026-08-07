@@ -1,0 +1,239 @@
+# Direct reward-guided fine-tuning of the SR2 generator G_theta(Y, z).
+#
+# This file is the single source of truth for the DIRECT line. It deliberately
+# does not modify configs/reward/reward.yaml: the residual line's constraint
+# severities, bins and reward fit stay exactly as they are, and are READ from
+# here rather than redefined, so the two lines cannot drift apart on what a
+# "reward" is while disagreeing about what a "pass" is.
+#
+# What this line is NOT:
+#   * it does not train a residual generator (that is the reward.yaml line);
+#   * it does not implement ControlNet;
+#   * it does not touch any existing residual/reward code path.
+
+reward_config: configs/reward/reward.yaml
+freeze: configs/sr2_baseline/freeze.yaml
+
+model:
+  # The pretrained generator every stage starts from. theta_0.
+  path: external/SRS-map2map/SRmodel/G_z0.pt
+  scale_factor: 8
+  in_chan: 6
+  out_chan: 6
+
+# The DEPLOYED tiling. These are not tunables: a tile is one generator forward
+# pass, and the per-tile catalog labels are attached to exactly that.
+geometry:
+  ng_lr: 64
+  ng_hr: 512
+  nsplit: 8
+  pad: 3
+  tile_hr: 64
+  boxsize_mpc_h: 100.0
+  dis_norm_kpc_h: 6000.0
+
+split:
+  # Mirrors reward.yaml. Repeated so a leak is a diff, not an inference.
+  proxy_fit_boxes:   [set0, set1, set2, set3, set4, set5, set6, set7]
+  proxy_gate_boxes:  [set8, set9, set10, set11]
+  actor_train_boxes: [set0, set1, set2, set3, set4, set5, set6, set7]
+  actor_eval_boxes:  [set8, set9, set10, set11]
+  # set12 is already development-contaminated (the SR2 subhalo study and the
+  # reward sanity check both ran on it), so it may serve as a LATE PREFLIGHT and
+  # never as final evidence. set13-15 stay sealed until the final comparison.
+  preflight_boxes:   [set12]
+  sealed_boxes:      [set13, set14, set15]
+
+# --- The differentiable structural features --------------------------------
+soft_structure:
+  # Soft thresholds are applied to log1p(delta); see the module docstring for
+  # why a delta-proportional sigmoid put a 0.054 pedestal under a signal of a
+  # few percent.
+  compact_delta: 100.0
+  envelope_lo: 10.0
+  envelope_hi: 100.0
+  tau_log: 0.35
+  peak_scales: [1, 2, 4]
+  peak_deltas: [100.0, 30.0, 10.0]
+  contrast_margin: 1.5
+  n_power_bands: 4
+  # Valid-centre CIC region as a fraction of the 64^3 crop. 0.5 is the value the
+  # measured table in cic_density_valid_center puts at rel-RMS 0.030 / corr
+  # 0.9995 / 97% of the mass kept.
+  region_fraction: 0.5
+  grid_mult: 1
+
+# --- The proxy --------------------------------------------------------------
+proxy:
+  # 3-5 members. The actor maximises mean - beta*std across them, so a single
+  # member silently disables the uncertainty penalty.
+  n_members: 5
+  hidden: [128, 128]
+  dropout: 0.0
+  epochs: 400
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 256
+  huber_delta: 1.0
+  # Capped inverse-frequency weighting over the 16 predicted counts. Uncapped,
+  # the 3.16e13 host bin (~30 hosts/box against ~1300 in the lowest) would take
+  # ~40x the loss while carrying the noisiest label of the set.
+  bin_weight_cap: 8.0
+  bin_weight_floor: 0.25
+  # Ranking pairs are formed ONLY within the same (box, tile_id).
+  ranking_weight: 1.0
+  max_pairs_per_group: 32
+  # Drop pairs whose true reward gap is below this: with a small edit most pairs
+  # are ties and training on them is pure label noise.
+  min_pair_margin: 0.0
+
+# The proxy must clear ALL of these on the held-out boxes before the actor is
+# allowed to run. Failing them is NOT a reason to unfreeze more of SR2; it is a
+# reason to improve the proxy or its data, or to move to the true-catalog
+# oracle-renderer experiment.
+proxy_gate:
+  min_within_tile_spearman: 0.5
+  min_pairwise_accuracy: 0.65
+  # Fraction of proxy-selected top candidates that really improved R_occ.
+  min_selected_positive_fraction: 0.6
+  # The oracle-intervention alpha ladder must come out in order.
+  min_alpha_ordering_spearman: 0.8
+  # Single-feature ablation: dropping any one feature must not leave the proxy
+  # essentially as good, or the "proxy" is one number wearing a vector's name.
+  max_single_feature_ablation_retention: 0.9
+  # Pooled occupation-curve prediction, per reliable host bin.
+  max_occupation_curve_log_error: 0.3
+  # Real tile swaps through splice_tiles, verified with a fresh Rockstar run.
+  n_splice_verifications: 4
+  min_splice_sign_agreement: 0.75
+
+# --- The actor --------------------------------------------------------------
+actor:
+  rung: proj_noise            # proj_noise | fine | middle_fine | all_blocks | full
+  group_lr:
+    proj_noise: 1.0e-5
+    fine: 3.0e-6
+    middle: 1.0e-6
+    coarse: 3.0e-7
+  weight_decay: 0.0
+  max_steps: 2000
+  batch_size: 2
+  noise_draws: 2              # seed diversity, same LR tile. NOT two tiles.
+
+  # Occupation is primary; the joint score is kept at a small weight so
+  # abundance cannot be traded away entirely to buy occupation. All three are
+  # logged separately every step regardless.
+  w_occ_reward: 1.0
+  w_joint_reward: 0.25
+  beta_uncertainty: 1.0
+
+  lambda_reward: 1.0
+  lambda_density_power: 10.0
+  lambda_low_k: 100.0
+  lambda_prox: 1.0
+  lambda_diversity: 10.0
+  d_struct_min: 0.05
+  # The surrogate does not get to move anything until the exact guards are
+  # established.
+  reward_warmup_steps: 200
+
+  grad_clip: 1.0
+  amp: true
+  ema_decay: 0.999
+  grad_norm_every: 25
+  log_every: 10
+  checkpoint_every: 250
+  seed: 0
+  density_power_bands: 8
+
+# --- Checkpoint gates -------------------------------------------------------
+# RELATIVE, and paired on (box, seed) against frozen SR2. reward.yaml's
+# density_power_error_max = 0.03751 is 1.5x the WORST frozen-vs-HR error, which
+# is the right bound for "materially worse than the baseline" and much too
+# permissive for "no degradation" -- it admits a checkpoint that makes density
+# 50% worse than SR2's own error. It is kept below only as an absolute backstop.
+gates:
+  # PLACEHOLDERS. Run the frozen seed-to-seed calibration
+  # (scripts/reward/gate_sr2_direct.py --stage calibrate) and paste the proposal
+  # in, then set calibrated: true. Nothing downstream will pass while this is
+  # false, which is the point.
+  calibrated: false
+  mean_degradation_max: null
+  single_box_degradation_max: null
+  # Inherited from the residual line's calibration (0.1x the HR box-to-box
+  # scatter). Rewriting the LR-visible scales means the output is no longer a
+  # refinement of the thing that was validated.
+  low_k_change_max: 0.139595
+  d_struct_min: 0.05
+  density_power_error_max: 0.03751
+
+calibration:
+  # Frozen-generator seeds used to measure the seed-to-seed spread that sets the
+  # tolerances above. More seeds is a better tolerance, not a looser one.
+  seeds: [0, 1, 2, 3]
+  boxes: [set0, set1, set2, set3]
+  mean_margin: 1.0
+  single_margin: 2.0
+
+# --- Rockstar feedback loop -------------------------------------------------
+# Section 10: a deliberately small overfit FIRST, then dataset aggregation.
+overfit:
+  boxes: [set0]
+  # Host-rich tiles, chosen by the frozen box's own tile summaries.
+  n_tiles: 4
+  tile_selection: host_rich
+  rung: proj_noise
+  max_steps: 300
+  # The real result, not the proxy, decides. Improvement in at least two
+  # reliable host bins, at least one of which is bin 2 or 3.
+  min_improved_reliable_bins: 2
+  min_improved_upper_bins: 1
+  upper_reliable_host_bins: [2, 3]
+
+dagger:
+  rounds: 3
+  candidates_per_round: 4
+  # Proxy and actor are NEVER updated from the same minibatches: a round trains
+  # the actor, then labels new candidates, then refits the proxy, then
+  # revalidates it, then resumes from the last FIELD-VALID actor checkpoint.
+  refit_proxy_each_round: true
+  resume_from_last_field_valid: true
+
+# --- Original SR2 adversarial continuation ----------------------------------
+# CHECKED ON THIS CLUSTER: external/SRS-map2map/SRmodel/ contains G_z0.pt and
+# G_z2.pt only, and no D_* checkpoint exists anywhere under $ZFS. So there is no
+# original critic, the mainline weight is zero, and a freshly initialised critic
+# is NOT "ordinary SR2 continuation" -- it is a random objective. It may be run
+# later as a separate, clearly-labelled ablation after a frozen-generator
+# warm-up. dmsr.HRCritic is deliberately not reused: it was designed for
+# high-pass residual fields and sees different inputs.
+adversarial:
+  weight: 0.0
+  allow_fresh_critic: false
+  checkpoint: ""
+  gp_lambda: 10.0
+  gp_every: 16
+  critic_steps_per_generator_step: 1
+  critic_lr: 1.0e-4
+  critic_betas: [0.0, 0.9]
+  critic_width: 64
+  critic_depth: 4
+  # 6 upsampled LR + 6 candidate/HR displacement+velocity + 8 inverse-pixel-
+  # shuffled fine CIC density = 20 channels.
+  density_grid_mult: 2
+  critic_warmup_steps: 1000
+
+paths:
+  # Every bulky artifact of this line. NOT the repository, NOT home.
+  root_env: DMSR_SR2_DIRECT_ROOT
+  default_root: ${ZFS}/DMSR/dmsr_reward/sr2_direct
+
+rockstar:
+  binary: external/rockstar/rockstar
+  # FULL_PARTICLE_CHUNKS = 1: the member-particle table is what makes exact
+  # fractional tile attribution possible.
+  config: configs/sr2_baseline/rockstar_particles.cfg
+  chunk_rows: 8000000
+  # The ~7 GB ASCII table is streamed into a compressed summary and DELETED in
+  # the same job. It must never survive the allocation.
+  delete_particles: true
