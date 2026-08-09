@@ -122,12 +122,34 @@ def spec_tag(args) -> str:
 # --------------------------------------------------------------------------- #
 # generate
 # --------------------------------------------------------------------------- #
+def cached_frozen_field(box: str, seed: int) -> Optional[np.ndarray]:
+    """The frozen candidate's field, if the labelled one is already on disk.
+
+    Every use of a "frozen reference" in this file means *the* frozen candidate
+    of that box and seed -- the one whose catalog the labels' ``dR`` is measured
+    against. Regenerating it instead of loading it makes that an assumption
+    about bit-reproducible seeded sampling across nodes and GPU models, and if
+    the assumption ever fails the failure is silent: an intervention's alpha=0
+    anchor stops being the box its reward is compared to. Loading is also a
+    minute of a6000 time saved per candidate.
+    """
+    p = candidate_dir(box, candidate_tag("frozen", seed=int(seed))) / "field.npy"
+    return np.load(p, mmap_mode="r") if p.is_file() else None
+
+
 def generate_field(cfg, box: str, source: str, seed: int, *, alpha: float,
                    mode: str, checkpoint: str, device) -> np.ndarray:
     geom = geometry_of(cfg)
 
     if source == "hr":
         return np.asarray(load_hr(cfg, box), dtype=np.float32)
+
+    if source in ("frozen", "frozen_seed"):
+        cached = cached_frozen_field(box, seed)
+        if cached is not None:
+            print(f"    reusing the labelled frozen field for {box} seed {seed}",
+                  flush=True)
+            return np.asarray(cached, dtype=np.float32)
 
     if source in ("frozen", "frozen_seed", "actor"):
         lr = np.asarray(load_lr(cfg, box), dtype=np.float32)
@@ -146,6 +168,9 @@ def generate_field(cfg, box: str, source: str, seed: int, *, alpha: float,
         # ranking signal if they are the SAME operation the oracle study measured.
         from cosmo_sr.reward.oracle_hr import apply_intervention
 
+        # generate_field reuses the labelled frozen field when it is on disk,
+        # which by the submitter's ordering it always is: interventions are
+        # submitted behind their box's mask job, which is behind its HR label.
         base = generate_field(cfg, box, "frozen", seed, alpha=0.0, mode=mode,
                               checkpoint="", device=device)
         hr = np.asarray(load_hr(cfg, box), dtype=np.float32)

@@ -1,5 +1,9 @@
 #!/bin/bash
-# Fit BOTH proxy arms on set0-7, then gate each on set8-11, in one job.
+# Fit BOTH proxy arms on set0-7, then gate each on set8-11, in one job. CPU:
+# the proxy is a float64 two-layer MLP on ~39k rows and the reward model is a
+# 16-vector Mahalanobis, so there is nothing here a GPU accelerates -- and the
+# GPU build of this job ran on the CPU regardless, because DEVICE is empty in
+# the preamble and --device fell through to "cpu".
 #
 # One job because the arm comparison's whole value is that only the feature
 # vector differed: one process, one table, one set of shared hyperparameters
@@ -13,12 +17,10 @@
 #
 #   sbatch scripts/slurm/train_catalog_proxy_gpu.sbatch <envfile>
 #SBATCH --job-name=sd_proxy
-#SBATCH --partition=general
-#SBATCH --exclude=gpu28
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --partition=cpu
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=12:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/sr2_direct/logs/slurm-sd_proxy-%j.out
 
 set -euo pipefail

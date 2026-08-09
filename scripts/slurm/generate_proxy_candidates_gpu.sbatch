@@ -21,7 +21,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=08:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/sr2_direct/logs/slurm-sd_gen-%A_%a.out
 
 set -euo pipefail

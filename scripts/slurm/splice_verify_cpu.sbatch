@@ -12,7 +12,7 @@
 #SBATCH --partition=cpu
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=192G
-#SBATCH --time=12:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/sr2_direct/logs/slurm-sd_splice-%A_%a.out
 
 set -euo pipefail
