@@ -1,8 +1,10 @@
 #!/bin/bash
 # Proxy data, stage 1 (GPU): one candidate full box + its per-tile features.
 #
-# Features are computed HERE, while the 3.2 GB field is still resident, so the
-# proxy trainer reads a few MB per candidate instead of re-reading the array.
+# Features for BOTH arms are computed HERE, while the 3.2 GB field is still
+# resident, so the proxy trainer reads a few MB per candidate instead of
+# re-reading the array -- and so the two arms are derived from one pass over one
+# field and cannot disagree about which tile they describe.
 #
 # Node choice: `general` with gpu28 excluded, i.e. an a6000 (48 GB) rather than
 # the a5000 (24 GB). The footprint is one 14^3 -> 70^3 forward pass at a time,
@@ -11,6 +13,8 @@
 #
 #   sbatch scripts/slurm/generate_proxy_candidates_gpu.sbatch \
 #       RUN_NAME=direct_a BOX=set0 SOURCE=frozen SEED=0
+#   sbatch scripts/slurm/generate_proxy_candidates_gpu.sbatch \
+#       RUN_NAME=direct_a BOX=set0 SOURCE=intervention ALPHA=0.5 MODE=vel
 #SBATCH --job-name=sd_gen
 #SBATCH --partition=general
 #SBATCH --exclude=gpu28
@@ -31,6 +35,7 @@ set -euo pipefail
 : "${SOURCE:=frozen}"
 : "${SEED:=0}"
 : "${ALPHA:=}"
+: "${MODE:=both}"
 : "${CHECKPOINT:=}"
 : "${DROP_FIELD:=0}"
 
@@ -38,7 +43,8 @@ read -r -a _BOXES <<< "${BOXES//,/ }"
 BOX="${BOX:-${_BOXES[${SLURM_ARRAY_TASK_ID:-0}]}}"
 
 ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME" --stage generate
-      --box "$BOX" --source "$SOURCE" --seed "$SEED" --base-seed "$BASE_SEED")
+      --box "$BOX" --source "$SOURCE" --seed "$SEED" --base-seed "$BASE_SEED"
+      --mode "$MODE")
 [ -n "$ALPHA" ] && ARGS+=(--alpha "$ALPHA")
 [ -n "$CHECKPOINT" ] && ARGS+=(--checkpoint "$CHECKPOINT")
 [ -n "$DEVICE" ] && ARGS+=(--device "$DEVICE")

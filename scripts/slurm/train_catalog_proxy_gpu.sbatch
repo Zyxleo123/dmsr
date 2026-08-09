@@ -1,19 +1,24 @@
 #!/bin/bash
-# Fit the proxy ensemble (set0-7), then GATE it on set8-11 in the same job.
+# Fit BOTH proxy arms on set0-7, then gate each on set8-11, in one job.
 #
-# The gate runs here rather than as a separate job because its verdict is the
-# only thing that decides whether the actor may start, and splitting them adds a
-# window in which a stale "pass" from a previous fit is on disk next to a new
-# ensemble.
+# One job because the arm comparison's whole value is that only the feature
+# vector differed: one process, one table, one set of shared hyperparameters
+# chosen by cross-validation on the mean over both arms. Two jobs would be two
+# chances for a difference nobody intended.
 #
-#   sbatch scripts/slurm/train_catalog_proxy_gpu.sbatch RUN_NAME=direct_a
+# The gates run here too, rather than as separate jobs, because their verdict is
+# the only thing that decides whether an actor may start, and splitting them
+# adds a window in which a stale "pass" from a previous fit sits on disk next to
+# a new ensemble.
+#
+#   sbatch scripts/slurm/train_catalog_proxy_gpu.sbatch <envfile>
 #SBATCH --job-name=sd_proxy
 #SBATCH --partition=general
 #SBATCH --exclude=gpu28
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --mem=96G
+#SBATCH --time=12:00:00
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/sr2_direct/logs/slurm-sd_proxy-%j.out
 
 set -euo pipefail
@@ -23,21 +28,38 @@ _D="${SLURM_SUBMIT_DIR:-/zfsauton2/home/yixiz/DMSR/cosmo_sr_project}/scripts/slu
 source "$_D/_sr2_direct_common.sh" "$@"
 set -euo pipefail
 
+: "${ARMS:=a b}"
+
 require_input "$REWARD_MODEL_JSON" "scripts/slurm/fit_reward_model_cpu.sbatch"
-require_input "$DMSR_SR2_DIRECT_ROOT/proxy_data/rows.jsonl" \
-    "scripts/slurm/label_proxy_candidates_cpu.sbatch (which runs --stage index)"
+# The marker, not the table: a rows.jsonl exists as soon as ONE candidate has
+# been labelled, and fitting on that would be fitting on a different dataset
+# every time the indexer ran.
+require_input "$DMSR_SR2_DIRECT_ROOT/proxy_data/labels_complete.json" \
+    "scripts/slurm/index_proxy_labels_cpu.sbatch (after every label job)"
 
 python -u scripts/reward/train_catalog_proxy.py \
-    --config "$DIRECT_CFG" --run-name "$RUN_NAME" --device "${DEVICE:-cpu}"
+    --config "$DIRECT_CFG" --run-name "$RUN_NAME" --device "${DEVICE:-cpu}" \
+    --arms ${ARMS//,/ }
 
-python -u scripts/reward/gate_catalog_proxy.py \
-    --config "$DIRECT_CFG" --run-name "$RUN_NAME"
+for ARM in ${ARMS//,/ }; do
+    python -u scripts/reward/gate_catalog_proxy.py \
+        --config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM"
+done
 
-GATE="$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME/proxy_gate.json"
-python - "$GATE" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-print("proxy gate:", "PASS" if d.get("passed") else "FAIL")
-for f in d.get("failures", []):
-    print("   !!", f)
+python - "$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME" ${ARMS//,/ } <<'PY'
+import json, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+for arm in sys.argv[2:]:
+    p = run / f"proxy_gate_{arm}.json"
+    if not p.is_file():
+        print(f"arm {arm}: NO VERDICT ({p} missing)")
+        continue
+    d = json.loads(p.read_text())
+    print(f"arm {arm}: {'PASS' if d.get('passed') else 'FAIL'}")
+    for f in d.get("failures", []):
+        print("   !!", f)
+print()
+print("The splice verifications are a separate CPU stage and are expected to be")
+print("unmet at this point. Run them, then proxy_benchmark.py, for the decision:")
+print("  bash scripts/slurm/submit_proxy_benchmark.sh splice")
 PY

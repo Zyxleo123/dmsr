@@ -1,9 +1,14 @@
 #!/usr/bin/env python
 """Train the actor: direct reward-guided fine-tuning of SR2, one rung at a time.
 
-Refuses to start unless the proxy gate passed. That is the whole architecture of
-this line: the surrogate is checked against real catalogs first, and only then
-is it allowed to move a pretrained generator's weights.
+Refuses to start unless ``proxy_benchmark.json`` says this arm may advance. That
+is the whole architecture of this line: the surrogate is checked against real
+catalogs first -- including twelve real spliced-and-re-run Rockstar boxes -- and
+only then is it allowed to move a pretrained generator's weights.
+
+The benchmark, not a per-arm gate, is the authority. An arm can clear its own
+criteria and still not be the one to advance, and the comparison that decides
+that is made in one place.
 
     python scripts/reward/train_sr2_direct.py --run-name direct_a --rung proj_noise
     python scripts/reward/train_sr2_direct.py --run-name direct_a --overfit
@@ -81,6 +86,10 @@ def main(argv=None) -> int:
                          "proj_noise only, short")
     ap.add_argument("--boxes", default="")
     ap.add_argument("--device", default="")
+    ap.add_argument("--arm", default="a",
+                    help="which proxy arm to fine-tune. It must appear in "
+                         "proxy_benchmark.json's advance list; the benchmark, "
+                         "not this flag, decides what may be advanced")
     ap.add_argument("--ignore-gate", action="store_true",
                     help="run without a passing proxy gate (debugging only; the "
                          "resulting checkpoint is not evidence about anything)")
@@ -95,22 +104,40 @@ def main(argv=None) -> int:
     loader_cfg = dict(cfg.get("actor", {}))
 
     # ---- the gate ---------------------------------------------------------
-    gate_file = run / "proxy_gate.json"
+    # The authority is proxy_benchmark.json, not a per-arm verdict: the arms are
+    # compared there, and its `decision` is what says whether ANY arm may be
+    # fine-tuned and which. Reading a single arm's gate would let an arm that
+    # passed on its own be advanced past a decision that said not to.
+    bench_file = run / "proxy_benchmark.json"
     if not args.ignore_gate:
-        if not gate_file.is_file():
-            print(f">>> MISSING INPUT: {gate_file}")
-            print(">>> produced by: scripts/reward/gate_catalog_proxy.py")
+        if not bench_file.is_file():
+            print(f">>> MISSING INPUT: {bench_file}")
+            print(">>> produced by: scripts/slurm/submit_proxy_benchmark.sh all")
             print(">>> exiting 0 so dependents report the same rather than "
                   ">>> stranding on DependencyNeverSatisfied.")
             return 0
-        verdict = json.loads(gate_file.read_text())
-        if not verdict.get("passed", False):
-            print(">>> GATE FAILED: the catalog proxy did not clear section 7:")
-            for f in verdict.get("failures", []):
-                print(f">>>   {f}")
+        bench = json.loads(bench_file.read_text())
+        decision = dict(bench.get("decision", {}))
+        advance = [str(a) for a in decision.get("advance", [])]
+        if not advance:
+            print(">>> DECISION: " + str(decision.get("decision", "unknown")))
+            print(">>> " + str(decision.get("rationale", "")))
+            for a, fails in (bench.get("failures") or {}).items():
+                for f in fails:
+                    print(f">>>   arm {a}: {f}")
             print(">>> Not training. Improve the proxy or its data; do NOT "
                   ">>> compensate by unfreezing more of the generator.")
             return 0
+        if str(args.arm) not in advance:
+            print(f">>> arm {args.arm!r} is not in the benchmark's advance list "
+                  f"{advance}.")
+            print(">>> " + str(decision.get("rationale", "")))
+            print(">>> Not training this arm.")
+            return 0
+        print(f"=== benchmark decision {decision.get('decision')}: advancing "
+              f"arm {args.arm}" +
+              (f" (preferred: {decision['preferred']})" if "preferred" in decision
+               else ""), flush=True)
 
     # ---- what to train ----------------------------------------------------
     if args.overfit:
@@ -167,12 +194,28 @@ def main(argv=None) -> int:
 
     # ---- model ------------------------------------------------------------
     _, reward_t = load_reward_models(cfg)
-    proxy_dir = run / "proxy"
+    proxy_dir = run / f"proxy_{args.arm}"
     if not proxy_dir.is_dir():
         print(f">>> MISSING INPUT: {proxy_dir}")
         print(">>> produced by: scripts/reward/train_catalog_proxy.py")
         return 0
     proxies = ProxyEnsemble.load(proxy_dir)
+
+    # The trainer computes the actor's features itself, and today it computes
+    # arm A's -- density only. An arm-B ensemble expects the phase-space block
+    # too, and feeding it a 26-vector where it wants 44 is a shape error deep in
+    # a training step rather than a statement about what is missing.
+    from cosmo_sr.reward.soft_structure import feature_names
+    want = int(proxies.members[0].cfg.n_features)
+    have = 2 * len(feature_names(scfg))
+    if want != have:
+        print(f">>> arm {args.arm!r}'s proxy takes {want} features, but the actor "
+              f">>> computes {have}.")
+        print(">>> Fine-tuning against a phase-space proxy needs the actor's own "
+              ">>> feature path extended to arm B (cosmo_sr.reward.phase_space."
+              ">>> arm_paired_features). That is deliberately not part of the "
+              ">>> benchmark milestone; not training.")
+        return 0
 
     trainer = DirectFinetuneTrainer(
         model_path_of(cfg), proxies, reward_t, cfg=acfg, geom=geom,

@@ -2,8 +2,6 @@
 # Submitter for the DIRECT SR2 fine-tuning line. It ONLY calls sbatch.
 #
 #   DRY=1 bash scripts/slurm/submit_sr2_direct.sh all     # print, submit nothing
-#   bash scripts/slurm/submit_sr2_direct.sh data          # candidates + labels
-#   bash scripts/slurm/submit_sr2_direct.sh proxy         # fit + GATE the proxy
 #   bash scripts/slurm/submit_sr2_direct.sh baseline      # frozen field metrics
 #   bash scripts/slurm/submit_sr2_direct.sh calibrate     # -> HUMAN STEP
 #   bash scripts/slurm/submit_sr2_direct.sh overfit       # section 10 small overfit
@@ -139,62 +137,32 @@ die_if_aborted() {
 
 dep_of() { [ -n "$1" ] && echo "--dependency=afterok:$1" || echo ""; }
 
-# --- data: candidates (GPU) each followed by its own label job (CPU) --------
-# generate -> label is afterok per candidate, and the candidates are siblings of
-# each other so they queue concurrently rather than serialising behind one
-# 12-hour Rockstar run.
-if [ "$STAGE" = "all" ] || [ "$STAGE" = "data" ]; then
-    echo "=== proxy data ($RUN_NAME)"
-    LAST_LABEL=""
-    for BOX in "${_FIT[@]}"; do
-        # HR: the positive structural anchor.
-        SUB_OVERRIDES=("BOX=$BOX" "SOURCE=hr" "SEED=0")
-        J=$(sub "data: generate HR $BOX (GPU)" $(dep_of "$AFTER") \
-            scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
-        LAST_LABEL=$(sub "data: label HR $BOX (CPU)" --dependency=afterok:"$J" \
-            scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
-        SUB_OVERRIDES=()
-
-        # Frozen SR2 at several seeds: the baseline plus the negative control.
-        for SEED in "${_SEEDS[@]}"; do
-            SRC=$([ "$SEED" = "0" ] && echo frozen || echo frozen_seed)
-            SUB_OVERRIDES=("BOX=$BOX" "SOURCE=$SRC" "SEED=$SEED")
-            J=$(sub "data: generate $SRC seed$SEED $BOX (GPU)" $(dep_of "$AFTER") \
-                scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
-            LAST_LABEL=$(sub "data: label $SRC seed$SEED $BOX (CPU)" \
-                --dependency=afterok:"$J" \
-                scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
-            SUB_OVERRIDES=()
-        done
-
-        # Targeted HR interventions at several alpha: the within-tile ranking
-        # signal. Without these the proxy only ever sees "HR vs SR2", which is
-        # an easy binary distinction and not a local improvement direction.
-        for A in "${_ALPHAS[@]}"; do
-            SUB_OVERRIDES=("BOX=$BOX" "SOURCE=intervention" "SEED=0" "ALPHA=$A")
-            J=$(sub "data: generate intervention a=$A $BOX (GPU)" $(dep_of "$AFTER") \
-                scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
-            LAST_LABEL=$(sub "data: label intervention a=$A $BOX (CPU)" \
-                --dependency=afterok:"$J" \
-                scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
-            SUB_OVERRIDES=()
-        done
-    done
-    echo "  candidates -> $ROOT/candidates/  table -> $ROOT/proxy_data/rows.jsonl"
-    export DATA_JID="$LAST_LABEL"
+# --- data and proxy: MOVED, deliberately -----------------------------------
+# The dataset and the proxy benchmark are now their own workflows, and this file
+# no longer submits either. That is not tidying: the version here labelled only
+# set0-7, so the held-out boxes had no rows and the "gate" had nothing out of
+# sample to gate on; every labelling job rewrote the shared index in place; and
+# `proxy` was chained behind the LAST SUBMITTED labelling job rather than the
+# SLOWEST, so it could fit on a table that was still missing whole boxes. Those
+# are dataset bugs, and a dataset bug reached through a fine-tuning submitter is
+# a bug nobody looks for.
+#
+# The replacements enforce the separation: the label workflow has no path into
+# proxy training, and the benchmark workflow refuses to start until the label
+# workflow has written labels_complete.json.
+if [ "$STAGE" = "all" ] || [ "$STAGE" = "data" ] || [ "$STAGE" = "proxy" ]; then
+    echo "=== '$STAGE' is no longer submitted from this file."
+    echo "===   dataset  : bash scripts/slurm/submit_proxy_labels.sh smoke"
+    echo "===              bash scripts/slurm/submit_proxy_labels.sh all"
+    echo "===   benchmark: bash scripts/slurm/submit_proxy_benchmark.sh all"
+    echo "=== The benchmark ends at proxy_benchmark.json, whose decision says"
+    echo "=== whether any arm may be fine-tuned at all. Nothing below this line"
+    echo "=== may be run before that decision exists."
+    if [ "$STAGE" != "all" ]; then
+        exit 0
+    fi
 fi
-
-# --- proxy: fit, then gate (same job) --------------------------------------
 JID_PROXY=""
-if [ "$STAGE" = "all" ] || [ "$STAGE" = "proxy" ]; then
-    echo "=== proxy fit + gate"
-    DEP=$(dep_of "${DATA_JID:-$AFTER}")
-    JID_PROXY=$(sub "proxy: fit ensemble + section-7 gate (GPU)" $DEP \
-        scripts/slurm/train_catalog_proxy_gpu.sbatch); die_if_aborted
-    echo "  verdict -> $ROOT/runs/$RUN_NAME/proxy_gate.json"
-    echo "  !! if it fails, IMPROVE THE PROXY OR ITS DATA. Unfreezing more of"
-    echo "  !! SR2 is not a response to a proxy that cannot rank."
-fi
 
 # --- baseline: frozen field metrics, several seeds per box -----------------
 JID_BASE=""

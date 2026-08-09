@@ -346,12 +346,21 @@ def count_loss(
     target: Mapping[str, torch.Tensor],
     *,
     weights: Optional[torch.Tensor] = None,
+    row_weights: Optional[torch.Tensor] = None,
     huber_delta: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
     """Huber on ``log1p`` counts, per output block and combined.
 
     ``log1p`` rather than ``log``: tile counts are fractional and frequently
     exactly zero (a tile with no 1e14 host), and ``log`` of that is not a number.
+
+    ``weights`` is per output bin, ``row_weights`` per row. They do different
+    jobs and both are needed: the bin weights stop the abundant low-mass bins
+    from setting the loss, and the row weights stop the abundant *easy sources*
+    -- HR and frozen are five of every eight candidates -- from doing the same
+    to the intervention ladder that carries the local ranking signal. A row
+    weight of zero excludes that row exactly, which is how a box-bootstrap
+    sample is expressed here without rebuilding the batch.
     """
     keys = ("n_sub", "n_host", "occ_numerator")
     parts: Dict[str, torch.Tensor] = {}
@@ -365,15 +374,22 @@ def count_loss(
     p = torch.cat(stacked_p, dim=1)
     t = torch.cat(stacked_t, dim=1)
     per_elem = F.huber_loss(p, t, delta=float(huber_delta), reduction="none")
+
+    w = torch.ones(1, per_elem.shape[1], dtype=per_elem.dtype, device=per_elem.device)
     if weights is not None:
         w = weights.to(per_elem.dtype).to(per_elem.device).reshape(1, -1)
         if w.shape[1] != per_elem.shape[1]:
             raise ValueError(
                 f"weights has {w.shape[1]} entries, expected {per_elem.shape[1]}"
             )
-        parts["loss"] = (per_elem * w).sum() / (w.sum() * per_elem.shape[0])
-    else:
-        parts["loss"] = per_elem.mean()
+    r = torch.ones(per_elem.shape[0], 1, dtype=per_elem.dtype, device=per_elem.device)
+    if row_weights is not None:
+        r = row_weights.to(per_elem.dtype).to(per_elem.device).reshape(-1, 1)
+        if r.shape[0] != per_elem.shape[0]:
+            raise ValueError(
+                f"row_weights has {r.shape[0]} entries, expected {per_elem.shape[0]}"
+            )
+    parts["loss"] = (per_elem * w * r).sum() / (w.sum() * r.sum()).clamp_min(1e-12)
     return parts
 
 
@@ -452,15 +468,29 @@ def split_indices_by_box(
     }
 
 
-def pairwise_ranking_loss(better: torch.Tensor, worse: torch.Tensor) -> torch.Tensor:
+def pairwise_ranking_loss(better: torch.Tensor, worse: torch.Tensor,
+                          weights: Optional[torch.Tensor] = None) -> torch.Tensor:
     """RankNet loss with the convention **higher score = better**.
 
     The opposite of :func:`cosmo_sr.tts.verifier.pairwise_ranking_loss`, which
     scores candidates by an error (lower = better). Rewards are rewards, so the
     sign is flipped here rather than negating rewards at the call site, where the
     convention would be invisible.
+
+    ``weights`` carries the same per-pair reweighting the count loss applies per
+    row -- source balance, changed-tile emphasis, bootstrap multiplicity -- so a
+    pair drawn from a box the bootstrap did not sample contributes nothing here
+    either. Without it the ranking term would quietly train on the full dataset
+    while the count term trained on the sample.
     """
-    return F.softplus(worse - better).mean()
+    per_pair = F.softplus(worse - better)
+    if weights is None:
+        return per_pair.mean()
+    w = weights.to(per_pair.dtype).to(per_pair.device).reshape(-1)
+    if w.shape[0] != per_pair.shape[0]:
+        raise ValueError(
+            f"weights has {w.shape[0]} entries, expected {per_pair.shape[0]}")
+    return (per_pair * w).sum() / w.sum().clamp_min(1e-12)
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:

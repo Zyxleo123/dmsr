@@ -30,10 +30,14 @@ if str(PROJECT_ROOT / "scripts" / "reward") not in sys.path:
 from _common import (  # noqa: E402
     append_jsonl, banner, bins_of, read_jsonl, write_json,
 )
+# Re-exported so every script imports the matrix from one place; it lives in
+# its own torch-free module so the submitter can enumerate it on a login node.
+from _proxy_matrix import candidate_matrix, candidate_tag, dataset_of  # noqa: E402,F401
 
 from cosmo_sr.reward import paths  # noqa: E402
 from cosmo_sr.reward.direct_gates import RelativeDensityGate, load_direct_gate  # noqa: E402
 from cosmo_sr.reward.reward import RewardModel  # noqa: E402
+from cosmo_sr.reward.phase_space import PhaseSpaceConfig  # noqa: E402
 from cosmo_sr.reward.soft_structure import SoftStructureConfig  # noqa: E402
 from cosmo_sr.reward.tiles import TileGrid  # noqa: E402
 from cosmo_sr.reward.torch_reward import TorchRewardModel  # noqa: E402
@@ -45,10 +49,12 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "reward" / "sr2_direct_finetune.yaml
 
 __all__ = [
     "DEFAULT_CONFIG", "PROJECT_ROOT", "actor_config_of", "add_direct_args",
-    "append_jsonl", "banner", "bins_of", "boxes_of", "code_commit",
-    "direct_root", "file_sha", "geometry_of", "gate_of", "load_direct_config",
-    "load_lr", "load_hr", "load_reward_models", "manifest_row", "read_jsonl",
-    "soft_config_of", "tile_grid_of", "write_json",
+    "append_jsonl", "banner", "bins_of", "boxes_of", "candidate_matrix",
+    "candidate_tag", "code_commit", "dataset_of", "direct_root", "file_sha",
+    "geometry_of", "gate_of", "labels_complete_path", "load_direct_config",
+    "load_lr", "load_hr", "load_reward_models", "manifest_row",
+    "phase_space_config_of", "read_jsonl", "rockstar_provenance",
+    "soft_config_of", "tile_grid_of", "write_json", "write_json_atomic",
 ]
 
 
@@ -151,6 +157,16 @@ def soft_config_of(cfg: Mapping) -> SoftStructureConfig:
         boxsize_mpc_h=float(g.get("boxsize_mpc_h", 100.0)),
         ng_hr=int(g.get("ng_hr", 512)),
         dis_norm_kpc_h=float(g.get("dis_norm_kpc_h", 6000.0)),
+    )
+
+
+def phase_space_config_of(cfg: Mapping) -> PhaseSpaceConfig:
+    p = dict(cfg.get("phase_space", {}))
+    return PhaseSpaceConfig(
+        vel_norm_km_s=float(p.get("vel_norm_km_s", 313.42210244571896)),
+        v_ref_km_s=float(p.get("v_ref_km_s", 300.0)),
+        coherence_scales=tuple(int(x) for x in p.get("coherence_scales", (1, 2, 4))),
+        particle_mass_msun_h=float(p.get("particle_mass_msun_h", 581881454.8686146)),
     )
 
 
@@ -265,3 +281,51 @@ def manifest_row(**kw) -> Dict:
     row = {"code_commit": code_commit(), "catalog_path": "", "tile_summaries_path": ""}
     row.update(kw)
     return row
+
+
+def rockstar_provenance(cfg: Mapping) -> Dict[str, str]:
+    """Hashes of the halo finder and its configuration.
+
+    Both, not just the binary: ``FULL_PARTICLE_CHUNKS``, the mass definition and
+    the force resolution all live in the config, and a catalog produced under a
+    different one is not comparable with these labels even if the binary is
+    byte-identical.
+    """
+    rk = dict(cfg.get("rockstar", {}))
+    out: Dict[str, str] = {}
+    for key, default in (("binary", "external/rockstar/rockstar"),
+                         ("config", "configs/sr2_baseline/rockstar_particles.cfg")):
+        p = Path(rk.get(key, default))
+        if not p.is_absolute():
+            p = PROJECT_ROOT / p
+        out[f"rockstar_{key}_path"] = str(p)
+        out[f"rockstar_{key}_sha"] = file_sha(p) if p.is_file() else "missing"
+    return out
+
+
+def write_json_atomic(path: str | os.PathLike, obj) -> Path:
+    """Write JSON through a temporary file in the same directory, then rename.
+
+    ``os.replace`` is atomic within a filesystem, so a reader either sees the
+    previous complete document or the new one -- never a half-written index. The
+    index is read by jobs that may start while it is being rewritten, and a
+    truncated JSON there fails in the trainer with a parse error that says
+    nothing about what actually went wrong.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
+    os.replace(tmp, p)
+    return p
+
+
+def labels_complete_path() -> Path:
+    """The gate every proxy trainer must find before it may read the table.
+
+    Written only by ``collect_catalog_proxy_data.py --stage index``, which runs
+    once, after every labelling job. Its absence means labelling is still in
+    flight and any table on disk is a partial one; fitting on a partial table
+    quietly changes the dataset between runs and makes two fits incomparable.
+    """
+    return direct_root("proxy_data") / "labels_complete.json"

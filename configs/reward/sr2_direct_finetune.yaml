@@ -63,6 +63,56 @@ soft_structure:
   region_fraction: 0.5
   grid_mult: 1
 
+# --- The phase-space block (arm B only) -------------------------------------
+# Arm A is soft_structure alone; arm B is soft_structure + these. Nothing else
+# differs between the arms, which is what makes the comparison an answer about
+# features rather than about tuning.
+phase_space:
+  # What velnorm(., z=0, undo=True) multiplies a stored velocity channel by.
+  # Written into every manifest so a feature vector computed at one redshift can
+  # never be silently compared with one computed at another.
+  vel_norm_km_s: 313.42210244571896
+  v_ref_km_s: 300.0
+  coherence_scales: [1, 2, 4]
+  # Om = 0.2814, 100 Mpc/h, 512^3.
+  particle_mass_msun_h: 581881454.8686146
+
+# --- The labelled dataset (phases 1-3) --------------------------------------
+# The predeclared candidate matrix. Fixed BEFORE any of it is generated: a
+# matrix chosen after looking at labels is a hyperparameter, and this one is
+# meant to be evidence.
+proxy_dataset:
+  # 12 boxes x 8 candidates = 96 full-box Rockstar runs. set12 is preflight-only
+  # and set13-15 are sealed; neither appears here.
+  boxes: [set0, set1, set2, set3, set4, set5, set6, set7,
+          set8, set9, set10, set11]
+  frozen_seeds: [0, 1, 2, 3]
+  alphas: [0.25, 0.5, 1.0]
+  # The core intervention edits displacement AND velocity together.
+  core_intervention_mode: both
+  # Predeclared diagnostic subset: the same alpha ladder in displacement-only
+  # and velocity-only form, on four boxes (two fit, two held out). This is the
+  # ONLY thing that can answer "does arm B see information arm A cannot" -- an
+  # arm-B win on candidates where velocity never moved independently would be
+  # unattributable.
+  diagnostic_boxes: [set0, set1, set8, set9]
+  diagnostic_modes: [disp, vel]
+  # Targets for the HR-directed masks, selected from the frozen SR2 vs HR
+  # catalogs. Same cuts as the Experiment-1 oracle so the interventions are the
+  # operation that study measured, not a lookalike.
+  intervention:
+    max_targets: 24
+    min_sub_particles: 50
+    min_separation_mpc_h: 6.0
+    host_bins: [2, 3]
+    dilate: 2
+    smooth: 1.5
+  # A four-candidate integrity smoke test runs first -- hr, two frozen seeds and
+  # one full-strength intervention, enumerated in submit_proxy_labels.sh, which
+  # is the thing that runs. Its labels are inspected for integrity ONLY: fitting
+  # even a preliminary MLP on them would make the smoke test part of the model
+  # selection.
+
 # --- The proxy --------------------------------------------------------------
 proxy:
   # 3-5 members. The actor maximises mean - beta*std across them, so a single
@@ -86,6 +136,43 @@ proxy:
   # Drop pairs whose true reward gap is below this: with a small edit most pairs
   # are ties and training on them is pure label noise.
   min_pair_margin: 0.0
+  # Row weighting. HR and frozen rows are 5 of the 8 candidates per box and are
+  # the easy ones; without balancing they set the loss and the intervention
+  # ladder -- the only rows that vary locally and monotonically -- is a rounding
+  # error in it. Weights are per SOURCE, normalised to mean 1, and multiplied by
+  # `changed_tile_weight` on tiles the intervention mask actually touched.
+  balance_sources: true
+  changed_tile_weight: 3.0
+  # A tile counts as "changed" when the candidate's own feature difference from
+  # frozen is above this in absolute value, in units of that feature's training
+  # standard deviation. Measured on the features, not on the mask, so it means
+  # the same thing for actor candidates that have no mask at all.
+  changed_tile_threshold: 0.5
+
+# --- Model selection (phase 5) ----------------------------------------------
+# Grouped by BOX, because two tiles of one box share its large-scale modes and
+# are not independent samples. Hyperparameters are chosen ONCE on the mean
+# across both arms and then used by both: an arm that got its own tuning budget
+# would win the comparison on the budget rather than on the features.
+proxy_cv:
+  enabled: true
+  n_folds: 4
+  # Deliberately small. The point is to check that (128, 128) is not obviously
+  # wrong for either arm, not to search.
+  grid:
+    - {hidden: [128, 128], lr: 1.0e-3, weight_decay: 1.0e-4}
+    - {hidden: [128, 128], lr: 3.0e-4, weight_decay: 1.0e-3}
+    - {hidden: [256, 256], lr: 1.0e-3, weight_decay: 1.0e-4}
+    - {hidden: [64, 64],   lr: 1.0e-3, weight_decay: 1.0e-4}
+  # Selection objective: within-(box, tile) Spearman on the held-out FOLD, never
+  # on set8-11.
+  objective: within_tile_spearman
+  epochs: 200
+  # Ensemble members are box-BOOTSTRAP samples, not just different seeds.
+  # Re-initialising the same data five times measures optimisation noise; the
+  # spread the actor's uncertainty penalty needs is the spread over which boxes
+  # were seen, which is the real sampling variability.
+  bootstrap_boxes: true
 
 # The proxy must clear ALL of these on the held-out boxes before the actor is
 # allowed to run. Failing them is NOT a reason to unfreeze more of SR2; it is a
@@ -101,11 +188,39 @@ proxy_gate:
   # Single-feature ablation: dropping any one feature must not leave the proxy
   # essentially as good, or the "proxy" is one number wearing a vector's name.
   max_single_feature_ablation_retention: 0.9
-  # Pooled occupation-curve prediction, per reliable host bin.
+  # Pooled occupation-curve prediction, in EVERY reliable host bin -- not on
+  # average. A mean hides a bin that is wrong by a factor of two behind four
+  # that are right, and the bins are not interchangeable: 2 and 3 are where the
+  # decision is.
   max_occupation_curve_log_error: 0.3
+  # Pooled full-box (N, H, S, O) must beat the frozen/zero-change, training-mean
+  # and linear-regression baselines. A proxy that cannot beat "predict no
+  # change" has learned nothing an actor can use.
+  must_beat_baselines: [zero_change, train_mean, linear]
+  # Ensemble spread must be informative: rows the ensemble disagrees about must
+  # be the rows it gets wrong, or `beta` in the actor's LCB is penalising noise.
+  min_uncertainty_error_spearman: 0.2
   # Real tile swaps through splice_tiles, verified with a fresh Rockstar run.
-  n_splice_verifications: 4
+  # 12 across at least three held-out boxes, mixing proxy-selected positives,
+  # high-uncertainty rows and random controls -- selected-only splices would
+  # measure the proxy where it is most confident and nowhere else.
+  n_splice_verifications: 12
+  min_splice_boxes: 3
   min_splice_sign_agreement: 0.75
+  splice_strata: [predicted_positive, high_uncertainty, random]
+  # Reported, never gated: the 1e14 host bin holds ~1 object per box, so a
+  # "failure" there is a Poisson draw.
+  report_only_host_bins: [4]
+
+# --- Predeclared reporting slices (phase 5) ---------------------------------
+# Fixed here so the slices cannot be chosen after the numbers are seen.
+proxy_report_slices:
+  all: {}
+  near_sr2: {sources: [frozen, frozen_seed], alphas: null}
+  interventions_both: {sources: [intervention], modes: [both]}
+  interventions_disp: {sources: [intervention], modes: [disp]}
+  interventions_vel: {sources: [intervention], modes: [vel]}
+  hr_anchor: {sources: [hr]}
 
 # --- The actor --------------------------------------------------------------
 actor:
