@@ -459,7 +459,14 @@ def stage_label(cfg, args) -> int:
     label_ok = bool(consistency["ok"] and identity_ok)
 
     if bool(rk.get("delete_particles", True)) and not args.keep_particles:
-        for p in tables:
+        # The ASCII member table AND the GADGET2 snapshot Rockstar was fed. Both
+        # are regenerable from field.npy in minutes and neither is evidence; at
+        # ~7 GB and ~3.5 GB per candidate they are 1.2 TB across the matrix if
+        # they are allowed to accumulate. The snapshot is easy to forget because
+        # it is written by run_rockstar_on_field rather than by this script --
+        # oracle_intervene.py and splice_verify.py each delete it separately.
+        doomed = list(tables) + sorted(Path(halo_dir).glob("*.gadget2"))
+        for p in doomed:
             size_gb = p.stat().st_size / 1e9
             p.unlink()
             print(f"  deleted {p.name} ({size_gb:.1f} GB) in the job that made it",
