@@ -297,6 +297,79 @@ class MemberWeights:
         )
 
 
+#: Fraction of rows a ``.particles`` table may lose to unparseable content
+#: before it is treated as a broken file rather than a slightly ragged one.
+#: Not zero, because a torn final line costs one row out of ~90 million and
+#: failing the whole candidate for it would be its own kind of wrong; small,
+#: because anything above a handful of rows means the table and the catalog no
+#: longer describe the same run and every tile statistic built from it is
+#: unattributable.
+MAX_UNPARSEABLE_ROW_FRACTION = 1e-6
+
+
+def _stream_particle_columns(path: Path, chunk_rows: int):
+    """Yield ``(particle_id, external_haloid)`` int64 blocks, skipping bad rows.
+
+    Reads the two columns as **float64** and converts, rather than asking the C
+    parser for int64 directly. Measured on this cluster: two of twenty-eight
+    otherwise-identical Rockstar runs wrote a ``.particles`` table that made
+    pandas raise ``cannot safely convert passed user dtype of int64 for float64
+    dtyped data in column 6`` part-way through a 10 GB file, killing the job.
+    A strict int64 request turns any single malformed row into a crash after
+    fifteen minutes of halo finding.
+
+    Rows whose ids are not integral, or outside the lattice, are dropped and
+    **counted**. The count is returned so the caller can refuse the candidate:
+    silently dropping member particles would shrink an object's weight without
+    shrinking its ``num_p``, which is precisely the corruption
+    :func:`check_member_consistency` exists to catch, and it should be caught
+    here with a readable number rather than there as a mystery.
+    """
+    import pandas as pd
+
+    reader = pd.read_csv(
+        path,
+        sep=r"\s+",
+        comment="#",
+        header=None,
+        usecols=[COL_PARTICLE_ID, COL_EXTERNAL],
+        names=["particle_id", "external_haloid"],
+        dtype=np.float64,
+        engine="c",
+        chunksize=int(chunk_rows),
+        on_bad_lines="skip",
+    )
+    n_total = n_bad = 0
+    examples: List[str] = []
+    for block in reader:
+        pid_f = block["particle_id"].to_numpy(dtype=np.float64, copy=False)
+        eid_f = block["external_haloid"].to_numpy(dtype=np.float64, copy=False)
+        n_total += pid_f.size
+        good = (np.isfinite(pid_f) & np.isfinite(eid_f)
+                & (pid_f == np.rint(pid_f)) & (eid_f == np.rint(eid_f)))
+        if not good.all():
+            bad = np.nonzero(~good)[0]
+            n_bad += bad.size
+            for i in bad[:3]:
+                if len(examples) < 5:
+                    examples.append(f"particle_id={pid_f[i]!r} "
+                                    f"external_haloid={eid_f[i]!r}")
+        yield (pid_f[good].astype(np.int64), eid_f[good].astype(np.int64))
+        del block, pid_f, eid_f
+
+    if n_bad:
+        frac = n_bad / max(n_total, 1)
+        msg = (f"{n_bad} of {n_total} rows ({frac:.2e}) in {path.name} could not "
+               f"be read as integers; examples: {examples}")
+        if frac > MAX_UNPARSEABLE_ROW_FRACTION:
+            raise ValueError(
+                msg + ". That is too many to be a torn line: the member table "
+                "and the catalog do not describe the same run, so no tile "
+                "decomposition built from it is trustworthy.")
+        print(f"    WARNING: {msg} (below the "
+              f"{MAX_UNPARSEABLE_ROW_FRACTION:.0e} tolerance; dropped)", flush=True)
+
+
 def stream_particle_tile_counts(
     particles_path: str | Path,
     grid: TileGrid,
@@ -316,8 +389,6 @@ def stream_particle_tile_counts(
     print (``_should_print``: below ``MIN_HALO_OUTPUT_SIZE``, or unbound), so
     they are not in the catalog either and are dropped here.
     """
-    import pandas as pd
-
     path = Path(particles_path)
     if not path.is_file():
         raise FileNotFoundError(f"no member-particle table at {path}")
@@ -325,29 +396,17 @@ def stream_particle_tile_counts(
     n_tiles = grid.n_tiles
     keys: List[np.ndarray] = []
     counts: List[np.ndarray] = []
-    reader = pd.read_csv(
-        path,
-        sep=r"\s+",
-        comment="#",
-        header=None,
-        usecols=[COL_PARTICLE_ID, COL_EXTERNAL],
-        names=["particle_id", "external_haloid"],
-        dtype=np.int64,
-        engine="c",
-        chunksize=int(chunk_rows),
-    )
-    for block in reader:
-        eid = block["external_haloid"].to_numpy(dtype=np.int64, copy=False)
-        keep = eid >= 0
+    for pid_all, eid_all in _stream_particle_columns(path, int(chunk_rows)):
+        keep = eid_all >= 0
         if not keep.any():
             continue
-        eid = eid[keep]
-        pid = block["particle_id"].to_numpy(dtype=np.int64, copy=False)[keep]
+        eid = eid_all[keep]
+        pid = pid_all[keep]
         tile = tile_of_particle_id(pid, grid)
         k, c = np.unique(eid * n_tiles + tile, return_counts=True)
         keys.append(k)
         counts.append(c)
-        del block, eid, pid, tile
+        del eid, pid, tile
 
     if not keys:
         z = np.zeros(0, dtype=np.int64)
@@ -380,27 +439,19 @@ def stream_member_ids(
     particles too -- which is correct, because the host's Lagrangian footprint
     is what the equal-count random control is drawn from.
     """
-    import pandas as pd
-
     wanted = np.asarray(sorted({int(h) for h in halo_ids}), dtype=np.int64)
     out: Dict[int, List[np.ndarray]] = {int(h): [] for h in wanted}
     if wanted.size == 0:
         return {}
-    reader = pd.read_csv(
-        Path(particles_path), sep=r"\s+", comment="#", header=None,
-        usecols=[COL_PARTICLE_ID, COL_EXTERNAL],
-        names=["particle_id", "external_haloid"], dtype=np.int64,
-        engine="c", chunksize=int(chunk_rows),
-    )
-    for block in reader:
-        eid = block["external_haloid"].to_numpy(dtype=np.int64, copy=False)
+    for pid_all, eid in _stream_particle_columns(Path(particles_path),
+                                                 int(chunk_rows)):
         sel = np.isin(eid, wanted)
         if not sel.any():
             continue
-        pid = block["particle_id"].to_numpy(dtype=np.int64, copy=False)[sel]
+        pid = pid_all[sel]
         for h in np.unique(eid[sel]):
             out[int(h)].append(pid[eid[sel] == h])
-        del block, eid, pid, sel
+        del pid, sel
     return {h: (np.concatenate(v) if v else np.zeros(0, dtype=np.int64))
             for h, v in out.items()}
 
@@ -440,6 +491,71 @@ def _normalize_counts(
         weight=count.astype(np.float64) / per_row_total,
         n_members={int(h): int(t) for h, t in zip(uniq, totals)},
         meta={"source": source, "n_objects": int(uniq.size)},
+    )
+
+
+def majority_weights(weights: MemberWeights) -> MemberWeights:
+    """Collapse fractional tile weights onto each object's single busiest tile.
+
+    Why this exists
+    ---------------
+    Fractional attribution is *exact* -- an object's weight sums to one over the
+    tiles its member particles came from, so the per-tile statistics sum to the
+    whole-box catalog to numerical precision. Exactness is not the same as
+    stability, and measured on set0 the two come apart badly: between two frozen
+    SR2 seeds of the same box, ``sum_t |dS_t|`` is 4033 while ``|sum_t dS_t|`` is
+    317. **92% of the per-tile label churn cancels on pooling.** The catalog is
+    stable; its decomposition is not.
+
+    The mechanism is that a cluster's bound particles originate in many
+    Lagrangian tiles, so its weight is spread thin, and any marginal change in
+    which particles Rockstar binds redistributes that weight. The halo has not
+    moved and its mass has barely changed -- only the split has.
+
+    Collapsing to the argmax tile keeps the property every downstream identity
+    needs (each object still carries total weight exactly one, so the tile sums
+    still reproduce :func:`direct_full_box_stats` exactly) while making the
+    label move only when an object's *majority* tile changes, which requires a
+    real change rather than a reshuffle.
+
+    What it costs: a large halo genuinely does span many tiles, and this assigns
+    all of it to one. The per-tile label becomes a coarser statement -- "which
+    tile is most responsible" rather than "how responsible is each tile". That
+    is a modelling choice, which is why both schemes are computed from the same
+    Rockstar run and compared rather than one being assumed.
+
+    Ties go to the lowest tile id, so the result is deterministic.
+    """
+    if weights.halo_id.size == 0:
+        return MemberWeights(
+            weights.halo_id.copy(), weights.tile_id.copy(), weights.weight.copy(),
+            dict(weights.n_members), {**weights.meta, "attribution": "majority"})
+
+    order = np.lexsort((weights.tile_id, weights.halo_id))
+    halo = weights.halo_id[order]
+    tile = weights.tile_id[order]
+    w = weights.weight[order]
+
+    uniq, start = np.unique(halo, return_index=True)
+    ends = np.append(start[1:], halo.size)
+    # argmax within each object's contiguous run. np.maximum.reduceat gives the
+    # max; the first index attaining it is the winner, which makes ties
+    # deterministic without a Python loop over 300k objects.
+    peak = np.maximum.reduceat(w, start)
+    is_peak = w >= np.repeat(peak, ends - start) - 1e-15
+    # First index attaining the group max: mask non-peaks to +inf and take the
+    # per-group minimum index. Vectorised because a Python loop over ~300k
+    # objects runs on every candidate of every box.
+    idx = np.where(is_peak, np.arange(halo.size), halo.size)
+    pick = np.minimum.reduceat(idx, start)
+
+    return MemberWeights(
+        halo_id=uniq.astype(np.int64),
+        tile_id=tile[pick].astype(np.int64),
+        weight=np.ones(uniq.size, dtype=np.float64),
+        n_members={int(h): int(weights.n_members.get(int(h), 0)) for h in uniq},
+        meta={**weights.meta, "attribution": "majority",
+              "mean_majority_share": float(np.mean(peak))},
     )
 
 

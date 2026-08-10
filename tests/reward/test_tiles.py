@@ -474,3 +474,67 @@ def test_loo_credit_is_order_independent(grid, tbins, particles_file):
     b = leave_one_out_credit(shuffled, rm.reward)
     for k in a:
         assert a[k] == pytest.approx(b[k], abs=1e-12)
+
+
+def test_majority_weights_preserve_the_additivity_identity():
+    """One-hot attribution is still exact: every object carries weight one.
+
+    That is the property the plan's ``sum_t N_t = N`` check rests on, and it is
+    the reason collapsing to the majority tile is a variance choice rather than
+    a correctness one.
+    """
+    from cosmo_sr.reward.tiles import MemberWeights, majority_weights
+
+    w = MemberWeights(
+        halo_id=np.array([1, 1, 1, 2, 2, 3], dtype=np.int64),
+        tile_id=np.array([5, 7, 9, 4, 2, 8], dtype=np.int64),
+        weight=np.array([0.2, 0.5, 0.3, 0.4, 0.6, 1.0]),
+        n_members={1: 100, 2: 50, 3: 10}, meta={"source": "member_particle_ids"})
+    m = majority_weights(w)
+
+    assert list(m.tile_id) == [7, 2, 8]
+    assert m.max_weight_error() == 0.0
+    assert set(m.n_members) == set(w.n_members)
+    assert m.meta["attribution"] == "majority"
+
+
+def test_majority_weights_break_ties_deterministically():
+    """Equal shares go to the lowest tile id, both times it is called."""
+    from cosmo_sr.reward.tiles import MemberWeights, majority_weights
+
+    w = MemberWeights(
+        halo_id=np.array([1, 1], dtype=np.int64),
+        tile_id=np.array([9, 3], dtype=np.int64),
+        weight=np.array([0.5, 0.5]), n_members={1: 8}, meta={})
+    assert list(majority_weights(w).tile_id) == [3]
+    assert list(majority_weights(w).tile_id) == [3]
+
+
+def test_majority_tile_summaries_still_sum_to_the_direct_whole_box(bins):
+    """The identity every label rests on holds under BOTH attribution schemes."""
+    from cosmo_sr.reward.tiles import (
+        TileGrid, direct_full_box_stats, majority_weights, tile_summaries,
+    )
+    from tests.reward.conftest import synthetic_catalog
+
+    grid = TileGrid(ng_hr=16, tile_hr=8, boxsize_mpc_h=100.0)
+    cat = synthetic_catalog([((10.0, 10.0, 10.0), 5e13), ((60.0, 60.0, 60.0), 2e13)],
+                            [2, 1], boxsize=100.0)
+    rng = np.random.default_rng(0)
+    halo, tile, weight = [], [], []
+    for h in cat.ids:
+        tiles = rng.choice(grid.n_tiles, size=3, replace=False)
+        w = rng.dirichlet(np.ones(3))
+        halo += [int(h)] * 3
+        tile += [int(t) for t in tiles]
+        weight += [float(x) for x in w]
+    mw = MemberWeights(np.asarray(halo, dtype=np.int64),
+                       np.asarray(tile, dtype=np.int64), np.asarray(weight),
+                       {int(h): 30 for h in cat.ids}, {"source": "test"})
+
+    direct = direct_full_box_stats(cat, bins)
+    for w in (mw, majority_weights(mw)):
+        s = tile_summaries(cat, w, bins, grid, box="set0", source="t")
+        for key in ("n_sub", "n_host", "occ_numerator"):
+            pooled = np.sum([getattr(s[t], key) for t in s], axis=0)
+            assert np.allclose(pooled, direct[key], atol=1e-9), key
