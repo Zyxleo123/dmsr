@@ -38,6 +38,10 @@ set -euo pipefail
 : "${ALPHA:=}"
 : "${MODE:=both}"
 : "${CHECKPOINT:=}"
+# OVERWRITE=1 redoes the halo finding even if output is already there.
+# Needed after a job died between Rockstar and the summaries: the
+# leftovers are debris, not a cache.
+: "${OVERWRITE:=0}"
 
 read -r -a _BOXES <<< "${BOXES//,/ }"
 BOX="${BOX:-${_BOXES[${SLURM_ARRAY_TASK_ID:-0}]}}"
@@ -49,5 +53,6 @@ ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME" --stage label
       --box "$BOX" --source "$SOURCE" --seed "$SEED" --mode "$MODE")
 [ -n "$ALPHA" ] && ARGS+=(--alpha "$ALPHA")
 [ -n "$CHECKPOINT" ] && ARGS+=(--checkpoint "$CHECKPOINT")
+[ "$OVERWRITE" = "1" ] && ARGS+=(--overwrite)
 
 python -u scripts/reward/collect_catalog_proxy_data.py "${ARGS[@]}"

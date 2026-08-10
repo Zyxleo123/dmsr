@@ -419,12 +419,24 @@ def stage_label(cfg, args) -> int:
 
     rk = dict(cfg.get("rockstar", {}))
     halo_dir = work / "rockstar"
+    # Reuse a previous Rockstar run ONLY if that run got as far as writing a
+    # label report. Halo-finder output left behind by a job that died between
+    # Rockstar and the summaries is not a cache -- measured here, a crashed
+    # attempt left an ascii catalog of 209,757 objects next to a .particles
+    # table missing 18,155 of them, and reusing the pair produced a tile
+    # decomposition of a catalog that never existed. A complete attempt always
+    # leaves label_report.json, so its absence is the exact signal that the
+    # leftovers are debris.
+    reuse_rockstar = bool(args.reuse) and report_path.is_file()
+    if args.reuse and not reuse_rockstar and Path(halo_dir).exists():
+        print(">>> discarding Rockstar output from an attempt that never "
+              ">>> finished labelling; re-running the halo finder.", flush=True)
     cat = run_rockstar_on_particles(
         particles, halo_dir, tag=tag,
         binary=PROJECT_ROOT / rk.get("binary", "external/rockstar/rockstar"),
         cfg=PROJECT_ROOT / rk.get("config",
                                   "configs/sr2_baseline/rockstar_particles.cfg"),
-        overwrite=not args.reuse)
+        overwrite=not reuse_rockstar)
     del particles
 
     tables = sorted(Path(halo_dir, f"{tag}_rockstar").glob("*.particles"))
@@ -437,6 +449,31 @@ def stage_label(cfg, args) -> int:
         tables[0], grid, chunk_rows=int(rk.get("chunk_rows", 8_000_000)))
     consistency = check_member_consistency(cat, weights)
     weights.to_npz(npz)
+
+    # tile_summaries RAISES on objects with no member rows, which is right --
+    # their weight is nowhere and the partition of unity is broken. But a raise
+    # here is a traceback where a verdict belongs: the candidate is invalid, the
+    # run should say so in the report the indexer reads, and the job should exit
+    # 0 so dependents report the same instead of stranding.
+    if not consistency["ok"]:
+        write_json_atomic(report_path, {
+            "box": box, "tag": tag, "source": source, "label_ok": False,
+            "member_consistency_ok": False, "member_consistency": consistency,
+            "field_sha": gen.get("field_sha", ""),
+            "reason": (
+                f"{consistency['n_missing']} of {consistency['n_catalog_objects']} "
+                "catalog objects have no member-particle rows"),
+            "seconds": round(time.time() - t0, 1),
+        })
+        print(f">>> INVALID CANDIDATE: {consistency['n_missing']} of "
+              f"{consistency['n_catalog_objects']} catalog objects have no "
+              ">>> member-particle rows, so their weight is nowhere and the tile")
+        print(">>> sums cannot reproduce the box. The .particles table and the")
+        print(">>> ascii catalog do not describe the same run.")
+        print(">>> Recorded as label_ok=false; the indexer will exclude it and")
+        print(">>> withhold labels_complete.json. Re-run this candidate with")
+        print(">>> OVERWRITE=1 to redo the halo finding from scratch.")
+        return 0
 
     members_path = (_extract_hr_members(cfg, box, tables[0], work)
                     if source == "hr" else None)
