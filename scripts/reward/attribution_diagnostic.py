@@ -103,20 +103,53 @@ def load_summaries(cfg, box: str, tag: str,
     return out
 
 
-def touched_mask(cfg, box: str, tag: str, threshold: float) -> np.ndarray:
-    """Tiles whose FIELD changed, from the generation-time feature difference.
+_TOUCHED_CACHE: Dict[str, np.ndarray] = {}
 
-    Read from features.npz rather than recomputed: it is the same quantity the
-    trainer would use to decide a row is worth a ranking pair, so the diagnostic
-    and the training filter cannot disagree.
+
+def touched_mask(cfg, box: str, tag: str, threshold: float) -> np.ndarray:
+    """Tiles the intervention actually edited, from the Lagrangian mask itself.
+
+    NOT from a feature difference, which was the first version of this and was
+    wrong in a way that silently deleted the experiment's most informative arm.
+    A velocity-only intervention moves no particle, so the density field is
+    bit-unchanged and arm A's feature difference is zero on every one of the 512
+    tiles (measured: max 1e-5, against 0.71 for the same alpha in displacement).
+    Defining "touched" by arm A's features therefore excluded every ``vel``
+    candidate from the analysis -- the exact rows that exist to make an arm-B
+    win attributable.
+
+    Defining it by arm B's features instead would fix that but introduce a worse
+    problem: the two arms would then be scored on different row sets, and the
+    plan requires them to differ in the feature vector and nothing else.
+
+    The mask is the ground truth. It is a property of the *edit*, identical for
+    both arms and for every alpha and channel mode of a box, so one computation
+    per box serves all of them.
     """
-    f = candidate_dir(box, tag) / "features.npz"
-    if not f.is_file():
-        return np.zeros(tile_grid_of(cfg).n_tiles, dtype=bool)
-    z = np.load(f)
-    a = z["features_a"]
-    diff = a[:, a.shape[1] // 2:]
-    return np.linalg.norm(diff, axis=1) > float(threshold)
+    grid = tile_grid_of(cfg)
+    if box in _TOUCHED_CACHE:
+        return _TOUCHED_CACHE[box]
+
+    npz = direct_root("intervention_masks") / f"{box}.npz"
+    if npz.is_file():
+        m = np.load(npz)["mask"]
+        cover = np.asarray([
+            float((m[grid.slices(t)] > 0.01).mean()) for t in range(grid.n_tiles)])
+        out = cover > 0.0
+        print(f"    {box}: {int(out.sum())} of {grid.n_tiles} tiles carry mask "
+              f"(max coverage {cover.max():.3f})", flush=True)
+    else:
+        # Fall back to arm B, the SUPERSET of what any arm can see, so the
+        # fallback still cannot favour one arm over the other.
+        f = candidate_dir(box, tag) / "features.npz"
+        if not f.is_file():
+            return np.zeros(grid.n_tiles, dtype=bool)
+        b = np.load(f)["features_b"]
+        out = np.linalg.norm(b[:, b.shape[1] // 2:], axis=1) > float(threshold)
+        print(f"    {box}: no mask on disk; falling back to arm-B features "
+              f"({int(out.sum())} tiles)", flush=True)
+    _TOUCHED_CACHE[box] = out
+    return out
 
 
 def _summary(counts: Dict[str, np.ndarray], idx: Optional[np.ndarray] = None,
