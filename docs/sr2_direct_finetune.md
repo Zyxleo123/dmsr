@@ -107,6 +107,42 @@ and `G_z2.pt` and nothing else, and no `D_*` checkpoint exists anywhere under
   20-channel contract (6 upsampled LR + 6 field + 8 inverse-pixel-shuffled fine
   CIC density), WGAN-GP with λ=10 and the penalty every 16 critic batches.
 
+## The per-tile target is not rankable — switch to pooled (2026-08-09)
+
+The proxy in step 1 predicts a *tile's* statistics, so the label has to be
+attributable to a tile. `reward/attribution_diagnostic.py` (run
+`sd_attrib`, code `1f8bf99`) reads the saved `tile_weights.npz` and catalogs
+and re-derives the per-tile reward change under two attribution schemes —
+**fractional** (mask-weighted) and **majority** (winner-take-all) — then asks
+whether the per-tile label is repeatable enough to rank on. It measures
+repeatability against the frozen-seed churn: how much a tile's label moves
+between four re-simulations of the *same* input, versus how much it moves under
+intervention.
+
+Verdict on the two completed boxes (`set0`, `set1`, 4608 rows each):
+
+| scheme | repeatability ceiling (touched tiles) | SNR (touched) | pooled-cancel | rankable |
+| --- | --- | --- | --- | --- |
+| fractional | 0.58 | 0.70 | 93% | **no** |
+| majority | 0.58 | 0.72 | 93% | **no** |
+
+Both schemes fall below the 0.5 gate on `set1` and only scrape it on `set0`,
+and ~93% of the per-tile signal cancels when pooled — a tile's label churns
+between frozen seeds nearly as much as it moves under intervention. This is an
+intrinsic per-tile noise floor: it is set by re-simulation variance of a single
+tile, not by sample count, so finishing the remaining boxes does **not** rescue
+it. `recommendation.action = switch_to_pooled_target`,
+`per_tile_ranking_viable = false`.
+
+The same diagnostic reports `whole_box_repeatability_ceiling = 1.0` for both
+schemes: the **pooled / whole-box** reward change is perfectly stable. So the
+fix is to change the target, not the features — predict pooled reward change,
+not per-tile `(N, H, S)`. The remaining 92/120 candidate labels need not be
+generated for the per-tile proxy; the `index` job (`sd_index`) correctly leaves
+no `labels_complete.json` and blocks the per-tile trainer.
+
+Report: `runs/direct_a/attribution_diagnostic.json`.
+
 ## Runbook
 
 ```bash
