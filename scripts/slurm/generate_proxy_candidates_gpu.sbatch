@@ -6,11 +6,17 @@
 # re-reading the array -- and so the two arms are derived from one pass over one
 # field and cannot disagree about which tile they describe.
 #
-# Node choice: `general,legacy`, gpu28 excluded. NOT general alone -- checked
-# with myfree while five of these sat PENDING, every general a6000 was either
-# full or backfill-reserved while six legacy nodes were IDLE. The GPU footprint
-# is one 14^3 -> 70^3 forward pass at a time, a few hundred MB, so a 2080 Ti
-# (11 GB) or a v100 serves as well as an a6000 and is far likelier to be free.
+# Node choice: `legacy` with its matching `--qos=qos_legacy`. It USED to be
+# `general,legacy` with no qos, but the cluster now enforces a per-partition QOS
+# (general->qos_general, legacy->qos_legacy, cpu->qos_cpu), and a job listing two
+# partitions whose default QOS differ is rejected at submit with "Invalid qos
+# specification" -- there is no single qos valid for both, so spanning them is no
+# longer possible. legacy is the right single choice for the same reason it was
+# half of the old pair: checked with myfree, every general a6000 is contended
+# while six legacy nodes are IDLE, and the GPU footprint is one 14^3 -> 70^3
+# forward pass at a time, a few hundred MB, so a 2080 Ti (11 GB) or a v100 serves
+# as well as an a6000. To run on general instead, set both lines together:
+# `--partition=general` and `--qos=qos_general` (never one without the other).
 #
 # --mem is 48G, not 128G. Peak host RAM is the intervention path: base field
 # 3.2 + HR 3.2 + mask 0.5 + the blended copy 3.2 + the frozen reference 3.2,
@@ -27,8 +33,8 @@
 #   sbatch scripts/slurm/generate_proxy_candidates_gpu.sbatch \
 #       RUN_NAME=direct_a BOX=set0 SOURCE=intervention ALPHA=0.5 MODE=vel
 #SBATCH --job-name=sd_gen
-#SBATCH --partition=general,legacy
-#SBATCH --exclude=gpu28
+#SBATCH --partition=legacy
+#SBATCH --qos=qos_legacy
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G

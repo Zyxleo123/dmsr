@@ -83,6 +83,10 @@ import torch
 import torch.nn.functional as F
 
 from ..eval.density import cic_deposit_valid_center
+# The arm list lives in the torch-free :mod:`cosmo_sr.reward.arms` (so the
+# submitter can read it on a login node) and is re-exported here because every
+# existing caller imports it from this module.
+from .arms import ARMS
 # `_smooth` is private to soft_structure but shared deliberately: the coherence
 # ladder here must smooth exactly the way the density peak ladder does, or the
 # two blocks would be describing different scales under the same names.
@@ -93,18 +97,21 @@ from .soft_structure import (
 
 __all__ = [
     "ARMS",
+    "FLAT_ARMS",
     "PhaseSpaceConfig",
     "arm_feature_names",
     "arm_features",
     "arm_paired_features",
+    "deposit_phase_space",
     "phase_space_feature_names",
     "phase_space_features",
     "validate_phase_space_features",
 ]
 
-#: The two proxy arms being compared. ``a`` is density-only (the incumbent),
-#: ``b`` is density plus phase space. Ordered, because reports iterate them.
-ARMS: Tuple[str, ...] = ("a", "b")
+#: The arms whose per-tile features are a FLAT vector this module can compute.
+#: Arm ``c`` is a token grid and lives in :mod:`cosmo_sr.reward.soft_rockstar`;
+#: asking this module for it must raise, not silently fall back to arm ``b``.
+FLAT_ARMS: Tuple[str, ...] = ("a", "b")
 
 #: Newton's constant in ``Mpc (km/s)^2 / Msun``. In ``h``-units the factors of
 #: ``h`` in ``M`` and ``R`` cancel, so the same number applies to ``Msun/h`` and
@@ -189,17 +196,19 @@ def _weighted_pearson(a: torch.Tensor, b: torch.Tensor,
     return cov / (va.clamp_min(1e-20) * vb.clamp_min(1e-20)).sqrt()
 
 
-def phase_space_features(
+def deposit_phase_space(
     disp: torch.Tensor,
     vel: torch.Tensor,
     cfg: Optional[SoftStructureConfig] = None,
     ps: Optional[PhaseSpaceConfig] = None,
-) -> torch.Tensor:
-    """``(B, 9)`` phase-space features of a crop.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(m, vbar, sigma2)`` from ONE CIC pass over the valid-centre region.
 
-    ``disp`` and ``vel`` are both ``(B, 3, N, N, N)`` in the stored normalised
-    units -- the first three and last three channels of a six-channel field.
-    Differentiable in both.
+    ``m`` is ``1 + delta`` (clamped non-negative), ``vbar`` the per-cell
+    mass-weighted mean velocity in km/s, ``sigma2`` the intra-cell velocity
+    dispersion in (km/s)^2. Shared by arm B's crop summaries and arm C's token
+    grid so the two arms cannot disagree about which particles landed in which
+    cell -- a second, independent deposit could.
     """
     cfg = cfg or SoftStructureConfig()
     ps = ps or PhaseSpaceConfig()
@@ -216,20 +225,38 @@ def phase_space_features(
 
     m = raw_mass * float(int(cfg.grid_mult) ** 3)      # 1 + delta, as in the
     m = m.clamp_min(0.0)                               # density-only branch
-    # Scalar fields are (B, 1, R, R, R) and reduce over `dims`; vector fields are
-    # (B, 3, R, R, R) and must keep their component axis, so they reduce over
-    # `sdims`. Using `dims` on a vector silently sums x, y and z together.
-    dims, sdims = (1, 2, 3, 4), (2, 3, 4)
     # Cells with a sliver of mass would make `momentum / mass` explode; the floor
     # is small against a mean of 1 and only ever binds where there is nothing to
-    # measure. Every feature below is mass-weighted, so those cells contribute
-    # ~nothing regardless of what their ratio evaluates to.
+    # measure. Every feature downstream is mass-weighted, so those cells
+    # contribute ~nothing regardless of what their ratio evaluates to.
     msafe = raw_mass.clamp_min(1e-6)
     vbar = acc[:, 0:3] / msafe                                       # (B,3,R,R,R)
     v2bar = acc[:, 3:4] / msafe                                      # (B,1,R,R,R)
     # Intra-cell dispersion: <|v|^2> - |<v>|^2 within the cell. Non-negative in
     # exact arithmetic; clamped because it is a difference of two large numbers.
     sigma2 = (v2bar - (vbar ** 2).sum(dim=1, keepdim=True)).clamp_min(0.0)
+    return m, vbar, sigma2
+
+
+def phase_space_features(
+    disp: torch.Tensor,
+    vel: torch.Tensor,
+    cfg: Optional[SoftStructureConfig] = None,
+    ps: Optional[PhaseSpaceConfig] = None,
+) -> torch.Tensor:
+    """``(B, 9)`` phase-space features of a crop.
+
+    ``disp`` and ``vel`` are both ``(B, 3, N, N, N)`` in the stored normalised
+    units -- the first three and last three channels of a six-channel field.
+    Differentiable in both.
+    """
+    cfg = cfg or SoftStructureConfig()
+    ps = ps or PhaseSpaceConfig()
+    m, vbar, sigma2 = deposit_phase_space(disp, vel, cfg, ps)
+    # Scalar fields are (B, 1, R, R, R) and reduce over `dims`; vector fields are
+    # (B, 3, R, R, R) and must keep their component axis, so they reduce over
+    # `sdims`. Using `dims` on a vector silently sums x, y and z together.
+    dims, sdims = (1, 2, 3, 4), (2, 3, 4)
 
     total = m.sum(dim=dims).clamp_min(1e-12)
     v0 = (m * vbar).sum(dim=sdims) / total.unsqueeze(1)              # (B,3)
@@ -314,8 +341,12 @@ def phase_space_features(
 # --------------------------------------------------------------------------- #
 def _check_arm(arm: str) -> str:
     a = str(arm).lower()
-    if a not in ARMS:
-        raise ValueError(f"arm must be one of {list(ARMS)}, got {arm!r}")
+    if a not in FLAT_ARMS:
+        raise ValueError(
+            f"this module computes flat feature vectors for arms "
+            f"{list(FLAT_ARMS)}, got {arm!r}"
+            + (" (arm 'c' is a token grid; use cosmo_sr.reward.soft_rockstar)"
+               if a == "c" else ""))
     return a
 
 

@@ -1,21 +1,25 @@
 #!/bin/bash
-# Phases 4-6: fit both arms, gate both arms, verify with real splices, decide.
+# Phases 4-6: fit the arms, gate them offline, verify the passing arms with the
+# ACTOR-LIKE Rockstar gate (probe fine-tune -> real splices), decide.
 # This submitter ONLY calls sbatch. It stops at proxy_benchmark.json and has no
-# path into SR2 fine-tuning: that decision is what the benchmark is for.
+# path into production SR2 fine-tuning: that decision is what the benchmark is
+# for. The probe runs it submits are capped, stamped probe_only, and refused as
+# a resume point by the production trainer.
 #
 #   DRY=1 bash scripts/slurm/submit_proxy_benchmark.sh all
-#   bash scripts/slurm/submit_proxy_benchmark.sh fit       # train + gate both arms
-#   bash scripts/slurm/submit_proxy_benchmark.sh splice    # select + 12 runs per arm
-#   bash scripts/slurm/submit_proxy_benchmark.sh decide    # re-gate + benchmark
-#   bash scripts/slurm/submit_proxy_benchmark.sh all ARMS="a"
+#   bash scripts/slurm/submit_proxy_benchmark.sh fit     # train + gate all arms
+#   bash scripts/slurm/submit_proxy_benchmark.sh probe   # probe + 12 checks/arm
+#   bash scripts/slurm/submit_proxy_benchmark.sh decide  # re-gate + benchmark
+#   bash scripts/slurm/submit_proxy_benchmark.sh probe ARMS="b"
 #
 # WHY IT IS THREE STAGES AND NOT ONE CHAIN
 # ----------------------------------------
-# `all` does chain them, because the ordering is mechanical. But `splice` is
-# separable on purpose: its plan is twelve full-box Rockstar runs per arm chosen
-# by the proxy, and it is worth reading splice_plan_<arm>.json before spending
-# them. Nothing is lost by looking -- the plan is written by a job that takes
-# seconds.
+# `all` does chain them, because the ordering is mechanical. But `probe` is
+# separable on purpose, twice over: it should be pointed at the arms whose
+# OFFLINE gate passed (read proxy_gate_<arm>.json after `fit`, then run `probe`
+# with ARMS set to the survivors), and its plan is twelve full-box Rockstar
+# runs per arm chosen by the proxy, worth reading (actor_plan_<arm>.json)
+# before spending them. Nothing is lost by looking -- the plan job is minutes.
 #
 # Configuration goes into ONE timestamped env file passed as a POSITIONAL
 # argument. Never `sbatch --export`: on this cluster any explicit export list
@@ -34,8 +38,11 @@ DRY="${DRY:-0}"
 
 RUN_NAME="${RUN_NAME:-direct_a}"
 DIRECT_CFG="${DIRECT_CFG:-configs/reward/sr2_direct_finetune.yaml}"
-ARMS="${ARMS:-a b}"
-N_SPLICES="${N_SPLICES:-12}"
+ARMS="${ARMS:-a b c}"
+N_CHECKS="${N_CHECKS:-12}"
+# Field metrics for the probe gate are measured where the splices happen: the
+# held-out verify boxes (actor_gate.verify_boxes in the config).
+VERIFY_BOXES="${VERIFY_BOXES:-set8,set9,set10}"
 AFTER="${AFTER:-}"
 
 for kv in "$@"; do
@@ -106,53 +113,81 @@ die_if_aborted() {
 
 dep_of() { [ -n "$1" ] && echo "--dependency=afterok:$1" || echo ""; }
 
-# --- fit: both arms and both gates, in one job -----------------------------
+# --- fit: all arms and their offline gates, in one job ---------------------
 JID_FIT=""
 if [ "$STAGE" = "all" ] || [ "$STAGE" = "fit" ]; then
-    echo "=== fit + gate both arms ($RUN_NAME)"
+    echo "=== fit + offline-gate arms: $ARMS ($RUN_NAME)"
     SUB_OVERRIDES=("ARMS=${ARMS// /,}")
-    JID_FIT=$(sub "proxy: CV, both arms, both gates (GPU)" $(dep_of "$AFTER") \
+    JID_FIT=$(sub "proxy: fit + offline gate, all arms (GPU)" $(dep_of "$AFTER") \
         scripts/slurm/train_catalog_proxy_gpu.sbatch); die_if_aborted
     SUB_OVERRIDES=()
     echo "  ensembles -> $ROOT/runs/$RUN_NAME/proxy_<arm>/"
     echo "  verdicts  -> $ROOT/runs/$RUN_NAME/proxy_gate_<arm>.json"
-    echo "  !! the splice criterion is EXPECTED to be unmet at this point."
+    echo "  !! the actor criterion is EXPECTED to be unmet at this point;"
+    echo "  !! read offline_passed, then run the probe stage on the survivors."
 fi
 
-# --- splice: select, then one array task per splice, per arm ---------------
-SPLICE_JIDS=()
-if [ "$STAGE" = "all" ] || [ "$STAGE" = "splice" ]; then
-    echo "=== real splice verification ($N_SPLICES per arm)"
+# --- probe: probe fine-tune, field gates, select, then the Rockstar array ---
+# Per arm: train a capped probe_only checkpoint on the FIT boxes, measure its
+# fields on the verify boxes against the frozen baseline, gate them, generate
+# the verify boxes and pick the stratified plan, then one Rockstar run per
+# check. The probe trainer itself refuses arms whose offline gate failed, so
+# pointing this at every arm wastes at most a queued job, never a Rockstar run.
+ACTOR_JIDS=()
+if [ "$STAGE" = "all" ] || [ "$STAGE" = "probe" ]; then
+    echo "=== actor-like Rockstar gate ($N_CHECKS checks per arm)"
+    # The frozen baseline rows are shared by every arm's field gate; the eval
+    # job skips (box, seed) pairs already measured.
+    SUB_OVERRIDES=("BOXES=$VERIFY_BOXES")
+    JEF=$(sub "eval frozen fields on verify boxes (GPU)" \
+        $(dep_of "$AFTER") \
+        scripts/slurm/evaluate_sr2_direct_gpu.sbatch); die_if_aborted
+    SUB_OVERRIDES=()
     for ARM in "${_ARMS[@]}"; do
-        SUB_OVERRIDES=("ARM=$ARM")
-        JS=$(sub "splice $ARM: choose the plan (CPU)" \
+        SUB_OVERRIDES=("ARM=$ARM" "PROBE=1")
+        JP=$(sub "probe $ARM: capped probe_only fine-tune (GPU)" \
             $(dep_of "${JID_FIT:-$AFTER}") \
-            scripts/slurm/splice_select_cpu.sbatch); die_if_aborted
+            scripts/slurm/train_sr2_direct_gpu.sbatch); die_if_aborted
+        SUB_OVERRIDES=("CHECKPOINT=$ROOT/runs/$RUN_NAME/probe_$ARM/ema_generator.pt"
+                       "TAG=probe_$ARM" "BOXES=$VERIFY_BOXES")
+        JEP=$(sub "probe $ARM: field metrics on verify boxes (GPU)" \
+            --dependency=afterok:"$JP":"$JEF" \
+            scripts/slurm/evaluate_sr2_direct_gpu.sbatch); die_if_aborted
+        SUB_OVERRIDES=("STAGE=gate" "TAG=probe_$ARM")
+        JG=$(sub "probe $ARM: field gates (CPU)" \
+            --dependency=afterok:"$JEP" \
+            scripts/slurm/score_sr2_direct_cpu.sbatch); die_if_aborted
+        SUB_OVERRIDES=("ARM=$ARM")
+        JS=$(sub "actor $ARM: generate verify boxes, choose the plan (GPU)" \
+            --dependency=afterok:"$JG" \
+            scripts/slurm/actor_select_gpu.sbatch); die_if_aborted
         # One array, not N jobs: the array index IS the plan index, and a task
         # beyond the plan prints so and exits 0 rather than failing.
-        SPLICE_JIDS+=("$(sub "splice $ARM: $N_SPLICES real Rockstar runs (CPU array)" \
-            --array=0-$((N_SPLICES - 1)) --dependency=afterok:"$JS" \
-            scripts/slurm/splice_verify_cpu.sbatch)"); die_if_aborted
+        ACTOR_JIDS+=("$(sub "actor $ARM: $N_CHECKS real Rockstar runs (CPU array)" \
+            --array=0-$((N_CHECKS - 1)) --dependency=afterok:"$JS" \
+            scripts/slurm/actor_verify_cpu.sbatch)"); die_if_aborted
         SUB_OVERRIDES=()
     done
-    echo "  plan    -> $ROOT/runs/$RUN_NAME/splice_plan_<arm>.json"
-    echo "  results -> $ROOT/runs/$RUN_NAME/splice_verification_<arm>.jsonl"
+    echo "  probe   -> $ROOT/runs/$RUN_NAME/probe_<arm>/ema_generator.pt"
+    echo "  gates   -> $ROOT/runs/$RUN_NAME/gate_probe_<arm>.json"
+    echo "  plan    -> $ROOT/runs/$RUN_NAME/actor_plan_<arm>.json"
+    echo "  results -> $ROOT/runs/$RUN_NAME/actor_verification_<arm>.jsonl"
 fi
 
-# --- decide: re-gate with the splices in place, write the benchmark --------
+# --- decide: re-gate with the actor checks in place, write the benchmark ---
 if [ "$STAGE" = "all" ] || [ "$STAGE" = "decide" ]; then
     DEP=""
-    if [ "${#SPLICE_JIDS[@]}" -gt 0 ]; then
-        # afterany: a splice that failed is missing evidence, and the gate
+    if [ "${#ACTOR_JIDS[@]}" -gt 0 ]; then
+        # afterany: a check that failed is missing evidence, and the gate
         # reports missing evidence as an unmet criterion. afterok would strand
         # the benchmark instead and say nothing.
-        DEP="--dependency=afterany:$(IFS=:; echo "${SPLICE_JIDS[*]}")"
+        DEP="--dependency=afterany:$(IFS=:; echo "${ACTOR_JIDS[*]}")"
     elif [ -n "${JID_FIT:-$AFTER}" ]; then
         DEP="--dependency=afterany:${JID_FIT:-$AFTER}"
     fi
     echo "=== decision"
     SUB_OVERRIDES=("ARMS=${ARMS// /,}")
-    sub "benchmark: re-gate both arms, write proxy_benchmark.json (CPU)" \
+    sub "benchmark: re-gate all arms, write proxy_benchmark.json (CPU)" \
         $DEP scripts/slurm/proxy_benchmark_cpu.sbatch >/dev/null; die_if_aborted
     SUB_OVERRIDES=()
     echo "  record -> $ROOT/runs/$RUN_NAME/proxy_benchmark.json"

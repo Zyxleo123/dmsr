@@ -67,7 +67,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..reward.arms import check_arm
 from ..reward.catalog_proxy import ProxyEnsemble
+from ..reward.phase_space import PhaseSpaceConfig, arm_paired_features
+from ..reward.soft_rockstar import SoftRockstarConfig, soft_rockstar_paired_tokens
 from ..reward.soft_structure import (
     SoftStructureConfig, density_from_disp, paired_features, structural_diversity,
 )
@@ -245,10 +248,20 @@ class DirectFinetuneTrainer:
         actor: Optional[ControlledG] = None,
         frozen: Optional[ControlledG] = None,
         chan_kwargs: Optional[Mapping] = None,
+        arm: str = "a",
+        phase_cfg: Optional[PhaseSpaceConfig] = None,
+        rockstar_cfg: Optional[SoftRockstarConfig] = None,
     ):
         self.cfg = cfg or DirectFinetuneConfig()
         self.geom = geom or SR2TileGeometry()
         self.soft_cfg = soft_cfg or SoftStructureConfig()
+        # Which arm's differentiable extractor feeds the frozen proxy. The
+        # extractors are the SAME functions the labelled features came from
+        # (phase_space / soft_rockstar), so the proxy sees at fine-tuning time
+        # exactly what it saw at training time.
+        self.arm = check_arm(arm)
+        self.phase_cfg = phase_cfg or PhaseSpaceConfig()
+        self.rockstar_cfg = rockstar_cfg or SoftRockstarConfig()
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(int(self.cfg.seed))
@@ -356,6 +369,23 @@ class DirectFinetuneTrainer:
         """The gate-comparable RMS ratio from the squared loss term."""
         return float(max(float(loss_value), 0.0) ** 0.5)
 
+    def _extract(self, cand: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+        """The trainable candidate's proxy features, arm-appropriately.
+
+        Arm A is :func:`paired_features` (density only), arm B adds the
+        phase-space block, arm C is the soft-Rockstar token grid. Each is the
+        exact function the labelled training features came from, which is the
+        whole contract: a proxy fine-tuned against features it was not trained
+        on is answering a different question than the one it was gated on.
+        """
+        if self.arm == "a":
+            return paired_features(cand, base, self.soft_cfg)
+        if self.arm == "b":
+            return arm_paired_features(cand, base, "b", self.soft_cfg,
+                                       self.phase_cfg)
+        return soft_rockstar_paired_tokens(cand, base, self.soft_cfg,
+                                           self.phase_cfg, self.rockstar_cfg)
+
     # -- the step ---------------------------------------------------------- #
     def loss_terms(self, batch: Mapping) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
         """Every loss term, unweighted, plus diagnostics.
@@ -363,6 +393,15 @@ class DirectFinetuneTrainer:
         Returned separately from the weighted sum so the per-term gradient norms
         can be taken without recomputing the forward pass, and so a log row shows
         what each guard actually measured rather than its contribution to a total.
+
+        Draw 0 versus the other draws: the proxy reward and its catalog-context
+        swap use **draw 0 only**. Draw 0 is the base seed, whose frozen catalog
+        context is the one the labels were measured against; scoring the other
+        draws against that context would ask the proxy about (seed, context)
+        pairs it never saw. The second draw exists for the diversity term, and
+        the exact field guards (density power, low-k) run on every draw --
+        they are guards, they are cheap, and a draw that broke the field would
+        otherwise be invisible.
         """
         lr, noise, b, d = fold_draws(
             {"lr": batch["lr"].to(self.device),
@@ -374,9 +413,11 @@ class DirectFinetuneTrainer:
         # HR is per (box, tile); the draws share it.
         hr_rep = hr.unsqueeze(1).expand(b, d, *hr.shape[1:]).reshape(b * d, *hr.shape[1:])
 
-        feats = paired_features(cand, base, self.soft_cfg)
-        box = self._box_summary(batch, b, d)
-        frozen_tile = self._frozen_tile_summary(batch, b, d)
+        # fold_draws lays the batch out as (example, draw) -> example * d + draw,
+        # so draw 0 is every d-th row.
+        feats = self._extract(cand[::d], base[::d])
+        box = batch["box_summary"].to(self.device)
+        frozen_tile = batch["frozen_tile_summary"].to(self.device)
         all_dr = self.proxies.delta_rewards_all(
             self.reward, feats.to(torch.float64), box, frozen_tile,
             w_joint=float(self.cfg.w_joint_reward),
@@ -397,6 +438,7 @@ class DirectFinetuneTrainer:
             "q_std": float(q["std"].detach().mean()),
             "q_safe": float(q["q_safe"].detach().mean()),
             "n_draws": float(d),
+            "n_reward_rows": float(b),
         }
         # All three rewards, always: the joint score can fall because abundance
         # improved while occupation stayed flat, and occupation is the target.
@@ -417,24 +459,6 @@ class DirectFinetuneTrainer:
             diag["div_d_struct"] = float("nan")
             diag["diversity_inactive"] = 1.0
         return terms, diag
-
-    def _box_summary(self, batch: Mapping, b: int, d: int) -> TorchSummary:
-        s = batch["box_summary"]
-        return self._repeat_summary(s, d)
-
-    def _frozen_tile_summary(self, batch: Mapping, b: int, d: int) -> TorchSummary:
-        return self._repeat_summary(batch["frozen_tile_summary"], d)
-
-    def _repeat_summary(self, s: TorchSummary, d: int) -> TorchSummary:
-        s = s.to(self.device)
-        if d == 1:
-            return s
-        return TorchSummary(
-            n_sub=s.n_sub.repeat_interleave(d, dim=0),
-            n_host=s.n_host.repeat_interleave(d, dim=0),
-            occ_numerator=s.occ_numerator.repeat_interleave(d, dim=0),
-            volume_mpc3=s.volume_mpc3.repeat_interleave(d, dim=0),
-        )
 
     def weighted_sum(self, terms: Mapping[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         w = {

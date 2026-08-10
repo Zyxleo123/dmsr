@@ -57,16 +57,33 @@ import torch.nn.functional as F
 from .torch_reward import TorchRewardModel, TorchSummary
 
 __all__ = [
+    "PROXY_CLASSES",
     "CatalogProxy",
+    "ProxyBase",
     "ProxyConfig",
     "ProxyEnsemble",
     "bin_weights_from_counts",
     "count_loss",
+    "load_proxy",
     "make_within_tile_pairs",
     "pairwise_ranking_loss",
+    "register_proxy",
     "spearman",
     "split_indices_by_box",
+    "tie_aware_agreement",
 ]
+
+
+#: Model classes a saved proxy blob may name. Populated by
+#: :func:`register_proxy` at import time; :func:`load_proxy` dispatches on it so
+#: an ensemble directory can hold any registered class without every caller
+#: knowing which one it is.
+PROXY_CLASSES: Dict[str, type] = {}
+
+
+def register_proxy(cls: type) -> type:
+    PROXY_CLASSES[cls.__name__] = cls
+    return cls
 
 
 @dataclass
@@ -105,14 +122,102 @@ class ProxyConfig:
         return int(self.n_sub_bins) + 2 * int(self.n_host_bins)
 
 
-class CatalogProxy(nn.Module):
-    """Features -> ``(N, H, S)``, nonnegative by construction.
+class ProxyBase(nn.Module):
+    """What every proxy model class shares: the head, the units, persistence.
 
-    Nonnegativity through ``softplus`` rather than a clamp: a clamp has zero
-    gradient on the wrong side, so a member that starts with a bin pushed
-    negative can never recover it, and the ensemble spread then reports
-    confidence about a bin one member has silently stopped modelling.
+    The arms differ in exactly one thing -- how a tile's field is turned into
+    something a network can read. Arms A and B hand over a flat feature vector;
+    arm C hands over a token grid and learns its own pooling. Everything
+    *downstream* of that must be identical or the comparison stops being about
+    features: the same three output blocks, the same ``softplus * scale``
+    parameterisation, the same ``TorchSummary`` contract, the same checkpoint
+    layout. Putting them here makes that a fact about the code rather than a
+    convention two classes are trusted to follow.
+
+    Subclasses provide ``self.cfg`` (with ``n_sub_bins``, ``n_host_bins``,
+    ``n_outputs`` and a ``to_dict``/``from_dict`` pair), ``self.seed``, an
+    ``output_scale`` buffer of length ``n_outputs``, and a ``forward``.
     """
+
+    def _counts_from_raw(self, raw: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Split raw head outputs into the three count blocks, nonnegative.
+
+        Nonnegativity through ``softplus`` rather than a clamp: a clamp has zero
+        gradient on the wrong side, so a member that starts with a bin pushed
+        negative can never recover it, and the ensemble spread then reports
+        confidence about a bin one member has silently stopped modelling.
+        """
+        counts = F.softplus(raw.to(torch.float64)) * self.output_scale
+        j, i = int(self.cfg.n_sub_bins), int(self.cfg.n_host_bins)
+        return {
+            "n_sub": counts[:, :j],
+            "n_host": counts[:, j:j + i],
+            "occ_numerator": counts[:, j + i:j + 2 * i],
+        }
+
+    def summary(self, features: torch.Tensor, volume_mpc3: torch.Tensor) -> TorchSummary:
+        out = self.forward(features)
+        return TorchSummary(
+            n_sub=out["n_sub"], n_host=out["n_host"],
+            occ_numerator=out["occ_numerator"],
+            volume_mpc3=volume_mpc3.to(torch.float64),
+        )
+
+    def save(self, path: str | Path) -> Path:
+        """Write the blob, **naming the class**.
+
+        The class name is what lets :func:`load_proxy` rebuild an arm-C member
+        from a directory that looks exactly like an arm-A one. Without it the
+        loader would have to guess from the state-dict keys, which is the kind
+        of inference that works until someone renames a layer.
+        """
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"class": type(self).__name__, "config": self.cfg.to_dict(),
+                    "seed": self.seed, "state_dict": self.state_dict()}, p)
+        return p
+
+
+def load_proxy(path: str | Path, map_location="cpu") -> ProxyBase:
+    """Rebuild any registered proxy class from its checkpoint.
+
+    A blob with no ``class`` key is from before the arm-C refactor, when
+    :class:`CatalogProxy` was the only model class; defaulting to it keeps every
+    ensemble trained under the old code loadable.
+    """
+    blob = torch.load(str(path), map_location=map_location, weights_only=False)
+    name = str(blob.get("class", "CatalogProxy"))
+    if name not in PROXY_CLASSES:
+        # Registration happens on import, and arm C lives in a module nothing
+        # here imports (it would be a cycle: it imports this one). Import it on
+        # demand rather than making every caller remember to.
+        try:
+            from . import soft_rockstar  # noqa: F401
+        except Exception as exc:                     # pragma: no cover - defensive
+            raise KeyError(
+                f"checkpoint {path} names proxy class {name!r}, which is not "
+                f"registered and could not be imported: {exc}") from exc
+    if name not in PROXY_CLASSES:
+        raise KeyError(
+            f"checkpoint {path} names proxy class {name!r}; registered classes "
+            f"are {sorted(PROXY_CLASSES)}")
+    cls = PROXY_CLASSES[name]
+    m = cls(cls.CONFIG.from_dict(blob["config"]), seed=blob.get("seed"))
+    m.load_state_dict(blob["state_dict"])
+    return m
+
+
+@register_proxy
+class CatalogProxy(ProxyBase):
+    """Flat features -> ``(N, H, S)``. Arms A and B.
+
+    A two-layer MLP on a 26- or 44-dimensional vector. Small on purpose: see the
+    module docstring for why the surrogate is a short named feature vector
+    rather than a 3-D critic.
+    """
+
+    #: The config class :func:`load_proxy` should rebuild from a blob.
+    CONFIG = ProxyConfig
 
     def __init__(self, cfg: Optional[ProxyConfig] = None, *, seed: Optional[int] = None):
         super().__init__()
@@ -167,42 +272,25 @@ class CatalogProxy(nn.Module):
         """``{'n_sub': (B,J), 'n_host': (B,I), 'occ_numerator': (B,I)}``."""
         x = self._standardize(features.to(self.feat_mean.dtype))
         raw = self.net(x.to(next(self.net.parameters()).dtype))
-        counts = F.softplus(raw.to(torch.float64)) * self.output_scale
-        j, i = int(self.cfg.n_sub_bins), int(self.cfg.n_host_bins)
-        return {
-            "n_sub": counts[:, :j],
-            "n_host": counts[:, j:j + i],
-            "occ_numerator": counts[:, j + i:j + 2 * i],
-        }
-
-    def summary(self, features: torch.Tensor, volume_mpc3: torch.Tensor) -> TorchSummary:
-        out = self.forward(features)
-        return TorchSummary(
-            n_sub=out["n_sub"], n_host=out["n_host"],
-            occ_numerator=out["occ_numerator"],
-            volume_mpc3=volume_mpc3.to(torch.float64),
-        )
+        return self._counts_from_raw(raw)
 
     # -- persistence ------------------------------------------------------- #
-    def save(self, path: str | Path) -> Path:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"config": self.cfg.to_dict(), "seed": self.seed,
-                    "state_dict": self.state_dict()}, p)
-        return p
-
     @staticmethod
-    def load(path: str | Path, map_location="cpu") -> "CatalogProxy":
-        blob = torch.load(str(path), map_location=map_location, weights_only=False)
-        m = CatalogProxy(ProxyConfig.from_dict(blob["config"]), seed=blob.get("seed"))
-        m.load_state_dict(blob["state_dict"])
-        return m
+    def load(path: str | Path, map_location="cpu") -> ProxyBase:
+        """Kept as a thin alias for :func:`load_proxy`.
+
+        Every existing call site says ``CatalogProxy.load``. Rather than change
+        them all to a free function, this dispatches like the free function
+        does -- so a directory of arm-C members loads correctly even through the
+        old name, instead of silently mis-rebuilding as an MLP.
+        """
+        return load_proxy(path, map_location)
 
 
 class ProxyEnsemble(nn.Module):
     """``M`` proxies, and the lower-confidence reward the actor maximises."""
 
-    def __init__(self, members: Sequence[CatalogProxy]):
+    def __init__(self, members: Sequence[ProxyBase]):
         super().__init__()
         if not members:
             raise ValueError("an ensemble needs at least one member")
@@ -305,7 +393,17 @@ class ProxyEnsemble(nn.Module):
         files = sorted(d.glob("member_*.pt"))
         if not files:
             raise FileNotFoundError(f"no proxy members under {d}")
-        return ProxyEnsemble([CatalogProxy.load(f, map_location) for f in files])
+        members = [load_proxy(f, map_location) for f in files]
+        kinds = sorted({type(m).__name__ for m in members})
+        if len(kinds) > 1:
+            # Members of one ensemble differ only by which boxes the bootstrap
+            # drew. A directory holding two model classes is a directory two
+            # different fits wrote into, and averaging them would report a
+            # spread that is mostly "these are different models".
+            raise ValueError(
+                f"{d} holds mixed proxy classes {kinds}; an ensemble's members "
+                "must all be the same model class")
+        return ProxyEnsemble(members)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,11 +502,20 @@ def make_within_tile_pairs(
 ) -> np.ndarray:
     """``(P, 2)`` index pairs, ``pair[:, 0]`` the **better** (higher-reward) row.
 
-    Grouping is by ``(box, tile_id)`` and nothing else. Pairing across tiles
-    would let the proxy score well by learning which tiles are host-rich -- true,
-    useless, and not something the actor can act on. Pairs whose true reward gap
-    is below ``min_margin`` are dropped as ties: with a small edit most pairs
-    carry no signal and training on them is pure label noise.
+    Grouping is by ``(box, unit)`` and nothing else, where ``tile_id`` carries
+    the **supervision unit** -- a tile id at ``region_width = 1`` (the deployed
+    configuration, where ``region_id == tile_id`` exactly) and a region id at any
+    coarser width. The argument keeps its historical name because every existing
+    caller passes tile ids and the width-1 case is the identity; what matters is
+    that the *same* array is used to group the training pairs and to group the
+    evaluation metrics, which is why both come from one helper
+    (``_proxy_data.unit_ids_of``) rather than being derived twice.
+
+    Pairing across units would let the proxy score well by learning which tiles
+    are host-rich -- true, useless, and not something the actor can act on. Pairs
+    whose true reward gap is below ``min_margin`` are dropped as ties: with a
+    small edit most pairs carry no signal and training on them is pure label
+    noise.
     """
     rng = rng or np.random.default_rng(0)
     t = np.asarray(target, dtype=np.float64)
@@ -427,7 +534,14 @@ def make_within_tile_pairs(
         for a, b in cand:
             if not (np.isfinite(t[a]) and np.isfinite(t[b])):
                 continue
-            if abs(t[a] - t[b]) < float(min_margin):
+            gap = abs(t[a] - t[b])
+            # An equal-target pair carries no ranking signal and its RankNet
+            # target is undefined (which of two equal rewards is "better"?), so
+            # it is dropped *unconditionally* -- including at ``min_margin == 0``,
+            # where ``gap < 0`` is never true and an exact tie would otherwise
+            # slip through and train the proxy to prefer one of two identical
+            # rewards at random.
+            if gap == 0.0 or gap < float(min_margin):
                 continue
             pairs.append((int(a), int(b)) if t[a] > t[b] else (int(b), int(a)))
             kept += 1
@@ -493,15 +607,85 @@ def pairwise_ranking_loss(better: torch.Tensor, worse: torch.Tensor,
     return (per_pair * w).sum() / w.sum().clamp_min(1e-12)
 
 
+def _average_ranks(x: np.ndarray) -> np.ndarray:
+    """Fractional ranks with **ties averaged**, e.g. ``[3, 1, 3] -> [1.5, 0, 1.5]``.
+
+    The double ``argsort`` this replaces assigns ``0..n-1`` to *any* input,
+    including a constant one, so it silently invents an ordering out of noise and
+    reports a finite correlation for two arrays that carry none. Averaging tied
+    ranks is the definition of Spearman's rho on tied data and, as a side effect,
+    makes a constant array's ranks constant -- which is what lets
+    :func:`spearman` detect it and return NaN.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    order = np.argsort(x, kind="mergesort")
+    sx = x[order]
+    new_group = np.ones(n, dtype=bool)
+    new_group[1:] = sx[1:] != sx[:-1]
+    grp = np.cumsum(new_group) - 1
+    pos = np.arange(n, dtype=np.float64)
+    ng = int(grp[-1]) + 1
+    sums = np.zeros(ng, dtype=np.float64)
+    counts = np.zeros(ng, dtype=np.float64)
+    np.add.at(sums, grp, pos)
+    np.add.at(counts, grp, 1.0)
+    avg = sums / counts
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = avg[grp]
+    return ranks
+
+
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman's rho with tie-aware ranks; ``NaN`` when either input is constant.
+
+    A constant input has no ranking, so a correlation with it is undefined rather
+    than zero: reporting 0 would let a proxy that predicts the same number for
+    every candidate count as "no worse than chance" when it is in fact
+    unrankable, and averaging that 0 into a group mean drags the mean toward a
+    passing value.
+    """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     ok = np.isfinite(a) & np.isfinite(b)
     if ok.sum() < 2:
         return float("nan")
-    ra = np.argsort(np.argsort(a[ok])).astype(np.float64)
-    rb = np.argsort(np.argsort(b[ok])).astype(np.float64)
-    ra -= ra.mean()
-    rb -= rb.mean()
+    ra = _average_ranks(a[ok])
+    rb = _average_ranks(b[ok])
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
     den = np.sqrt((ra ** 2).sum() * (rb ** 2).sum())
     return float((ra * rb).sum() / den) if den > 0 else float("nan")
+
+
+def tie_aware_agreement(pred: np.ndarray, true: np.ndarray) -> Tuple[float, int]:
+    """Mean pairwise ordering agreement, tie-aware, and the pair count.
+
+    Over pairs with **distinct true values** only: a correctly ordered
+    prediction scores 1, a wrongly ordered one 0, and a predicted **tie** scores
+    0.5. The 0.5 is the point. The naive test ``(p_a > p_b) == (t_a > t_b)``
+    scores a prediction tie (``p_a == p_b``, so ``p_a > p_b`` is False) as
+    *correct* whenever the true order happens to be descending (``t_a > t_b``
+    also False), which turns "the proxy cannot tell these apart" into a coin that
+    lands heads half the time by construction. Returns ``(nan, 0)`` when no pair
+    has distinct true values.
+    """
+    p = np.asarray(pred, dtype=np.float64)
+    t = np.asarray(true, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(t)
+    p, t = p[ok], t[ok]
+    scores: List[float] = []
+    n = p.shape[0]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if t[i] == t[j]:
+                continue
+            if p[i] == p[j]:
+                scores.append(0.5)
+            elif (p[i] > p[j]) == (t[i] > t[j]):
+                scores.append(1.0)
+            else:
+                scores.append(0.0)
+    return (float(np.mean(scores)) if scores else float("nan"), len(scores))

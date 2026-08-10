@@ -86,13 +86,20 @@ from _sr2_direct import (  # noqa: E402
     banner, bins_of, candidate_matrix, candidate_tag, direct_root, file_sha,
     geometry_of, labels_complete_path, load_direct_config, load_hr, load_lr,
     manifest_row, model_path_of, phase_space_config_of, rockstar_provenance,
-    soft_config_of, tile_grid_of, write_json, write_json_atomic,
+    soft_config_of, soft_rockstar_config_of, tile_grid_of, write_json,
+    write_json_atomic,
 )
 
 from cosmo_sr.eval.particles import field_to_particles  # noqa: E402
 from cosmo_sr.eval.rockstar import run_rockstar_on_particles  # noqa: E402
+from cosmo_sr.reward.arms import (  # noqa: E402
+    ARMS, FEATURE_SCHEMA_VERSION, features_key, sidecar_arms, tokens_key,
+)
 from cosmo_sr.reward.oracle_hr import CHANNEL_MODES  # noqa: E402
-from cosmo_sr.reward.phase_space import ARMS, arm_features, arm_paired_feature_names  # noqa: E402
+from cosmo_sr.reward.phase_space import FLAT_ARMS, arm_features, arm_paired_feature_names  # noqa: E402
+from cosmo_sr.reward.soft_rockstar import (  # noqa: E402
+    paired_token_feature_names, soft_rockstar_tokens,
+)
 from cosmo_sr.reward.soft_structure import feature_names  # noqa: E402
 from cosmo_sr.reward.tiles import (  # noqa: E402
     check_member_consistency, direct_full_box_stats, member_weights_from_particles,
@@ -190,20 +197,26 @@ def generate_field(cfg, box: str, source: str, seed: int, *, alpha: float,
 
 def tile_features(cfg, field: np.ndarray, frozen: np.ndarray,
                   device) -> Dict[str, np.ndarray]:
-    """``{arm: (n_tiles, 2F)}`` paired features, one row per tile, in one pass.
+    """Per-tile features of ALL arms, one row per tile, in one pass.
 
-    Both arms come out of a single evaluation of the *larger* arm's base block,
-    which arm A is a prefix of. That is not an optimisation: it is what makes
-    "the arms share their density coordinates exactly" a fact about the code
-    rather than a claim about two code paths that look similar. Batched over
-    tiles because the CIC deposit is the cost, and 512 separate launches of a
-    64^3 deposit is dominated by launch overhead.
+    Arms ``a``/``b`` are ``(n_tiles, 2F)`` paired flat vectors; arm ``c`` is a
+    ``(n_tiles, 2, T, F_tok)`` paired token grid. The flat arms come out of a
+    single evaluation of the *larger* arm's base block, which arm A is a prefix
+    of, and arm C's tokens are pooled from the same CIC deposit
+    (:func:`cosmo_sr.reward.phase_space.deposit_phase_space`). That is not an
+    optimisation: it is what makes "the arms share their density coordinates
+    exactly" a fact about the code rather than a claim about code paths that
+    look similar. Batched over tiles because the CIC deposit is the cost, and
+    512 separate launches of a 64^3 deposit is dominated by launch overhead.
     """
     grid = tile_grid_of(cfg)
     scfg, pcfg = soft_config_of(cfg), phase_space_config_of(cfg)
+    rcfg = soft_rockstar_config_of(cfg)
     n_dens = len(feature_names(scfg))
     cand_rows: List[np.ndarray] = []
     base_rows: List[np.ndarray] = []
+    cand_tok: List[np.ndarray] = []
+    base_tok: List[np.ndarray] = []
     batch = 8
     ids = list(range(grid.n_tiles))
     for i in range(0, len(ids), batch):
@@ -215,14 +228,21 @@ def tile_features(cfg, field: np.ndarray, frozen: np.ndarray,
         with torch.no_grad():
             cand_rows.append(arm_features(c, "b", scfg, pcfg).cpu().numpy())
             base_rows.append(arm_features(b, "b", scfg, pcfg).cpu().numpy())
+            cand_tok.append(soft_rockstar_tokens(c, scfg, pcfg, rcfg).cpu().numpy())
+            base_tok.append(soft_rockstar_tokens(b, scfg, pcfg, rcfg).cpu().numpy())
         del c, b
     cand_f = np.concatenate(cand_rows, axis=0)
     base_f = np.concatenate(base_rows, axis=0)
+    ct = np.concatenate(cand_tok, axis=0)
+    bt = np.concatenate(base_tok, axis=0)
 
     widths = {"a": n_dens, "b": cand_f.shape[1]}
-    return {arm: np.concatenate(
+    out = {arm: np.concatenate(
         [cand_f[:, :w], cand_f[:, :w] - base_f[:, :w]], axis=1).astype(np.float32)
         for arm, w in widths.items()}
+    # Same slot convention as the flat arms: [candidate, candidate - frozen].
+    out["c"] = np.stack([ct, ct - bt], axis=1).astype(np.float32)
+    return out
 
 
 def _generate_inputs(cfg, args) -> Dict:
@@ -257,16 +277,83 @@ def _generate_inputs(cfg, args) -> Dict:
     return row
 
 
+def _write_features(cfg, work: Path, feats: Dict[str, np.ndarray]) -> Path:
+    """``features.npz`` with every arm's blocks and names, written atomically."""
+    scfg, pcfg = soft_config_of(cfg), phase_space_config_of(cfg)
+    feats_npz = work / "features.npz"
+    payload = {"tile_id": np.arange(feats["a"].shape[0], dtype=np.int64),
+               "feature_schema_version": np.int64(FEATURE_SCHEMA_VERSION)}
+    for arm in FLAT_ARMS:
+        payload[features_key(arm)] = feats[arm]
+        payload[f"feature_names_{arm}"] = np.array(
+            arm_paired_feature_names(arm, scfg, pcfg))
+    for arm in sidecar_arms():
+        payload[features_key(arm)] = feats[arm]
+        payload[f"feature_names_{arm}"] = np.array(
+            paired_token_feature_names(soft_rockstar_config_of(cfg)))
+    tmp = feats_npz.with_name(feats_npz.name + ".tmp.npz")
+    np.savez_compressed(tmp, **payload)
+    tmp.replace(feats_npz)
+    return feats_npz
+
+
+def _feature_manifest_keys(feats: Dict[str, np.ndarray]) -> Dict:
+    return {
+        "feature_schema_version": int(FEATURE_SCHEMA_VERSION),
+        "n_features": {arm: (int(feats[arm].shape[1]) if feats[arm].ndim == 2
+                             else list(feats[arm].shape[1:]))
+                       for arm in ARMS},
+        "n_tiles": int(feats["a"].shape[0]),
+    }
+
+
+def _backfill_features(cfg, args, work: Path, old: Dict, device) -> bool:
+    """Recompute ``features.npz`` from the saved field. No GPU pass, no Rockstar.
+
+    This is what :data:`FEATURE_SCHEMA_VERSION` buys: a new feature block
+    (arm C's tokens) changes nothing about the field or its label, so a
+    candidate whose inputs are identical but whose features predate the schema
+    is repaired in place from ``field.npy`` -- ``field_sha`` is untouched and
+    the existing label stays valid. Needs the frozen reference on disk for the
+    difference block; returns False (fall through to a full regenerate) when
+    either field is missing.
+    """
+    field_npy = work / "field.npy"
+    if not field_npy.is_file():
+        return False
+    source, seed = args.source, int(args.seed)
+    if source == "frozen":
+        frozen = np.load(field_npy, mmap_mode="r")
+    else:
+        frozen = cached_frozen_field(
+            args.box, seed if source == "frozen_seed" else int(args.base_seed))
+        if frozen is None:
+            return False
+    t0 = time.time()
+    banner(f"{args.box}/{spec_tag(args)}: features-only backfill "
+           f"(schema {old.get('feature_schema_version', 1)} -> "
+           f"{FEATURE_SCHEMA_VERSION}); the field and its label are untouched")
+    field = np.load(field_npy, mmap_mode="r")
+    feats = tile_features(cfg, field, frozen, device)
+    _write_features(cfg, work, feats)
+    row = dict(old)
+    row.update(_feature_manifest_keys(feats))
+    row["features_backfilled_seconds"] = round(time.time() - t0, 1)
+    write_json_atomic(work / "manifest.json", row)
+    print(f"  features " + ", ".join(f"{a}:{feats[a].shape}" for a in ARMS)
+          + f"  ({time.time() - t0:.0f}s)", flush=True)
+    return True
+
+
 def stage_generate(cfg, args, device) -> int:
     box, source, seed = args.box, args.source, int(args.seed)
     tag = spec_tag(args)
     work = candidate_dir(box, tag, create=True)
     field_npy = work / "field.npy"
-    feats_npz = work / "features.npz"
     man_path = work / "manifest.json"
 
     inputs = _generate_inputs(cfg, args)
-    if args.reuse and man_path.is_file() and feats_npz.is_file() \
+    if args.reuse and man_path.is_file() and (work / "features.npz").is_file() \
             and (field_npy.is_file() or args.drop_field):
         old = json.loads(man_path.read_text())
         # `phase_space` is compared like everything else: a changed velocity
@@ -275,10 +362,18 @@ def stage_generate(cfg, args, device) -> int:
         # field would be.
         stale = [k for k, v in inputs.items() if old.get(k) != v]
         if not stale:
-            banner(f"{box}/{tag}: already generated and input-identical -> {work}")
-            return 0
-        print(f">>> regenerating {box}/{tag}: inputs changed since the last run "
-              f"({', '.join(stale)})", flush=True)
+            if int(old.get("feature_schema_version", 1)) == FEATURE_SCHEMA_VERSION:
+                banner(f"{box}/{tag}: already generated and input-identical -> {work}")
+                return 0
+            # Input-identical but the features predate the current schema:
+            # repair the features from disk rather than redoing the field.
+            if _backfill_features(cfg, args, work, old, device):
+                return 0
+            print(">>> features are schema-stale and the frozen reference is "
+                  "not on disk; regenerating in full.", flush=True)
+        else:
+            print(f">>> regenerating {box}/{tag}: inputs changed since the last "
+                  f"run ({', '.join(stale)})", flush=True)
 
     t0 = time.time()
     banner(f"{box}/{tag}: generating")
@@ -298,13 +393,7 @@ def stage_generate(cfg, args, device) -> int:
             alpha=0.0, mode=args.mode, checkpoint="", device=device)
 
     feats = tile_features(cfg, field, frozen, device)
-    scfg, pcfg = soft_config_of(cfg), phase_space_config_of(cfg)
-    payload = {"tile_id": np.arange(feats["a"].shape[0], dtype=np.int64)}
-    for arm in ARMS:
-        payload[f"features_{arm}"] = feats[arm]
-        payload[f"feature_names_{arm}"] = np.array(
-            arm_paired_feature_names(arm, scfg, pcfg))
-    np.savez_compressed(feats_npz, **payload)
+    feats_npz = _write_features(cfg, work, feats)
 
     if not args.drop_field:
         tmp = field_npy.with_suffix(".tmp.npy")
@@ -315,9 +404,8 @@ def stage_generate(cfg, args, device) -> int:
         field_path=str(field_npy if not args.drop_field else ""),
         features_path=str(feats_npz),
         field_sha=(file_sha(field_npy) if not args.drop_field else ""),
-        n_tiles=int(feats["a"].shape[0]),
-        n_features={arm: int(feats[arm].shape[1]) for arm in ARMS},
         seconds=round(time.time() - t0, 1),
+        **_feature_manifest_keys(feats),
         **inputs)
     write_json_atomic(man_path, row)
     print(f"  features " + ", ".join(f"{a}:{feats[a].shape}" for a in ARMS)
@@ -579,11 +667,19 @@ def stage_index(cfg, args) -> int:
     expected = {(c["box"], c["tag"]): c for c in candidate_matrix(cfg)}
     found = _scan_candidates()
     rows: List[Dict] = []
-    labelled, invalid, unlabelled = [], [], []
+    side_blocks: Dict[str, List[np.ndarray]] = {a: [] for a in sidecar_arms()}
+    labelled, invalid, unlabelled, stale_features = [], [], [], []
+    leftover_particles: List[str] = []
 
     for entry in found:
         gen, lab = entry["generate"], entry["label"]
         key = (gen["box"], gen["tag"])
+        # `.particles` / `.gadget2` debris means a label job died mid-flight or
+        # forgot to clean up; at ~10 GB per candidate it must not accumulate,
+        # so it blocks the completeness marker until someone looks.
+        for p in list(Path(entry["dir"]).rglob("*.particles")) + \
+                list(Path(entry["dir"]).rglob("*.gadget2")):
+            leftover_particles.append(str(p))
         if lab is None:
             unlabelled.append(key)
             continue
@@ -595,17 +691,27 @@ def stage_index(cfg, args) -> int:
         if lab.get("field_sha") and lab["field_sha"] != gen.get("field_sha"):
             invalid.append({"key": list(key), "reason": "label describes a stale field"})
             continue
+        if int(gen.get("feature_schema_version", 1)) != FEATURE_SCHEMA_VERSION:
+            # The label is fine; the FEATURES predate the current schema, so
+            # this candidate's rows cannot join the table (they would leave
+            # holes in the newer arms' blocks). --stage generate repairs it
+            # from field.npy without re-running Rockstar.
+            stale_features.append(key)
+            continue
         labelled.append(key)
 
         feats = np.load(gen["features_path"])
         summaries = {int(s.tile_id): s
                      for s in read_tile_summaries(lab["tile_summaries_path"])}
-        blocks = {arm: feats[f"features_{arm}"] for arm in ARMS}
+        blocks = {arm: feats[features_key(arm)] for arm in ARMS}
         for i, tid in enumerate(feats["tile_id"].tolist()):
             s = summaries.get(int(tid))
             if s is None:
                 continue
             row = {
+                # The row's position in the full table, which is what joins it
+                # to the sidecar arrays after any filtering.
+                "row_id": len(rows),
                 "box": gen["box"], "tag": gen["tag"], "source": gen["source"],
                 "seed": int(gen["seed"]), "alpha": gen.get("alpha"),
                 "mode": gen.get("mode", "both"), "tile_id": int(tid),
@@ -617,8 +723,11 @@ def stage_index(cfg, args) -> int:
                 "field_sha": gen.get("field_sha", ""),
                 "code_commit": gen["code_commit"],
             }
-            for arm in ARMS:
-                row[f"features_{arm}"] = blocks[arm][i].tolist()
+            for arm in FLAT_ARMS:
+                row[features_key(arm)] = blocks[arm][i].tolist()
+            for arm in sidecar_arms():
+                side_blocks[arm].append(np.asarray(blocks[arm][i],
+                                                   dtype=np.float32))
             rows.append(row)
 
     table = direct_root("proxy_data", create=True) / "rows.jsonl"
@@ -627,6 +736,17 @@ def stage_index(cfg, args) -> int:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
     tmp.replace(table)
+
+    sidecars: Dict[str, Dict] = {}
+    for arm in sidecar_arms():
+        side_path = table.parent / tokens_key(arm)
+        stack = (np.stack(side_blocks[arm]) if side_blocks[arm]
+                 else np.zeros((0, 2, 1, 1), dtype=np.float32))
+        tmp_side = side_path.with_name(side_path.name + ".tmp.npy")
+        np.save(tmp_side, stack)
+        tmp_side.replace(side_path)
+        sidecars[arm] = {"path": str(side_path), "shape": list(stack.shape)}
+        del stack, side_blocks[arm]
 
     by_source: Dict[str, int] = {}
     by_box: Dict[str, int] = {}
@@ -639,19 +759,29 @@ def stage_index(cfg, args) -> int:
 
     done = set(labelled)
     missing = sorted(f"{b}/{t}" for (b, t) in expected if (b, t) not in done)
-    complete = not missing
+    # Leftover halo-finder debris blocks the marker too: it means a label job
+    # died between Rockstar and the summaries (or cleanup failed), and at ~10 GB
+    # per candidate "someone will clean it later" is how a TB disappears.
+    complete = not missing and not leftover_particles
     report = {
         "rows": len(rows), "table": str(table),
+        "feature_schema_version": int(FEATURE_SCHEMA_VERSION),
+        "sidecars": sidecars,
         "candidates_expected": len(expected),
         "candidates_generated": len(found),
         "candidates_labelled_ok": len(labelled),
         "candidates_unlabelled": [f"{b}/{t}" for b, t in sorted(unlabelled)],
+        "candidates_stale_features": [f"{b}/{t}" for b, t in sorted(stale_features)],
         "candidates_invalid": invalid,
+        "leftover_particles": leftover_particles,
         "missing_from_predeclared_matrix": missing,
         "complete": bool(complete),
         "rows_by_source": by_source, "rows_by_box": by_box,
         "intervention_rows_by_mode": by_mode,
-        "n_arms": {arm: (len(rows[0][f"features_{arm}"]) if rows else 0)
+        "n_arms": {arm: ((len(rows[0][features_key(arm)])
+                          if features_key(arm) in rows[0]
+                          else sidecars.get(arm, {}).get("shape", [0])[1:])
+                         if rows else 0)
                    for arm in ARMS},
         # Named explicitly because "HR vs SR2 only" is the failure mode this
         # dataset is designed to avoid, and a count is how you see it happening.
@@ -665,12 +795,15 @@ def stage_index(cfg, args) -> int:
     write_json_atomic(direct_root("proxy_data") / "index_report.json", report)
     banner(json.dumps({k: v for k, v in report.items()
                        if k not in ("candidates_unlabelled",
-                                    "missing_from_predeclared_matrix")}, indent=2))
+                                    "missing_from_predeclared_matrix",
+                                    "leftover_particles")}, indent=2))
 
     marker = labels_complete_path()
     if complete and rows:
         write_json_atomic(marker, {
             "complete": True, "rows": len(rows),
+            "feature_schema_version": int(FEATURE_SCHEMA_VERSION),
+            "sidecars": sidecars,
             "candidates": sorted(f"{b}/{t}" for b, t in expected),
             "table": str(table), "index_report": str(
                 direct_root("proxy_data") / "index_report.json"),
@@ -684,6 +817,16 @@ def stage_index(cfg, args) -> int:
             print(f">>>   {m}")
         if len(missing) > 20:
             print(f">>>   ... and {len(missing) - 20} more")
+        if stale_features:
+            print(f">>> {len(stale_features)} candidates hold valid labels but "
+                  "schema-stale features; repair them with --stage generate "
+                  "(features-only backfill, no Rockstar re-run).")
+        if leftover_particles:
+            print(f">>> {len(leftover_particles)} leftover .particles/.gadget2 "
+                  "files block completeness; a relabel (OVERWRITE=1) or manual "
+                  "cleanup removes them:")
+            for p in leftover_particles[:10]:
+                print(f">>>   {p}")
         print(">>> No labels_complete.json is written, so no proxy trainer will")
         print(">>> start on this partial table. That is the intended behaviour.")
     if not report["has_within_tile_variation"]:

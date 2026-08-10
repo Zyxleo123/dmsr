@@ -71,22 +71,28 @@ for v in $(env | grep -o '^SLURM_[A-Z_]*' || true); do unset "$v"; done
 # The candidate matrix lives in the config and is enumerated by ONE function --
 # _proxy_matrix.candidate_matrix, which the indexer and the completeness check
 # also call -- so the submitter cannot disagree with them about what the dataset
-# is. That module imports nothing heavy, but the *interpreter* still has to have
-# PyYAML, and the login node's default python does not; use the project env.
+# is. _proxy_status.py adds an ACTION per candidate (skip / generate_only /
+# label_only / generate_label / invalid) from the manifests on disk, so a
+# re-run submits only the work that is actually missing -- including the
+# features-only backfill when FEATURE_SCHEMA_VERSION moved (arm C's tokens)
+# without burning a Rockstar run on candidates whose labels are fine. Both
+# modules are torch-free, but the *interpreter* still has to have PyYAML and
+# numpy, and the login node's default python does not; use the project env.
 PYBIN="${PYBIN:-$ZFS/miniconda3/envs/${CONDA_ENV:-pjm}/bin/python}"
 [ -x "$PYBIN" ] || { echo "!!! no python at $PYBIN (set PYBIN=)" >&2; exit 1; }
-MATRIX=$(PYTHONPATH="$PROJECT/scripts/reward" "$PYBIN" - "$DIRECT_CFG" "$BOXES" <<'PY'
-import sys, yaml
-from _proxy_matrix import candidate_matrix
-cfg = yaml.safe_load(open(sys.argv[1]))
-boxes = sys.argv[2].split() if len(sys.argv) > 2 and sys.argv[2].strip() else None
-for c in candidate_matrix(cfg, boxes=boxes):
-    print(c["box"], c["source"], c["seed"],
-          "-" if c["alpha"] is None else f"{c['alpha']:.4f}", c["mode"], c["tag"])
-PY
-) || { echo "!!! could not enumerate the candidate matrix; nothing submitted" >&2; exit 1; }
+MATRIX=$(PYTHONPATH="$PROJECT/scripts/reward:$PROJECT/src" \
+    "$PYBIN" scripts/reward/_proxy_status.py "$DIRECT_CFG" "$ROOT" $BOXES) \
+    || { echo "!!! could not enumerate the candidate matrix; nothing submitted" >&2; exit 1; }
 N_CAND=$(printf '%s\n' "$MATRIX" | grep -c . || true)
 echo "candidate matrix: $N_CAND candidates"
+printf '%s\n' "$MATRIX" | awk '{n[$7]++} END {for (k in n) printf "  action %-15s %d\n", k, n[k]}'
+N_INVALID=$(printf '%s\n' "$MATRIX" | awk '$7 == "invalid"' | grep -c . || true)
+if [ "$N_INVALID" -gt 0 ]; then
+    echo "!!! $N_INVALID candidate(s) have label_ok=false on disk and are NOT"
+    echo "!!! auto-resubmitted. Inspect their label_report.json, then re-run"
+    echo "!!! those candidates with OVERWRITE=1:"
+    printf '%s\n' "$MATRIX" | awk '$7 == "invalid" {print "!!!   " $1 "/" $6}'
+fi
 
 SUB_OVERRIDES=()
 ABORT_FLAG="$ROOT/.submit_proxy_labels_aborted.$$"
@@ -183,49 +189,78 @@ if [ "$STAGE" = "all" ] || [ "$STAGE" = "data" ]; then
         scripts/slurm/intervention_targets_cpu.sbatch); die_if_aborted
 
     # Pass 1: HR and frozen. Siblings of each other, so they queue concurrently
-    # rather than serialising behind one 12-hour Rockstar run.
+    # rather than serialising behind one 12-hour Rockstar run. ACTION-aware:
+    # a `skip` submits nothing, a `generate_only` (schema backfill) has no
+    # label job behind it, a `label_only` has no generate job in front.
     declare -A HR_LABEL=()
-    while read -r BOX SOURCE SEED ALPHA MODE TAG; do
+    while read -r BOX SOURCE SEED ALPHA MODE TAG ACTION; do
         [ -z "${BOX:-}" ] && continue
         [ "$SOURCE" = "intervention" ] && continue
+        case "$ACTION" in skip|invalid) continue ;; esac
         SUB_OVERRIDES=("BOX=$BOX" "SOURCE=$SOURCE" "SEED=$SEED")
-        JG=$(sub "generate $BOX/$TAG (GPU)" $(dep_of "$AFTER") \
-            scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
-        if [ "$SOURCE" = "hr" ]; then
-            # Needs the target list too: it extracts those halos' member ids.
-            JL=$(sub "label $BOX/$TAG (CPU)" --dependency=afterok:"$JG":"$JT" \
-                scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
-            HR_LABEL[$BOX]="$JL"
-        else
-            JL=$(sub "label $BOX/$TAG (CPU)" --dependency=afterok:"$JG" \
-                scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
+        JG=""
+        if [ "$ACTION" != "label_only" ]; then
+            JG=$(sub "generate $BOX/$TAG [$ACTION] (GPU)" $(dep_of "$AFTER") \
+                scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
         fi
-        LABEL_JIDS+=("$JL")
+        if [ "$ACTION" = "generate_only" ]; then
+            # No label to wait for, but the index must still run after the
+            # features-only backfill or it would report the old schema.
+            LABEL_JIDS+=("$JG")
+        else
+            GDEP="${JG:-$AFTER}"
+            if [ "$SOURCE" = "hr" ]; then
+                # Needs the target list too: it extracts those halos' member ids.
+                DEPS="$JT"; [ -n "$GDEP" ] && DEPS="$GDEP:$JT"
+                JL=$(sub "label $BOX/$TAG (CPU)" --dependency=afterok:"$DEPS" \
+                    scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
+                HR_LABEL[$BOX]="$JL"
+            else
+                JL=$(sub "label $BOX/$TAG (CPU)" \
+                    $([ -n "$GDEP" ] && echo "--dependency=afterok:$GDEP") \
+                    scripts/slurm/label_proxy_candidates_cpu.sbatch); die_if_aborted
+            fi
+            LABEL_JIDS+=("$JL")
+        fi
         SUB_OVERRIDES=()
     done <<< "$MATRIX"
 
-    # Pass 2: masks, one per box, behind that box's HR label.
+    # Pass 2: masks, one per box, behind that box's HR label -- skipped when
+    # the mask already exists on disk (its HR label was `skip`ped above).
     declare -A MASK_JID=()
-    for BOX in "${!HR_LABEL[@]}"; do
+    while read -r BOX SOURCE SEED ALPHA MODE TAG ACTION; do
+        [ "$SOURCE" = "intervention" ] || continue
+        [ -n "${MASK_JID[$BOX]:-}" ] && continue
+        [ -f "$ROOT/intervention_masks/$BOX.npz" ] && { MASK_JID[$BOX]="-"; continue; }
         SUB_OVERRIDES=("BOX=$BOX")
+        DEP="${HR_LABEL[$BOX]:-}"
         MASK_JID[$BOX]=$(sub "mask $BOX (CPU)" \
-            --dependency=afterok:"${HR_LABEL[$BOX]}" \
+            $([ -n "$DEP" ] && echo "--dependency=afterok:$DEP") \
             scripts/slurm/intervention_masks_cpu.sbatch); die_if_aborted
         SUB_OVERRIDES=()
-    done
+    done <<< "$MATRIX"
 
     # Pass 3: the interventions, behind their own box's mask only.
-    while read -r BOX SOURCE SEED ALPHA MODE TAG; do
+    while read -r BOX SOURCE SEED ALPHA MODE TAG ACTION; do
         [ -z "${BOX:-}" ] && continue
         [ "$SOURCE" != "intervention" ] && continue
-        DEP="${MASK_JID[$BOX]:-}"
+        case "$ACTION" in skip|invalid) continue ;; esac
+        DEP="${MASK_JID[$BOX]:-}"; [ "$DEP" = "-" ] && DEP=""
         SUB_OVERRIDES=("BOX=$BOX" "SOURCE=intervention" "SEED=$SEED"
                        "ALPHA=$ALPHA" "MODE=$MODE")
-        JG=$(sub "generate $BOX/$TAG (GPU)" \
-            $([ -n "$DEP" ] && echo "--dependency=afterok:$DEP" || dep_of "$AFTER") \
-            scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
-        LABEL_JIDS+=("$(sub "label $BOX/$TAG (CPU)" --dependency=afterok:"$JG" \
-            scripts/slurm/label_proxy_candidates_cpu.sbatch)"); die_if_aborted
+        JG=""
+        if [ "$ACTION" != "label_only" ]; then
+            JG=$(sub "generate $BOX/$TAG [$ACTION] (GPU)" \
+                $([ -n "$DEP" ] && echo "--dependency=afterok:$DEP" || dep_of "$AFTER") \
+                scripts/slurm/generate_proxy_candidates_gpu.sbatch); die_if_aborted
+        fi
+        if [ "$ACTION" = "generate_only" ]; then
+            LABEL_JIDS+=("$JG")
+        else
+            LABEL_JIDS+=("$(sub "label $BOX/$TAG (CPU)" \
+                $([ -n "$JG" ] && echo "--dependency=afterok:$JG") \
+                scripts/slurm/label_proxy_candidates_cpu.sbatch)"); die_if_aborted
+        fi
         SUB_OVERRIDES=()
     done <<< "$MATRIX"
 fi

@@ -107,7 +107,15 @@ and `G_z2.pt` and nothing else, and no `D_*` checkpoint exists anywhere under
   20-channel contract (6 upsampled LR + 6 field + 8 inverse-pixel-shuffled fine
   CIC density), WGAN-GP with λ=10 and the penalty every 16 critic batches.
 
-## The per-tile target is not rankable — switch to pooled (2026-08-09)
+## Spatial scale of the label — tile vs region (SUPERSEDED conclusion below)
+
+### ~~The per-tile target is not rankable — switch to pooled (2026-08-09)~~ — superseded
+
+> **Superseded 2026-08-10.** The measurement below is preserved as historical
+> evidence; its *conclusion* — that the local-credit route is dead and the only
+> option is a whole-box scalar — was an over-reach on two development boxes and
+> two methodological bugs, and is no longer the plan. See "Region-scale
+> re-analysis" below.
 
 The proxy in step 1 predicts a *tile's* statistics, so the label has to be
 attributable to a tile. `reward/attribution_diagnostic.py` (run
@@ -121,27 +129,105 @@ intervention.
 
 Verdict on the two completed boxes (`set0`, `set1`, 4608 rows each):
 
-| scheme | repeatability ceiling (touched tiles) | SNR (touched) | pooled-cancel | rankable |
+| scheme | "repeatability ceiling" (touched tiles) | SNR (touched) | pooled-cancel | rankable (old verdict) |
 | --- | --- | --- | --- | --- |
 | fractional | 0.58 | 0.70 | 93% | **no** |
 | majority | 0.58 | 0.72 | 93% | **no** |
 
-Both schemes fall below the 0.5 gate on `set1` and only scrape it on `set0`,
-and ~93% of the per-tile signal cancels when pooled — a tile's label churns
-between frozen seeds nearly as much as it moves under intervention. This is an
-intrinsic per-tile noise floor: it is set by re-simulation variance of a single
-tile, not by sample count, so finishing the remaining boxes does **not** rescue
-it. `recommendation.action = switch_to_pooled_target`,
-`per_tile_ranking_viable = false`.
+Both schemes fell below the 0.5 gate on `set1` and only scraped it on `set0`,
+and ~93% of the per-tile signal cancelled when pooled to the whole box.
 
-The same diagnostic reports `whole_box_repeatability_ceiling = 1.0` for both
-schemes: the **pooled / whole-box** reward change is perfectly stable. So the
-fix is to change the target, not the features — predict pooled reward change,
-not per-tile `(N, H, S)`. The remaining 92/120 candidate labels need not be
-generated for the per-tile proxy; the `index` job (`sd_index`) correctly leaves
-no `labels_complete.json` and blocks the per-tile trainer.
+### Why those numbers were **not** a learnability ceiling
 
-Report: `runs/direct_a/attribution_diagnostic.json`.
+Two things were wrong with reading them as one:
+
+1. **It was called a "repeatability ceiling", as if the four frozen seeds were
+   re-measurements of one field.** They are not. Different SR2 seeds produce
+   different fields and different proxy inputs, so the frozen-seed comparison
+   measures **baseline-context stability** — how much a candidate's ranking
+   depends on *which frozen box it is scored against* — not the irreducible
+   noise of one measurement. Under a *fixed* baseline (which is what the actor
+   and a seed-0-trained proxy actually use) the label is well defined.
+2. **It measured one spatial scale — a single tile — when the real question is
+   which scale is the smallest reliable one.** The 92–93% pooled cancellation is
+   precisely the evidence that a *coarser* unit is more stable: a cluster's
+   bound particles originate in many Lagrangian tiles, so its label churns
+   between tiles while barely moving for the box. The right response is to find
+   the region width at which the churn has cancelled *within* the region but the
+   region is still a local unit the actor can move — not to jump straight to the
+   whole box.
+
+Two implementation bugs also inflated the pessimism, now fixed
+(`reward/catalog_proxy.py`): `spearman()` used a double-`argsort` that invents an
+order for tied or constant inputs (so an unrankable prediction scored as chance
+rather than `NaN`), and the pairwise agreement scored a prediction tie on a
+descending true pair as *correct*. Both made a noisy label look slightly more
+rankable than it is, but the tie handling in the pair builder
+(`make_within_tile_pairs`) was the opposite — it let exact-tie pairs through at
+`min_margin=0` and trained on label noise.
+
+### Region-scale re-analysis (2026-08-10)
+
+`reward/regions.py` pools the exact tile statistics into cubic **regions** of
+width 1, 2, 4, 8 tiles over the 8³ grid, for every valid periodic partition
+offset, with three exact identities (width-1 = tiles, width-8 = one box, and
+every partition sums to the whole-box catalog to 1e-6).
+`reward/region_attribution_diagnostic.py` (job `sd_region`) uses it to measure,
+per (box, scheme, **width**, offset): the number of informative regions and
+non-tied candidate pairs; the tie-aware within-region Spearman and pairwise
+agreement of the candidate ordering **across frozen baseline contexts**
+(`baseline_context_stability`, computed within (box, region, offset) and
+averaged per box, bootstrapped by box only — never one global correlation); the
+regional signal-to-noise; and how much per-tile churn cancels once pooled to the
+region.
+
+The counterfactual is the exact swap form, lifted from a tile to a region and
+computed **consistently**: for frozen seed `r`,
+`ΔR_g = R(C_r − c_{r,g} + c_{c,g}) − R(C_r)`, with `C_r` and `c_{r,g}` always
+from the *same* baseline `r`.
+
+With only `set0` and `set1` this is **exploratory**: the report stamps
+`evidence_status = exploratory_insufficient_boxes` and proposes which width(s)
+to carry into the held-out pilot, and it deliberately emits **no**
+"unlearnable" verdict — two development boxes cannot support one, and the
+trained held-out proxy gate (phase 5) remains decisive. A width is *eligible*
+for the pilot screen only with ordering stability ≳ 0.65 (Spearman and pairwise)
+and neither screen box collapsing.
+
+Result (job `sd_region`, `set0`+`set1`, mean over offsets and boxes, both
+schemes ≈ identical so `fractional` shown):
+
+| width | within-region stability ρ | pairwise | min-box ρ | regional SNR | pooled-cancel | informative units |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 (tile) | 0.995 | 0.993 | 0.994 | 0.65 | 0.00 | 153–177 tiles |
+| 2 | 0.994 | 0.992 | 0.994 | 0.63 | 0.55 | ~47 regions |
+| 4 | 0.995 | 0.992 | 0.994 | 0.63 | 0.82 | 8 regions |
+| 8 (box) | 1.000 | 1.000 | 1.000 | ~0.66 | 0.93 | 1 region |
+
+The old 0.58 "ceiling" **does not reproduce** under the correct statistic. The
+metric the gate actually uses — the tie-aware ordering of the candidate versions
+*within* a (box, tile/region), across frozen baseline contexts — is ≈ 0.99 at
+**every** width, including width 1. The 0.58 was the correlation of per-tile `dR`
+*magnitudes* pooled across all tiles between two baseline halves; that global
+concatenation mixes cross-tile magnitude scatter into the number and is exactly
+the pooling the plan forbids. The 92–93% pooled cancellation reproduces (0.93 at
+width 8) but is not evidence against the tile path: it grows smoothly with width
+while the within-tile *ordering* is already stable at width 1.
+
+Two honest caveats before this becomes a decision: (1) it is **baseline-context
+stability**, not learnability — whether a proxy can predict the ordering from
+features is decided only by the trained held-out gate (phase 5); (2) the
+candidates here are the monotone intervention α-ladder, whose within-unit order
+is baseline-robust by construction, so 0.99 is an upper-ish bound that real actor
+candidates need not match. Regional SNR ≈ 0.65 (label signal comparable to
+seed-churn) says the signal is real but modest.
+
+Provisional read (exploratory, two dev boxes): the whole-box-scalar pivot was
+**not** warranted; the simpler **width-1 tile path is not ruled out** and is the
+one to carry — pending the set8/set9 pilot screen and the trained gate.
+
+Reports: old `runs/direct_a/attribution_diagnostic.json` (unchanged, historical);
+new `runs/direct_a/region_attribution_diagnostic.json`.
 
 ## Runbook
 

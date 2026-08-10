@@ -370,3 +370,84 @@ def test_block_average_matches_numpy():
     a = block_average(x[0], 8)
     b = block_average_torch(torch.from_numpy(x), 8)[0].numpy()
     assert np.allclose(a, b, atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Arm dispatch: the trainer computes each arm's own features
+# --------------------------------------------------------------------------- #
+def _arm_proxies(arm, soft_cfg):
+    from cosmo_sr.reward.phase_space import (
+        PhaseSpaceConfig, arm_paired_feature_names,
+    )
+    from cosmo_sr.reward.soft_rockstar import (
+        SoftRockstarConfig, SoftRockstarProxy, SoftRockstarProxyConfig,
+        token_feature_names,
+    )
+
+    pcfg = PhaseSpaceConfig()
+    rcfg = SoftRockstarConfig()
+    if arm == "c":
+        cfg = SoftRockstarProxyConfig(
+            n_token_features=len(token_feature_names(rcfg)),
+            n_tokens=int(rcfg.tokens_per_axis) ** 3,
+            n_sub_bins=6, n_host_bins=5, token_hidden=(8,), embed_dim=4)
+        members = [SoftRockstarProxy(cfg, seed=s) for s in range(2)]
+        g = torch.Generator().manual_seed(0)
+        tok = torch.randn(8, 2, cfg.n_tokens, cfg.n_token_features, generator=g)
+        for m in members:
+            m.fit_standardizer(tok)
+    else:
+        n = len(arm_paired_feature_names(arm, soft_cfg, pcfg))
+        cfg = ProxyConfig(n_features=n, n_sub_bins=6, n_host_bins=5, hidden=(16,))
+        members = [CatalogProxy(cfg, seed=s) for s in range(2)]
+    return ProxyEnsemble(members), pcfg, rcfg
+
+
+@pytest.mark.parametrize("arm", ["b", "c"])
+def test_reward_gradient_flows_through_the_arm_extractor(
+        arm, model_path, reward_and_box, geom, soft_cfg, batch, chan_kwargs):
+    """Arms B and C are real actor paths, not benchmark-only feature sets.
+
+    The trainer must extract THIS arm's features differentiably and the reward
+    gradient must reach SR2's weights through them -- for C that is the full
+    field -> CIC deposit -> token grid -> DeepSets -> reward chain.
+    """
+    reward, _ = reward_and_box
+    ens, pcfg, rcfg = _arm_proxies(arm, soft_cfg)
+    t = DirectFinetuneTrainer(
+        model_path, ens, reward,
+        cfg=DirectFinetuneConfig(rung="proj_noise", amp=False,
+                                 reward_warmup_steps=0, density_power_bands=3),
+        geom=geom, soft_cfg=soft_cfg, device=torch.device("cpu"),
+        chan_kwargs=chan_kwargs, arm=arm, phase_cfg=pcfg, rockstar_cfg=rcfg)
+    terms, diag = t.loss_terms(batch)
+    for k, v in terms.items():
+        assert torch.isfinite(v).all(), k
+    params = [p for p in t.actor.parameters() if p.requires_grad]
+    g = torch.autograd.grad(terms["reward"], params, allow_unused=True)
+    total = sum(float(x.abs().sum()) for x in g if x is not None)
+    assert total > 0.0, f"arm {arm}: no reward gradient reached SR2"
+
+
+def test_arm_c_extract_is_the_paired_token_grid(
+        model_path, reward_and_box, geom, soft_cfg, chan_kwargs, batch):
+    from cosmo_sr.train.sr2_finetune_data import fold_draws, trim_to_tile
+
+    reward, _ = reward_and_box
+    ens, pcfg, rcfg = _arm_proxies("c", soft_cfg)
+    t = DirectFinetuneTrainer(
+        model_path, ens, reward,
+        cfg=DirectFinetuneConfig(rung="proj_noise", amp=False,
+                                 density_power_bands=3),
+        geom=geom, soft_cfg=soft_cfg, device=torch.device("cpu"),
+        chan_kwargs=chan_kwargs, arm="c", phase_cfg=pcfg, rockstar_cfg=rcfg)
+    lr, noise, _, _ = fold_draws(batch)
+    with torch.no_grad():
+        cand = trim_to_tile(t.actor(lr, noise=noise), geom).float()
+        base = trim_to_tile(t.frozen(lr, noise=noise), geom).float()
+        tok = t._extract(cand, base)
+    T = int(rcfg.tokens_per_axis) ** 3
+    assert tok.shape[1:] == (2, T, ens.members[0].cfg.n_token_features)
+    # At step zero the actor IS the frozen generator: the difference block of
+    # every token is exactly zero, same convention as the flat arms.
+    assert torch.allclose(tok[:, 1], torch.zeros_like(tok[:, 1]), atol=1e-6)

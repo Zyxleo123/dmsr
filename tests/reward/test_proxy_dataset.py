@@ -106,16 +106,23 @@ def _fake_candidate(box, tag, *, n_tiles=2, label_ok=True, additivity=0.0,
     from _sr2_direct import direct_root, write_json_atomic
     from cosmo_sr.reward.phase_space import arm_paired_feature_names
 
+    from cosmo_sr.reward.arms import FEATURE_SCHEMA_VERSION
+
     d = direct_root("candidates", f"{box}__{tag}", create=True)
-    feats = {"tile_id": np.arange(n_tiles, dtype=np.int64)}
+    feats = {"tile_id": np.arange(n_tiles, dtype=np.int64),
+             "feature_schema_version": np.int64(FEATURE_SCHEMA_VERSION)}
     for arm in ("a", "b"):
         n = len(arm_paired_feature_names(arm))
         feats[f"features_{arm}"] = np.arange(n_tiles * n,
                                              dtype=np.float32).reshape(n_tiles, n)
+    # Arm C's paired token grid, sidecar-bound: (n_tiles, 2, T, F).
+    feats["features_c"] = np.arange(n_tiles * 2 * 8 * 4, dtype=np.float32
+                                    ).reshape(n_tiles, 2, 8, 4)
     np.savez_compressed(d / "features.npz", **feats)
     write_json_atomic(d / "manifest.json", {
         "box": box, "tag": tag, "source": ("hr" if tag == "hr" else "frozen"),
         "seed": 0, "alpha": None, "mode": "both",
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "features_path": str(d / "features.npz"), "field_path": str(d / "field.npy"),
         "field_sha": field_sha, "model_sha": "m", "lr_sha": "l",
         "code_commit": "test"})

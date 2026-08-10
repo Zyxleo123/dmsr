@@ -7,6 +7,7 @@
 #
 #   sbatch scripts/slurm/train_sr2_direct_gpu.sbatch RUN_NAME=direct_a RUNG=proj_noise
 #   sbatch scripts/slurm/train_sr2_direct_gpu.sbatch RUN_NAME=direct_a OVERFIT=1
+#   sbatch scripts/slurm/train_sr2_direct_gpu.sbatch RUN_NAME=direct_a ARM=b PROBE=1
 #SBATCH --job-name=sd_actor
 #SBATCH --partition=general
 #SBATCH --exclude=gpu28
@@ -26,17 +27,20 @@ set -euo pipefail
 : "${RUNG:=}"
 : "${MAX_STEPS:=0}"
 : "${OVERFIT:=0}"
+: "${PROBE:=0}"
+: "${ARM:=a}"
 : "${RESUME:=}"
 : "${BOXES:=}"
 
 require_input "$REWARD_MODEL_JSON" "scripts/slurm/fit_reward_model_cpu.sbatch"
-require_input "$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME/proxy" \
+require_input "$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME/proxy_$ARM" \
     "scripts/slurm/train_catalog_proxy_gpu.sbatch"
 
-ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME")
+ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM")
 [ -n "$RUNG" ] && ARGS+=(--rung "$RUNG")
 [ "$MAX_STEPS" != "0" ] && ARGS+=(--max-steps "$MAX_STEPS")
 [ "$OVERFIT" = "1" ] && ARGS+=(--overfit)
+[ "$PROBE" = "1" ] && ARGS+=(--probe)
 [ -n "$RESUME" ] && ARGS+=(--resume "$RESUME")
 [ -n "$BOXES" ] && ARGS+=(--boxes "$BOXES")
 [ -n "$DEVICE" ] && ARGS+=(--device "$DEVICE")

@@ -52,14 +52,19 @@ def fitted_reward(reward_root):
     return out
 
 
+N_TOKENS, N_TOKEN_FEATURES = 8, 4
+
+
 def _write_rows(path: Path, *, boxes, tiles, seed=0, invalid_box=None):
-    """Frozen + perturbed candidates per (box, tile), with BOTH arms' features.
+    """Frozen + perturbed candidates per (box, tile), with ALL arms' features.
 
     ``compact_mass`` (feature 0) drives the counts, so a proxy that learns
     anything can rank a tile's candidates; the phase-space block is present and
     carries the same signal only on the ``vel`` rows, which is the shape the
-    diagnostic slice needs. The point is that the *table* is right, not that the
-    physics is.
+    diagnostic slice needs. Arm C's tokens go into a ``tokens_c.npy`` sidecar
+    joined by ``row_id``, exactly as the indexer writes them, with the same
+    gain in token channel 0. The point is that the *table* is right, not that
+    the physics is.
     """
     from cosmo_sr.reward.phase_space import arm_paired_feature_names
     from _sr2_direct import candidate_tag
@@ -72,6 +77,7 @@ def _write_rows(path: Path, *, boxes, tiles, seed=0, invalid_box=None):
               ("frozen_seed", None, "both", 1)]
              + [("intervention", a, m, 0)
                 for m in ("both", "disp", "vel") for a in (0.25, 0.5, 1.0)])
+    row_id, side_blocks = 0, []
     with open(path, "w") as fh:
         for box in boxes:
             for t in tiles:
@@ -87,8 +93,12 @@ def _write_rows(path: Path, *, boxes, tiles, seed=0, invalid_box=None):
                     diff = half_b.copy()
                     fb = np.concatenate([half_b, diff])
                     fa = np.concatenate([half_b[:n_a // 2], diff[:n_a // 2]])
+                    tok = rng.normal(0.0, 0.2,
+                                     size=(2, N_TOKENS, N_TOKEN_FEATURES))
+                    tok[:, :, 0] = gain
+                    side_blocks.append(tok.astype(np.float32))
                     fh.write(json.dumps({
-                        "box": box,
+                        "row_id": row_id, "box": box,
                         "tag": candidate_tag(source, seed=cseed, alpha=alpha,
                                              mode=mode),
                         "source": source, "seed": cseed, "alpha": alpha,
@@ -102,6 +112,8 @@ def _write_rows(path: Path, *, boxes, tiles, seed=0, invalid_box=None):
                         "model_sha": "deadbeef", "lr_sha": "cafe",
                         "field_sha": "f00d", "code_commit": "test",
                     }) + "\n")
+                    row_id += 1
+    np.save(path.parent / "tokens_c.npy", np.stack(side_blocks))
 
 
 def _mark_labels_complete():
@@ -116,9 +128,9 @@ def direct_cfg(tmp_path, reward_root):
     cfg = yaml.safe_load((PROJECT_ROOT / "configs" / "reward"
                           / "sr2_direct_finetune.yaml").read_text())
     cfg["proxy"].update({"n_members": 2, "epochs": 12, "hidden": [16]})
-    cfg["proxy_cv"].update({
-        "n_folds": 2, "epochs": 6,
-        "grid": [{"hidden": [16], "lr": 1.0e-3, "weight_decay": 1.0e-4}]})
+    cfg["proxy"]["arm_c"] = {"token_hidden": [8], "embed_dim": 4}
+    assert not cfg["proxy_cv"].get("enabled") and not cfg["proxy_cv"].get("grid"), \
+        "the committed config must not carry a hyperparameter sweep"
     # Four fit boxes, not two: the ensemble is a box-BOOTSTRAP, and a
     # bootstrap over two boxes is uniform a quarter of the time, which makes
     # the test that it resamples at all a coin flip.
@@ -131,7 +143,7 @@ def direct_cfg(tmp_path, reward_root):
 
 @pytest.fixture
 def trained(direct_cfg, fitted_reward):
-    """A fitted two-arm ensemble on a synthetic table. Returns the run dir."""
+    """A fitted three-arm ensemble on a synthetic table. Returns the run dir."""
     import train_catalog_proxy
     from _sr2_direct import direct_root, run_dir
 
@@ -161,22 +173,43 @@ def test_trainer_refuses_a_partial_table(direct_cfg, fitted_reward):
             ["--config", str(direct_cfg), "--run-name", "t", "--device", "cpu"])
 
 
-def test_both_arms_are_fitted_with_one_shared_hyperparameter_choice(trained):
+def test_all_three_arms_are_fitted_with_fixed_predeclared_configs(trained):
+    from cosmo_sr.reward.catalog_proxy import ProxyEnsemble
+    from cosmo_sr.reward.soft_rockstar import SoftRockstarProxy
+
     report = json.loads((trained / "train_report.json").read_text())
-    assert report["arms"] == ["a", "b"]
-    for arm in ("a", "b"):
+    assert report["arms"] == ["a", "b", "c"]
+    assert report["model_selection"] == "fixed_predeclared"
+    assert "cross_validation" not in report
+    assert report["proxy_unit"] == "region" and report["region_width"] == 1
+    for arm in ("a", "b", "c"):
         assert (trained / f"proxy_{arm}" / "member_00.pt").is_file()
         assert report["arm_reports"][arm]["members"]
-    # One hyperparameter dict, chosen on the mean over arms, used by both.
-    assert set(report["hyperparameters"]) == {"hidden", "lr", "weight_decay"}
-    cv = report["cross_validation"]
-    assert cv["selected"] == report["hyperparameters"]
-    assert all(f"{a}_within_tile_spearman" in row
-               for row in cv["table"] for a in ("a", "b"))
     # Arm B really is the wider feature vector, or the comparison is vacuous.
     assert (report["arm_reports"]["b"]["n_features"]
             > report["arm_reports"]["a"]["n_features"])
+    # Arm C is a token grid and its ensemble loads back as the DeepSets class.
+    assert report["arm_reports"]["c"]["feature_shape"] == [
+        2, N_TOKENS, N_TOKEN_FEATURES]
+    ens = ProxyEnsemble.load(trained / "proxy_c")
+    assert all(isinstance(m, SoftRockstarProxy) for m in ens.members)
     assert (trained / "proxy_baselines.json").is_file()
+
+
+def test_the_sweep_is_refused_if_it_creeps_back(direct_cfg, fitted_reward):
+    import train_catalog_proxy
+    from _sr2_direct import direct_root
+
+    _write_rows(direct_root("proxy_data", create=True) / "rows.jsonl",
+                boxes=["set0", "set1"], tiles=range(2))
+    _mark_labels_complete()
+    cfg = yaml.safe_load(direct_cfg.read_text())
+    cfg["proxy_cv"] = {"enabled": True,
+                       "grid": [{"hidden": [16], "lr": 1e-3}]}
+    direct_cfg.write_text(yaml.safe_dump(cfg))
+    with pytest.raises(SystemExit, match="sweep was removed"):
+        train_catalog_proxy.main(
+            ["--config", str(direct_cfg), "--run-name", "t", "--device", "cpu"])
 
 
 def test_ensemble_members_are_box_bootstrap_samples(trained):
@@ -203,22 +236,27 @@ def test_gate_reports_every_predeclared_criterion(trained, direct_cfg):
     v = json.loads((trained / "proxy_gate_a.json").read_text())
     assert {c["name"] for c in v["checks"]} == {
         "within_tile_spearman", "pairwise_accuracy", "selected_positive_fraction",
-        "alpha_ordering_spearman", "single_feature_dependence",
+        "single_feature_dependence",
         "occupation_log_error_worst_reliable_bin",
         "pooled_margin_over_worst_baseline", "uncertainty_error_spearman",
-        "splice_sign_agreement", "n_splice_verifications", "n_splice_boxes",
+    }
+    # The actor-like Rockstar verification is its own check family, judged
+    # separately: an arm can be offline-eligible while awaiting the probe.
+    assert {c["name"] for c in v["actor_checks"]} == {
+        "actor_sign_agreement", "n_actor_checks", "n_actor_boxes",
     }
     # Occupancy is gated per reliable bin and the sparse bin is reported only.
     assert v["occupation_by_bin"]["reliable_host_bins"] == [0, 1, 2, 3]
     assert v["occupation_by_bin"]["report_only_bins"] == [4]
     # The predeclared slices are all present, including the two that make an
-    # arm-B win attributable.
-    for name in ("near_sr2", "interventions_disp", "interventions_vel"):
+    # arm-B win attributable; the alpha ladder is reported there, not gated.
+    for name in ("near_sr2", "interventions_disp", "interventions_vel",
+                 "alpha_ordering_both", "alpha_ordering_vel"):
         assert name in v["slices"], sorted(v["slices"])
     assert set(v["baseline_comparison"]) == {"zero_change", "train_mean", "linear"}
 
 
-def test_gate_fails_without_the_real_splice_verifications(trained, direct_cfg):
+def test_gate_fails_without_the_real_actor_verifications(trained, direct_cfg):
     """Missing evidence makes a criterion unmet, never met."""
     import gate_catalog_proxy
 
@@ -226,7 +264,32 @@ def test_gate_fails_without_the_real_splice_verifications(trained, direct_cfg):
         ["--config", str(direct_cfg), "--run-name", "t", "--arm", "a"])
     v = json.loads((trained / "proxy_gate_a.json").read_text())
     assert not v["passed"]
-    assert any("splice" in f for f in v["failures"])
+    assert not v["actor_passed"]
+    assert any("actor" in f for f in v["actor_failures"])
+    # And full passage is the conjunction, never the offline screen alone.
+    assert v["passed"] == (v["offline_passed"] and v["actor_passed"])
+
+
+def test_gate_passes_only_with_landed_actor_checks(trained, direct_cfg):
+    """Actor rows flip actor_passed; the offline verdict is untouched."""
+    import gate_catalog_proxy
+    from _sr2_direct import append_jsonl
+
+    rng = np.random.default_rng(0)
+    for i in range(12):
+        pred = float(rng.normal(0.5, 0.1))
+        append_jsonl(trained / "actor_verification_a.jsonl", {
+            "stratum": ["predicted_positive", "high_uncertainty", "random"][i % 3],
+            "box": ["set8", "set9", "set10"][i % 3], "tile_id": i,
+            "predicted_dR": pred, "measured_dR": pred + float(rng.normal(0, 0.01)),
+        })
+    gate_catalog_proxy.main(
+        ["--config", str(direct_cfg), "--run-name", "t", "--arm", "a"])
+    v = json.loads((trained / "proxy_gate_a.json").read_text())
+    assert v["actor_passed"], v["actor_failures"]
+    assert v["actor"]["n_checks"] == 12
+    assert v["actor"]["n_boxes"] == 3
+    assert v["passed"] == v["offline_passed"]
 
 
 def test_splice_plan_is_stratified_and_spread_over_boxes(trained, direct_cfg):
@@ -257,19 +320,21 @@ def test_benchmark_writes_the_decision_and_is_immutable(trained, direct_cfg, cap
     import gate_catalog_proxy
     import proxy_benchmark
 
-    for arm in ("a", "b"):
+    for arm in ("a", "b", "c"):
         gate_catalog_proxy.main(
             ["--config", str(direct_cfg), "--run-name", "t", "--arm", arm])
     assert proxy_benchmark.main(
         ["--config", str(direct_cfg), "--run-name", "t",
          "--n-bootstrap", "50"]) == 0
     doc = json.loads((trained / "proxy_benchmark.json").read_text())
-    assert set(doc["passed"]) == {"a", "b"}
-    # Neither arm can pass here: the splices were never run.
-    assert doc["decision"]["decision"] == "do_not_finetune"
+    assert set(doc["passed"]) == {"a", "b", "c"}
+    # No arm can advance here: the actor-like Rockstar checks were never run,
+    # and offline evidence alone must not fine-tune anything.
+    assert doc["decision"]["decision"] in (
+        "do_not_finetune", "actor_gate_incomplete_do_not_finetune")
     assert doc["decision"]["advance"] == []
     assert doc["arm_comparison"]["n_boxes"] == 2
-    assert "difference" in doc["arm_comparison"]
+    assert "pairwise" in doc["arm_comparison"]
     assert doc["provenance"]["table_sha"]
     assert doc["content_sha256"]
 
@@ -294,31 +359,51 @@ def test_benchmark_refuses_without_every_arm_verdict(trained, direct_cfg, capsys
     assert "MISSING INPUT" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("decision, expected", [
-    ({"a": False, "b": False}, "do_not_finetune"),
-    ({"a": True, "b": False}, "advance_a_only"),
-    ({"a": False, "b": True}, "advance_b_only"),
+def _verdict(offline: bool, actor: bool) -> dict:
+    return {"passed": offline and actor, "offline_passed": offline,
+            "actor_passed": actor}
+
+
+@pytest.mark.parametrize("offline, actor, expected", [
+    ({"a": False, "b": False, "c": False}, False, "do_not_finetune"),
+    ({"a": True, "b": False, "c": False}, True, "advance_a"),
+    ({"a": False, "b": True, "c": False}, True, "advance_b"),
+    ({"a": True, "b": True, "c": True}, True, "advance_a_b_c"),
 ])
-def test_the_advancement_rule_is_a_function_not_a_paragraph(decision, expected):
+def test_the_advancement_rule_is_a_function_not_a_paragraph(offline, actor,
+                                                            expected):
     import proxy_benchmark
 
-    verdicts = {a: {"passed": p} for a, p in decision.items()}
-    out = proxy_benchmark._decide(verdicts, {"verdict": "equivalent"},
-                                  {"verdict": "equivalent"})
+    verdicts = {a: _verdict(p, actor and p) for a, p in offline.items()}
+    out = proxy_benchmark._decide(verdicts, {"pairwise": {}}, {})
     assert out["decision"] == expected
-    assert set(out["advance"]) == {a for a, p in decision.items() if p}
+    assert set(out["advance"]) == {a for a, p in offline.items() if p and actor}
+
+
+def test_offline_alone_never_advances_an_arm():
+    """The property the whole milestone hangs on: no Rockstar, no fine-tune."""
+    import proxy_benchmark
+
+    out = proxy_benchmark._decide(
+        {"a": _verdict(True, False), "b": _verdict(False, False)},
+        {"pairwise": {}}, {})
+    assert out["decision"] == "actor_gate_incomplete_do_not_finetune"
+    assert out["advance"] == []
+    assert out["awaiting_actor_gate"] == ["a"]
+    assert "Rockstar" in out["rationale"]
 
 
 def test_equivalent_arms_prefer_the_simpler_one():
     import proxy_benchmark
 
-    out = proxy_benchmark._decide({"a": {"passed": True}, "b": {"passed": True}},
-                                  {"verdict": "equivalent"}, {})
+    both = {"a": _verdict(True, True), "b": _verdict(True, True)}
+    out = proxy_benchmark._decide(
+        both, {"pairwise": {"b-a": {"verdict": "equivalent"}}}, {})
     assert out["preferred"] == "a"
     assert set(out["advance"]) == {"a", "b"}
 
-    ahead = proxy_benchmark._decide({"a": {"passed": True}, "b": {"passed": True}},
-                                    {"verdict": "second_better"}, {})
+    ahead = proxy_benchmark._decide(
+        both, {"pairwise": {"b-a": {"verdict": "second_better"}}}, {})
     assert ahead["preferred"] == "b"
     assert set(ahead["advance"]) == {"a", "b"}
 

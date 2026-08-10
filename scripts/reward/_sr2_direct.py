@@ -53,8 +53,9 @@ __all__ = [
     "candidate_tag", "code_commit", "dataset_of", "direct_root", "file_sha",
     "geometry_of", "gate_of", "labels_complete_path", "load_direct_config",
     "load_lr", "load_hr", "load_reward_models", "manifest_row",
-    "phase_space_config_of", "read_jsonl", "rockstar_provenance",
-    "soft_config_of", "tile_grid_of", "write_json", "write_json_atomic",
+    "phase_space_config_of", "read_jsonl", "region_width_of",
+    "rockstar_provenance", "soft_config_of", "soft_rockstar_config_of",
+    "tile_grid_of", "write_json", "write_json_atomic",
 ]
 
 
@@ -168,6 +169,34 @@ def phase_space_config_of(cfg: Mapping) -> PhaseSpaceConfig:
         coherence_scales=tuple(int(x) for x in p.get("coherence_scales", (1, 2, 4))),
         particle_mass_msun_h=float(p.get("particle_mass_msun_h", 581881454.8686146)),
     )
+
+
+def soft_rockstar_config_of(cfg: Mapping):
+    """Arm C's token-grid feature configuration (imported lazily: torch)."""
+    from cosmo_sr.reward.soft_rockstar import SoftRockstarConfig
+
+    s = dict(cfg.get("soft_rockstar", {}))
+    return SoftRockstarConfig(
+        tokens_per_axis=int(s.get("tokens_per_axis", 8)),
+        contrast_scales=tuple(int(x) for x in s.get("contrast_scales", (1, 2, 4))),
+        coherence_scale=int(s.get("coherence_scale", 2)),
+    )
+
+
+def region_width_of(cfg: Mapping) -> int:
+    """The supervision unit's width in tiles. 1 is the deployed configuration.
+
+    Read in one place so the trainer, the gate and the benchmark cannot group
+    by different units. At width 1 ``region_id == tile_id`` exactly
+    (:func:`cosmo_sr.reward.regions.region_ids_from_tile_ids`), so the existing
+    per-tile labels ARE the width-1 region labels.
+    """
+    unit = str(cfg.get("proxy_unit", "region"))
+    if unit != "region":
+        raise SystemExit(
+            f"proxy_unit is {unit!r}; the only supported supervision unit is "
+            "'region' (width 1 = the tile itself)")
+    return int(cfg.get("region_width", 1))
 
 
 def actor_config_of(cfg: Mapping) -> DirectFinetuneConfig:

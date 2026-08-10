@@ -17,19 +17,25 @@ resamples *boxes* with replacement and recomputes the metric on the resampled
 rows, which is the only version of "is B better than A" that is not mostly a
 statement about how many tiles fit in a box.
 
-The advancement rule (plan section 7)
--------------------------------------
-* neither arm passes -- do not fine-tune SR2. The proxy or its data is the thing
-  to fix, not the number of unfrozen parameters;
-* one arm passes -- advance only that arm;
-* both pass -- advance both to the same small fine-tuning screen. Proxy accuracy
-  alone does not establish that the *gradient* is useful, which is a different
-  question and a later one;
-* B passes where A fails, especially on the velocity-only interventions --
-  phase-space summaries are justified, and the velocity-only slice is what makes
-  that attributable rather than incidental;
-* the two are equivalent -- prefer A, because it is the simpler model, unless B
-  wins the later equal-budget real-Rockstar screen.
+The advancement rule
+--------------------
+An arm advances only on its FULL per-arm verdict: the offline held-out screen
+AND the actor-like Rockstar verification (a probe_only fine-tune's own
+generated tiles, spliced into held-out boxes and re-run through the real halo
+finder). An arm that passed offline but has no actor verification is recorded
+as *awaiting* and refused -- only real Rockstar results can authorize direct
+SR2 fine-tuning.
+
+* no arm passes in full -- do not fine-tune SR2. The proxy or its data is the
+  thing to fix, not the number of unfrozen parameters;
+* one or more arms pass -- advance them to the same small fine-tuning screen.
+  Proxy accuracy alone does not establish that the *gradient* is useful, which
+  is a different question and a later one;
+* among the advanced arms, prefer the simplest (a, then b, then c) unless a
+  more complex one is ahead by more than the box-bootstrap interval;
+* B or C passing where A fails, especially on the velocity-only interventions
+  -- the phase-space information is justified, and the velocity-only slice is
+  what makes that attributable rather than incidental.
 
     python scripts/reward/proxy_benchmark.py --run-name direct_a
 """
@@ -46,12 +52,12 @@ import torch
 
 from _proxy_data import (  # noqa: E402
     ARMS, as_arrays, build_row_context, ensemble_delta, load_rows, rank_metrics,
-    slice_rows, true_delta_rewards,
+    slice_rows, true_delta_rewards, unit_ids_of,
 )
 from _sr2_direct import (  # noqa: E402
     actor_config_of, add_direct_args, banner, boxes_of, code_commit, direct_root,
     file_sha, labels_complete_path, load_direct_config, load_reward_models,
-    rockstar_provenance, run_dir, write_json_atomic,
+    region_width_of, rockstar_provenance, run_dir, write_json_atomic,
 )
 
 from cosmo_sr.reward.catalog_proxy import ProxyEnsemble  # noqa: E402
@@ -72,8 +78,9 @@ def box_bootstrap(pred: Dict[str, np.ndarray], true: np.ndarray,
     idx_by_box = {b: np.nonzero(box == b)[0] for b in boxes}
     rng = np.random.default_rng(int(seed))
     draws: Dict[str, List[float]] = {a: [] for a in pred}
-    diff: List[float] = []
     arms = sorted(pred)
+    arm_pairs = [(x, y) for i, x in enumerate(arms) for y in arms[i + 1:]]
+    diffs: Dict[str, List[float]] = {f"{y}-{x}": [] for x, y in arm_pairs}
     for _ in range(int(n)):
         picked = rng.choice(boxes, size=len(boxes), replace=True)
         idx = np.concatenate([idx_by_box[b] for b in picked])
@@ -82,8 +89,9 @@ def box_bootstrap(pred: Dict[str, np.ndarray], true: np.ndarray,
             vals[a] = rank_metrics(pred[a][idx], true[idx], box[idx],
                                    tile[idx])[metric]
             draws[a].append(vals[a])
-        if len(arms) == 2:
-            diff.append(vals[arms[1]] - vals[arms[0]])
+        # Differences are computed WITHIN the replicate (see the docstring).
+        for x, y in arm_pairs:
+            diffs[f"{y}-{x}"].append(vals[y] - vals[x])
 
     def ci(v: Sequence[float]) -> Dict[str, float]:
         arr = np.asarray(v, dtype=np.float64)
@@ -95,75 +103,124 @@ def box_bootstrap(pred: Dict[str, np.ndarray], true: np.ndarray,
                 "lo90": float(np.percentile(arr, 5)),
                 "hi90": float(np.percentile(arr, 95))}
 
+    def verdict_of(d: Dict[str, float]) -> str:
+        return ("second_better" if d["lo90"] > 0 else
+                "first_better" if d["hi90"] < 0 else "equivalent")
+
     out: Dict = {"metric": metric, "n_boxes": len(boxes), "n_draws": int(n),
                  "per_arm": {a: ci(draws[a]) for a in arms}}
-    if len(arms) == 2:
-        d = ci(diff)
-        d["arms"] = f"{arms[1]} - {arms[0]}"
-        finite = np.asarray([x for x in diff if np.isfinite(x)])
+    pairwise: Dict[str, Dict] = {}
+    for x, y in arm_pairs:
+        key = f"{y}-{x}"
+        d = ci(diffs[key])
+        d["arms"] = f"{y} - {x}"
+        finite = np.asarray([v for v in diffs[key] if np.isfinite(v)])
         d["fraction_positive"] = (float(np.mean(finite > 0)) if finite.size
                                   else float("nan"))
-        out["difference"] = d
-        out["verdict"] = ("second_better" if d["lo90"] > 0 else
-                          "first_better" if d["hi90"] < 0 else "equivalent")
+        d["verdict"] = verdict_of(d)
+        pairwise[key] = d
+    out["pairwise"] = pairwise
+    if len(arms) == 2:
+        # The historical two-arm keys, kept so a two-arm run's record reads the
+        # same as it always did.
+        out["difference"] = pairwise[f"{arms[1]}-{arms[0]}"]
+        out["verdict"] = out["difference"]["verdict"]
     return out
 
 
 def _decide(verdicts: Dict[str, Dict], comparison: Dict,
             vel_comparison: Dict) -> Dict:
-    """Plan section 7, as a function rather than as a paragraph someone reads."""
-    passed = {a: bool(v.get("passed", False)) for a, v in verdicts.items()}
-    a_ok, b_ok = passed.get("a", False), passed.get("b", False)
-    equiv = comparison.get("verdict", "equivalent")
+    """The advancement rule, as a function rather than as a paragraph.
 
-    if not a_ok and not b_ok:
+    An arm advances only on its FULL verdict: the offline screen and the
+    actor-like Rockstar verification together (``passed`` in the per-arm gate
+    report). An arm that cleared the offline screen but whose actor
+    verification has not landed is named explicitly, and the decision refuses
+    to advance it: only real Rockstar results can authorize fine-tuning, and a
+    benchmark that advanced an arm on a promise would be the promise, recorded.
+
+    Among the arms that advance, the PREFERRED one is the simplest (a, then b,
+    then c) unless a more complex arm beats it by more than the box-bootstrap
+    interval on their difference -- complexity has to buy a distinguishable
+    improvement or it is not bought.
+    """
+    passed = {a: bool(v.get("passed", False)) for a, v in verdicts.items()}
+    offline = {a: bool(v.get("offline_passed", v.get("passed", False)))
+               for a, v in verdicts.items()}
+    advance = [a for a in verdicts if passed[a]]
+    awaiting = [a for a in verdicts if offline[a] and not passed[a]]
+    pairwise = comparison.get("pairwise", {})
+
+    if not advance:
+        if awaiting:
+            return {
+                "decision": "actor_gate_incomplete_do_not_finetune",
+                "advance": [],
+                "awaiting_actor_gate": sorted(awaiting),
+                "rationale": (
+                    f"Arm(s) {sorted(awaiting)} cleared the offline screen but "
+                    "their actor-like Rockstar verification is missing or "
+                    "failing. Run the probe_only fine-tune and "
+                    "actor_rockstar_verify.py, re-run the per-arm gate, then "
+                    "re-run this benchmark. Nothing may fine-tune SR2 on "
+                    "offline evidence alone."),
+            }
         return {
             "decision": "do_not_finetune",
             "advance": [],
-            "rationale": "Neither arm cleared its predeclared criteria. Fix the "
+            "rationale": "No arm cleared its predeclared criteria. Fix the "
                          "proxy or its data, or move to the true-catalog oracle "
                          "renderer. Unfreezing more of SR2 is not a response to "
                          "a proxy that cannot rank.",
         }
-    if a_ok and not b_ok:
-        return {"decision": "advance_a_only", "advance": ["a"],
-                "rationale": "Only the density-only arm passed. The phase-space "
-                             "summaries are not justified by this evidence."}
-    if b_ok and not a_ok:
-        vel = vel_comparison.get("verdict", "equivalent")
-        return {
-            "decision": "advance_b_only", "advance": ["b"],
-            "phase_space_justified": True,
-            "velocity_slice_verdict": vel,
-            "rationale": (
-                "Only the phase-space arm passed"
-                + (", and it also wins the velocity-only intervention slice, "
-                   "which arm A cannot see by construction -- the win is "
-                   "attributable to the extra coordinates."
-                   if vel == "second_better" else
-                   ". Note that it does NOT separate from arm A on the "
-                   "velocity-only slice, so the advantage is not clearly "
-                   "attributable to the phase-space coordinates; treat the "
-                   "attribution as open.")),
-        }
-    if equiv == "equivalent":
-        return {
-            "decision": "advance_both_prefer_a", "advance": ["a", "b"],
-            "preferred": "a",
-            "rationale": "Both arms passed and the box-bootstrap interval on "
-                         "their difference contains zero. Prefer A for "
-                         "simplicity; B may still be chosen if it produces "
-                         "better real-Rockstar improvement in the later "
-                         "equal-budget fine-tuning screen.",
-        }
-    better = "b" if equiv == "second_better" else "a"
-    return {
-        "decision": "advance_both", "advance": ["a", "b"], "preferred": better,
-        "rationale": f"Both arms passed and arm {better.upper()} is ahead by more "
-                     "than the box-bootstrap interval. Both still go to the same "
-                     "small fine-tuning screen: proxy accuracy alone does not "
-                     "establish that the gradient is useful.",
+
+    # Preference among the advanced arms: simplest first, displaced only by a
+    # distinguishable win.
+    order = [a for a in ("a", "b", "c") if a in advance]
+    preferred = order[0]
+    for rival in order[1:]:
+        key = f"{rival}-{preferred}" if rival > preferred else f"{preferred}-{rival}"
+        d = pairwise.get(key, {})
+        v = d.get("verdict", "equivalent")
+        rival_is_second = key.startswith(rival)
+        if (v == "second_better" and rival_is_second) or \
+                (v == "first_better" and not rival_is_second):
+            preferred = rival
+
+    vel = vel_comparison.get("pairwise", {})
+    notes = []
+    for rich, base in (("b", "a"), ("c", "a")):
+        if rich in advance:
+            v = vel.get(f"{rich}-{base}", {}).get("verdict", "")
+            if v == "second_better":
+                notes.append(
+                    f"arm {rich.upper()} wins the velocity-only intervention "
+                    "slice, which the density-only arm cannot see by "
+                    "construction -- its advantage is attributable to the "
+                    "phase-space information.")
+            elif v:
+                notes.append(
+                    f"arm {rich.upper()} does NOT separate from arm A on the "
+                    "velocity-only slice; treat any advantage's attribution "
+                    "as open.")
+
+    doc = {
+        "decision": "advance_" + "_".join(sorted(advance)),
+        "advance": sorted(advance),
+        "preferred": preferred,
+        "rationale": (
+            f"Arm(s) {sorted(advance)} cleared both the offline screen and the "
+            f"actor-like Rockstar verification. Preferred: {preferred.upper()} "
+            "-- the simplest passing arm, displaced only by a rival ahead by "
+            "more than the box-bootstrap interval. "
+            + " ".join(notes)).strip(),
     }
+    if awaiting:
+        doc["awaiting_actor_gate"] = sorted(awaiting)
+        doc["rationale"] += (
+            f" Arm(s) {sorted(awaiting)} are offline-eligible but await their "
+            "actor verification and do NOT advance.")
+    return doc
 
 
 def main(argv=None) -> int:
@@ -217,7 +274,8 @@ def main(argv=None) -> int:
     w_joint, w_occ = float(acfg.w_joint_reward), float(acfg.w_occ_reward)
     ctx = build_row_context(rows)
     true = true_delta_rewards(ctx, reward_t, w_joint=w_joint, w_occ=w_occ)
-    common = as_arrays(rows, arms[0])
+    common = as_arrays(rows, "a")
+    unit = unit_ids_of(common["tile_id"], width=region_width_of(cfg))
     preds: Dict[str, np.ndarray] = {}
     for arm in arms:
         d = run / f"proxy_{arm}"
@@ -225,11 +283,12 @@ def main(argv=None) -> int:
             print(f">>> MISSING INPUT: {d}")
             return 0
         ens = ProxyEnsemble.load(d).freeze()
-        feats = torch.as_tensor(as_arrays(rows, arm)["features"], dtype=torch.float64)
+        feats = torch.as_tensor(as_arrays(rows, arm, table_dir=table.parent)["features"],
+                                dtype=torch.float64)
         preds[arm], _ = ensemble_delta(ens.members, feats, ctx, reward_t,
                                        w_joint=w_joint, w_occ=w_occ)
 
-    comparison = box_bootstrap(preds, true, common["box"], common["tile_id"],
+    comparison = box_bootstrap(preds, true, common["box"], unit,
                                n=int(args.n_bootstrap), seed=int(args.seed))
     slices = dict(cfg.get("proxy_report_slices", {}))
     slice_cmp: Dict[str, Dict] = {}
@@ -241,7 +300,7 @@ def main(argv=None) -> int:
             continue
         slice_cmp[name] = box_bootstrap(
             {a: preds[a][idx] for a in arms}, true[idx], common["box"][idx],
-            common["tile_id"][idx], n=int(args.n_bootstrap), seed=int(args.seed))
+            unit[idx], n=int(args.n_bootstrap), seed=int(args.seed))
         slice_cmp[name]["n_rows"] = int(idx.size)
 
     decision = _decide(verdicts, comparison,
@@ -273,6 +332,11 @@ def main(argv=None) -> int:
         "n_gate_rows": len(rows),
         "gate_boxes": sorted(gate_boxes),
         "passed": {a: bool(verdicts[a].get("passed", False)) for a in arms},
+        "offline_passed": {a: bool(verdicts[a].get("offline_passed",
+                                                   verdicts[a].get("passed", False)))
+                           for a in arms},
+        "actor_passed": {a: bool(verdicts[a].get("actor_passed", False))
+                         for a in arms},
         "failures": {a: verdicts[a].get("failures", []) for a in arms},
         "checks": {a: verdicts[a].get("checks", []) for a in arms},
         "per_arm_verdict": verdicts,

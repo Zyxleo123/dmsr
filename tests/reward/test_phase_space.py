@@ -138,4 +138,17 @@ def test_vel_norm_is_part_of_the_configuration():
 
 
 def test_arms_registry_is_what_the_scripts_iterate():
-    assert ARMS == ("a", "b")
+    """Three arms in the registry; only the flat two live in this module.
+
+    Arm C's features are a token GRID, so asking ``arm_features`` for it must
+    be an error that names the right module rather than a wrong-shaped array.
+    """
+    from cosmo_sr.reward.arms import ARMS as CANONICAL
+    from cosmo_sr.reward.phase_space import FLAT_ARMS
+
+    assert ARMS is CANONICAL
+    assert ARMS == ("a", "b", "c")
+    assert FLAT_ARMS == ("a", "b")
+    f = _field(24, 3)
+    with pytest.raises(ValueError, match="soft_rockstar"):
+        arm_features(f, "c")

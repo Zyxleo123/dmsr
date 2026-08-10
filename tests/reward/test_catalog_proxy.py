@@ -9,6 +9,7 @@ from cosmo_sr.reward.catalog import CatalogBins, ChunkSummary, pool
 from cosmo_sr.reward.catalog_proxy import (
     CatalogProxy, ProxyConfig, ProxyEnsemble, bin_weights_from_counts, count_loss,
     make_within_tile_pairs, pairwise_ranking_loss, spearman, split_indices_by_box,
+    tie_aware_agreement,
 )
 from cosmo_sr.reward.reward import fit_reward_model
 from cosmo_sr.reward.torch_reward import (
@@ -270,3 +271,53 @@ def test_spearman_basics():
     assert spearman([1, 2, 3], [10, 20, 30]) == pytest.approx(1.0)
     assert spearman([1, 2, 3], [30, 20, 10]) == pytest.approx(-1.0)
     assert np.isnan(spearman([1.0], [2.0]))
+
+
+def test_spearman_averages_tied_ranks():
+    """A tie must get the average rank, not an invented order from argsort."""
+    # Two identical rankings with a tie block correlate perfectly.
+    assert spearman([1, 1, 2, 2, 3], [1, 1, 2, 2, 3]) == pytest.approx(1.0)
+    # Against SciPy's definition on tied data (computed by hand here):
+    # a = [1, 2, 2, 3] -> avg ranks [0, 1.5, 1.5, 3]; b = [10, 5, 5, 1] reversed.
+    assert spearman([1, 2, 2, 3], [10, 5, 5, 1]) == pytest.approx(-1.0)
+    # The old double-argsort gave a spurious non-unit value for tied inputs; the
+    # averaged-rank form is exactly +/-1 when the tie structure matches.
+
+
+def test_spearman_is_nan_for_a_constant_input():
+    """A constant vector has no ranking, so the correlation is undefined, not 0.
+
+    The double-argsort implementation returned a finite number here, which let an
+    unrankable (all-equal) prediction score as 'no worse than chance'.
+    """
+    assert np.isnan(spearman([5.0, 5.0, 5.0, 5.0], [1.0, 2.0, 3.0, 4.0]))
+    assert np.isnan(spearman([1.0, 2.0, 3.0, 4.0], [7.0, 7.0, 7.0, 7.0]))
+
+
+def test_pairs_drop_exact_ties_even_at_zero_margin():
+    """min_margin=0 must still discard equal-target pairs.
+
+    ``abs(gap) < 0`` is never true, so at zero margin an exact tie used to slip
+    through and train the proxy to prefer one of two identical rewards at random.
+    """
+    box = ["a"] * 3
+    tile = [0] * 3
+    target = [1.0, 1.0, 2.0]          # the (1.0, 1.0) pair is an exact tie
+    pairs = make_within_tile_pairs(box, tile, target, max_pairs_per_group=100,
+                                   min_margin=0.0)
+    assert len(pairs) == 2            # only the two distinct pairs survive
+    for i, j in pairs:
+        assert target[i] != target[j]
+
+
+def test_tie_aware_agreement_scores_prediction_ties_as_half():
+    # True order descending, prediction a tie: the naive == would call this
+    # 'correct'. It is a coin flip, so it scores 0.5.
+    acc, n = tie_aware_agreement([1.0, 1.0], [2.0, 1.0])
+    assert n == 1 and acc == pytest.approx(0.5)
+    # A correct strict ordering scores 1, a wrong one 0.
+    assert tie_aware_agreement([2.0, 1.0], [2.0, 1.0]) == (1.0, 1)
+    assert tie_aware_agreement([1.0, 2.0], [2.0, 1.0]) == (0.0, 1)
+    # Equal-*true* pairs are not counted at all.
+    acc2, n2 = tie_aware_agreement([1.0, 2.0], [3.0, 3.0])
+    assert n2 == 0 and np.isnan(acc2)
