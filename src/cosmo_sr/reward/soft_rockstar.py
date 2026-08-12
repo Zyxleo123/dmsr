@@ -276,8 +276,12 @@ class SoftRockstarProxyConfig:
     embed_dim: int = 32
     pools: Tuple[str, ...] = ("mean", "max", "lse")
     dropout: float = 0.0
-    #: Same ``softplus(raw) * scale`` convention as :class:`ProxyConfig`.
+    #: Legacy ``softplus(raw) * scale`` scale, kept for absolute-count checkpoints.
     output_scale: Tuple[float, ...] = ()
+    #: Predict a signed frozen-relative log-count residual (see
+    #: :class:`cosmo_sr.reward.catalog_proxy.ProxyConfig`). False for a checkpoint
+    #: saved before this field existed.
+    residual_head: bool = True
 
     def __post_init__(self) -> None:
         bad = [p for p in self.pools if p not in POOLS]
@@ -304,6 +308,7 @@ class SoftRockstarProxyConfig:
             pools=tuple(str(p) for p in d.get("pools", ("mean", "max", "lse"))),
             dropout=float(d.get("dropout", 0.0)),
             output_scale=tuple(float(x) for x in d.get("output_scale", ())),
+            residual_head=bool(d.get("residual_head", False)),
         )
 
     @property
@@ -347,6 +352,7 @@ class SoftRockstarProxy(ProxyBase):
             nn.Linear(len(self.cfg.pools) * int(self.cfg.embed_dim),
                       self.cfg.n_outputs),
         )
+        self._zero_init_head(self.head[-1])
         self.seed = None if seed is None else int(seed)
 
         scale = list(self.cfg.output_scale) or [1.0] * self.cfg.n_outputs
@@ -383,16 +389,28 @@ class SoftRockstarProxy(ProxyBase):
         """
         x = torch.as_tensor(np.asarray(tokens, dtype=np.float64))
         flat = self._flat_channels(x).reshape(-1, self.n_features)
-        self.feat_mean = flat.mean(dim=0)
-        std = flat.std(dim=0, unbiased=False)
-        self.feat_std = torch.where(std < 1e-12, torch.ones_like(std), std)
+        # Keep registered buffers: assignment would leave them on CPU after
+        # ``model.to(cuda)`` and break the first training step.
+        mean = flat.mean(dim=0).to(device=self.feat_mean.device,
+                                   dtype=self.feat_mean.dtype)
+        std = flat.std(dim=0, unbiased=False).to(device=self.feat_std.device,
+                                                  dtype=self.feat_std.dtype)
+        self.feat_mean.copy_(mean)
+        self.feat_std.copy_(torch.where(std < 1e-12, torch.ones_like(std), std))
         return self
 
     # -- forward -------------------------------------------------------------- #
-    def forward(self, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """``{'n_sub': (B,J), 'n_host': (B,I), 'occ_numerator': (B,I)}``."""
-        x = self._flat_channels(tokens.to(self.feat_mean.dtype))
-        x = (x - self.feat_mean) / self.feat_std
+    def forward(self, tokens: torch.Tensor,
+                frozen: Optional["TorchSummary"] = None) -> Dict[str, torch.Tensor]:
+        """``{'n_sub': (B,J), 'n_host': (B,I), 'occ_numerator': (B,I)}``.
+
+        ``frozen`` is the measured frozen tile summary the residual head
+        reconstructs against; ignored by an absolute-count checkpoint.
+        """
+        x = self._flat_channels(tokens.to(device=self.feat_mean.device,
+                                          dtype=self.feat_mean.dtype))
+        x = ((x - self.feat_mean.to(device=x.device, dtype=x.dtype))
+             / self.feat_std.to(device=x.device, dtype=x.dtype))
         enc_dtype = next(self.encoder.parameters()).dtype
         h = self.encoder(x.to(enc_dtype))                       # (B, T, E)
         n_tok = float(h.shape[1])
@@ -408,4 +426,4 @@ class SoftRockstarProxy(ProxyBase):
                               - torch.log(torch.tensor(n_tok, dtype=h.dtype,
                                                        device=h.device)))
         raw = self.head(torch.cat(pooled, dim=-1))
-        return self._counts_from_raw(raw)
+        return self._counts_from_raw(raw, frozen)

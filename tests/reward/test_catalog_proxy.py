@@ -50,12 +50,53 @@ def test_extreme_inputs_stay_nonnegative_and_finite(proxy, cfg):
 
 
 def test_output_scale_sets_the_magnitude(cfg):
-    scale = [100.0] * cfg.n_outputs
-    a = CatalogProxy(cfg, seed=1)
-    b = CatalogProxy(ProxyConfig(**{**cfg.to_dict(), "output_scale": scale,
-                                    "hidden": tuple(cfg.hidden)}), seed=1)
-    x = torch.zeros(2, cfg.n_features, dtype=torch.float64)
+    # Absolute head: residual zero-init would make both models emit zeros and
+    # make this check vacuously true.
+    abs_cfg = ProxyConfig(**{**cfg.to_dict(), "residual_head": False,
+                             "hidden": tuple(cfg.hidden)})
+    scale = [100.0] * abs_cfg.n_outputs
+    a = CatalogProxy(abs_cfg, seed=1)
+    b = CatalogProxy(ProxyConfig(**{**abs_cfg.to_dict(), "output_scale": scale,
+                                    "hidden": tuple(abs_cfg.hidden)}), seed=1)
+    x = torch.zeros(2, abs_cfg.n_features, dtype=torch.float64)
     assert torch.allclose(b(x)["n_sub"], 100.0 * a(x)["n_sub"], rtol=1e-9)
+
+
+def test_ensemble_is_frozen_but_still_differentiable(cfg):
+    model, ens = _reward_model()
+    reward = TorchRewardModel.from_numpy(model)
+    proxies = ProxyEnsemble([CatalogProxy(cfg, seed=s) for s in range(3)]).freeze()
+    assert all(not p.requires_grad for p in proxies.parameters())
+    # Residual heads start at zero so dR would be feature-independent; break
+    # that so this test still covers the actor's "frozen params, live grads".
+    for m in proxies.members:
+        torch.nn.init.normal_(m.net[-1].weight, std=0.05)
+
+    box = summary_from_ensemble(ens)
+    frozen_tile = TorchSummary(
+        n_sub=box.n_sub * 0.02, n_host=box.n_host * 0.02,
+        occ_numerator=box.occ_numerator * 0.02, volume_mpc3=box.volume_mpc3)
+    feats = torch.zeros(1, cfg.n_features, dtype=torch.float64, requires_grad=True)
+
+    per_member = proxies.delta_rewards(reward, feats, box, frozen_tile)
+    assert per_member.shape == (3, 1)
+    q = ProxyEnsemble.q_safe(per_member, beta=1.0)["q_safe"]
+    q.sum().backward()
+    # Frozen parameters, live gradient: the configuration actor training needs.
+    assert feats.grad is not None
+    assert torch.isfinite(feats.grad).all()
+    assert float(feats.grad.abs().sum()) > 0.0
+    assert all(p.grad is None for p in proxies.parameters())
+
+
+def test_members_with_different_seeds_disagree(cfg):
+    # Absolute head: residual zero-init would make every seed emit the same
+    # frozen reconstruction and hide seed disagreement.
+    abs_cfg = ProxyConfig(**{**cfg.to_dict(), "residual_head": False,
+                             "hidden": tuple(cfg.hidden)})
+    a, b = CatalogProxy(abs_cfg, seed=0), CatalogProxy(abs_cfg, seed=1)
+    x = torch.randn(4, abs_cfg.n_features, dtype=torch.float64)
+    assert not torch.allclose(a(x)["n_sub"], b(x)["n_sub"])
 
 
 def test_standardizer_is_fit_and_travels_with_the_checkpoint(tmp_path, cfg):
@@ -214,29 +255,6 @@ def test_q_safe_beta_zero_is_the_plain_mean():
     assert torch.allclose(out["q_safe"], per_member.mean(dim=0))
 
 
-def test_ensemble_is_frozen_but_still_differentiable(cfg):
-    model, ens = _reward_model()
-    reward = TorchRewardModel.from_numpy(model)
-    proxies = ProxyEnsemble([CatalogProxy(cfg, seed=s) for s in range(3)]).freeze()
-    assert all(not p.requires_grad for p in proxies.parameters())
-
-    box = summary_from_ensemble(ens)
-    frozen_tile = TorchSummary(
-        n_sub=box.n_sub * 0.02, n_host=box.n_host * 0.02,
-        occ_numerator=box.occ_numerator * 0.02, volume_mpc3=box.volume_mpc3)
-    feats = torch.zeros(1, cfg.n_features, dtype=torch.float64, requires_grad=True)
-
-    per_member = proxies.delta_rewards(reward, feats, box, frozen_tile)
-    assert per_member.shape == (3, 1)
-    q = ProxyEnsemble.q_safe(per_member, beta=1.0)["q_safe"]
-    q.sum().backward()
-    # Frozen parameters, live gradient: the configuration actor training needs.
-    assert feats.grad is not None
-    assert torch.isfinite(feats.grad).all()
-    assert float(feats.grad.abs().sum()) > 0.0
-    assert all(p.grad is None for p in proxies.parameters())
-
-
 def test_delta_rewards_all_returns_every_reward(cfg):
     model, ens = _reward_model()
     reward = TorchRewardModel.from_numpy(model)
@@ -259,12 +277,6 @@ def test_ensemble_round_trip(tmp_path, cfg):
     x = torch.randn(2, cfg.n_features, dtype=torch.float64)
     for a, b in zip(proxies.members, back.members):
         assert torch.allclose(a(x)["n_sub"], b(x)["n_sub"])
-
-
-def test_members_with_different_seeds_disagree(cfg):
-    a, b = CatalogProxy(cfg, seed=0), CatalogProxy(cfg, seed=1)
-    x = torch.randn(4, cfg.n_features, dtype=torch.float64)
-    assert not torch.allclose(a(x)["n_sub"], b(x)["n_sub"])
 
 
 def test_spearman_basics():

@@ -161,8 +161,16 @@ proxy:
   # ~40x the loss while carrying the noisiest label of the set.
   bin_weight_cap: 8.0
   bin_weight_floor: 0.25
-  # Ranking pairs are formed ONLY within the same (box, tile_id).
+  # --- The three-part objective (see train_catalog_proxy.py) ----------------
+  # Every arm predicts a signed frozen-relative log-count residual and is trained
+  # under: a normalised Huber reward-change regression (primary -- direct
+  # supervision on the dR the actor is scored on), the pairwise ranking loss
+  # (primary), and a SMALL absolute-count calibration term. sigma_R (the dR
+  # normaliser) is a robust scale computed from the fit boxes only, inside the
+  # trainer.
+  reward_change_weight: 1.0
   ranking_weight: 1.0
+  count_calibration_weight: 0.1
   max_pairs_per_group: 32
   # Drop pairs whose true reward gap is below this: with a small edit most pairs
   # are ties and training on them is pure label noise.
@@ -170,31 +178,57 @@ proxy:
   # Row weighting. HR and frozen rows are 5 of the 8 candidates per box and are
   # the easy ones; without balancing they set the loss and the intervention
   # ladder -- the only rows that vary locally and monotonically -- is a rounding
-  # error in it. Weights are per SOURCE, normalised to mean 1, and multiplied by
-  # `changed_tile_weight` on tiles the intervention mask actually touched.
+  # error in it. Weights are per SOURCE, normalised to mean 1, and the tiles the
+  # raw field actually changed are up-weighted 3x WITHIN each source (then the
+  # source is renormalised, so the emphasis is purely intra-source).
   balance_sources: true
   changed_tile_weight: 3.0
-  # A tile counts as "changed" when the candidate's own feature difference from
-  # frozen is above this in absolute value, in units of that feature's training
-  # standard deviation. Measured on the features, not on the mask, so it means
-  # the same thing for actor candidates that have no mask at all.
-  changed_tile_threshold: 0.5
+  # A tile counts as "changed" from the arm-neutral `field_changed` flag stored
+  # per row: the max absolute difference over all SIX raw displacement/velocity
+  # channels, so a velocity-only edit (invisible to a density feature) is still
+  # detected. No feature-space threshold: the raw field is copied exactly outside
+  # an edit, so the flag is unambiguous.
+  # Pair weighting: box-bootstrap multiplicity x pair-type x (3x if either
+  # endpoint changed). The priority pairs (frozen vs each intervention, then
+  # adjacent alpha) are built before any random fill.
+  changed_pair_weight: 3.0
+  pair_weight_frozen_vs_intervention: 1.0
+  pair_weight_adjacent_alpha: 1.0
+  pair_weight_random: 1.0
   # Ensemble members are box-BOOTSTRAP samples, not just different seeds.
   # Re-initialising the same data five times measures optimisation noise; the
   # spread the actor's uncertainty penalty needs is the spread over which boxes
   # were seen, which is the real sampling variability.
   bootstrap_boxes: true
-  # Arm C's model class (SoftRockstarProxy). ONE fixed, predeclared
-  # configuration -- there is no hyperparameter sweep in this experiment (see
-  # proxy_cv below); a model class gets exactly one architecture, declared
-  # before any held-out number is seen. Everything shared (epochs, losses,
-  # weights, optimizer budget, bootstrap draws) comes from the keys above and
-  # is identical across the three arms.
-  arm_c:
+  # Spatial arms (C-F) train for a fixed, smaller epoch budget than the MLP: a
+  # convolution over 512 tokens or 32^3 cells is a far larger step than a
+  # two-layer MLP on 44 numbers. Predeclared before any held-out number is seen;
+  # no per-arm tuning and no held-out sweep.
+  spatial_epochs: 50
+  # Each spatial model class gets ONE fixed, predeclared architecture -- there is
+  # no hyperparameter sweep in this experiment (see proxy_cv below). Everything
+  # shared (losses, weights, optimizer budget, bootstrap draws) comes from the
+  # keys above and is identical across the six arms.
+  arm_c:                         # SoftRockstarProxy: DeepSets over the token grid
     token_hidden: [64, 64]
     embed_dim: 32
     # mean + max + logsumexp over tokens, concatenated.
     pools: [mean, max, lse]
+  arm_d:                         # SpatialTokenProxy: 3-D CNN over the SAME tokens
+    # 16 -> 32 -> 64 -> 64 with one downsampling stage (8^3 -> 4^3), then global
+    # mean+max pooling. Arm C's control: identical features, adjacency-aware model.
+    channels: [32, 64, 64]
+    strides: [1, 2, 1]
+  arm_e:                         # FullGridProxy: strided CNN over the 32^3 grid
+    # 10 -> 16 -> 32 -> 64, stride 2 each (32^3 -> 4^3), then mean+max pooling.
+    channels: [16, 32, 64]
+    strides: [2, 2, 2]
+  arm_f:                         # SR2DiscriminatorProxy: the SR2 critic body
+    # The exact SR2Critic trunk (width 64, depth 4) on the 20-channel critic
+    # input, with the scalar head replaced by the 16-output catalog head. Fresh
+    # weights -- no compatible SR2 discriminator checkpoint exists.
+    width: 64
+    depth: 4
 
 # --- Model selection (phase 5) ----------------------------------------------
 # There is NO hyperparameter sweep in this experiment. Each model class trains

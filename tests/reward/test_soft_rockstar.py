@@ -138,8 +138,16 @@ def test_proxy_round_trips_through_the_shared_serialization(tmp_path):
 
 
 def test_proxy_gradient_reaches_the_field_through_the_tokens():
-    """The actor path: field -> tokens -> proxy -> scalar, end to end."""
+    """The actor path: field -> tokens -> proxy -> scalar, end to end.
+
+    The residual head is zero-initialised, so an UNTRAINED proxy outputs a
+    constant (exactly frozen) and its input gradient is identically zero -- that
+    is the correct prior, not a bug. The actor path uses a *trained* proxy, so the
+    property that matters is that once the head is non-trivial the gradient
+    reaches the field; break the zero-init to stand in for training.
+    """
     m, _ = _small_proxy()
+    torch.nn.init.normal_(m.head[-1].weight, std=0.2)
     m.eval()
     cand = _field(24, 8).clone().requires_grad_(True)
     tok = soft_rockstar_paired_tokens(cand, _field(24, 9), None, None, SMALL)
@@ -150,7 +158,8 @@ def test_proxy_gradient_reaches_the_field_through_the_tokens():
 
 
 def test_arm_registry_declares_c_as_sidecar():
-    assert ARMS == ("a", "b", "c")
+    assert ARMS == ("a", "b", "c", "d", "e", "f")
     assert arm_storage("a") == arm_storage("b") == "inline"
-    assert arm_storage("c") == "sidecar"
-    assert sidecar_arms() == ("c",)
+    assert arm_storage("c") == arm_storage("d") == arm_storage("e") == "sidecar"
+    assert arm_storage("f") == "field"
+    assert sidecar_arms() == ("c", "d", "e")

@@ -147,7 +147,7 @@ def test_arms_registry_is_what_the_scripts_iterate():
     from cosmo_sr.reward.phase_space import FLAT_ARMS
 
     assert ARMS is CANONICAL
-    assert ARMS == ("a", "b", "c")
+    assert ARMS == ("a", "b", "c", "d", "e", "f")
     assert FLAT_ARMS == ("a", "b")
     f = _field(24, 3)
     with pytest.raises(ValueError, match="soft_rockstar"):

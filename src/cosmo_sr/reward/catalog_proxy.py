@@ -68,6 +68,7 @@ __all__ = [
     "make_within_tile_pairs",
     "pairwise_ranking_loss",
     "register_proxy",
+    "reward_change_loss",
     "spearman",
     "split_indices_by_box",
     "tie_aware_agreement",
@@ -95,10 +96,16 @@ class ProxyConfig:
     n_host_bins: int = 5
     hidden: Tuple[int, ...] = (128, 128)
     dropout: float = 0.0
-    #: Predicted counts are ``softplus(raw) * scale``; the scale is set from the
-    #: training set's mean counts so the network starts near the right magnitude
-    #: instead of spending its first thousand steps learning the units.
+    #: Legacy ``softplus(raw) * scale`` output scale, kept for loading absolute-
+    #: count checkpoints. New models use the residual head (see ``residual_head``)
+    #: and ignore it.
     output_scale: Tuple[float, ...] = ()
+    #: Predict signed frozen-relative log-count changes ``d = log1p(s) - log1p(s0)``
+    #: rather than absolute counts, and reconstruct ``s = expm1(log1p(s0) + d)``
+    #: from the measured frozen tile summary. True for every model trained by the
+    #: current code; a checkpoint saved before this field existed loads as False
+    #: (:func:`ProxyConfig.from_dict`) and keeps the old absolute-count head.
+    residual_head: bool = True
 
     def to_dict(self) -> Dict:
         d = asdict(self)
@@ -115,6 +122,9 @@ class ProxyConfig:
             hidden=tuple(int(h) for h in d.get("hidden", (128, 128))),
             dropout=float(d.get("dropout", 0.0)),
             output_scale=tuple(float(x) for x in d.get("output_scale", ())),
+            # Absent from a pre-residual blob -> that checkpoint predicts absolute
+            # counts, so it must load with the absolute head, not the residual one.
+            residual_head=bool(d.get("residual_head", False)),
         )
 
     @property
@@ -139,24 +149,77 @@ class ProxyBase(nn.Module):
     ``output_scale`` buffer of length ``n_outputs``, and a ``forward``.
     """
 
-    def _counts_from_raw(self, raw: torch.Tensor) -> Dict[str, torch.Tensor]:
+    #: Whether this model's head predicts a frozen-relative residual. Read from
+    #: the config so a checkpoint loaded with ``residual_head=False`` keeps the
+    #: absolute-count head it was trained with.
+    @property
+    def residual_head(self) -> bool:
+        return bool(getattr(self.cfg, "residual_head", False))
+
+    def _zero_init_head(self, final: nn.Linear) -> None:
+        """Zero the final residual layer so the initial prediction equals frozen.
+
+        A zero weight and bias make the initial residual ``d = 0`` for every
+        input, so ``s = expm1(log1p(s0) + 0) = s0`` exactly: the untrained proxy
+        predicts "no change from frozen", which is the correct prior and the
+        strongest count baseline (``zero_change``). Only meaningful for the
+        residual head; the absolute head keeps its default initialisation.
+        """
+        if self.residual_head:
+            nn.init.zeros_(final.weight)
+            if final.bias is not None:
+                nn.init.zeros_(final.bias)
+
+    def _frozen_log(self, frozen: Optional[TorchSummary],
+                    ref: torch.Tensor) -> torch.Tensor:
+        """``log1p`` of the frozen tile's counts, concatenated in block order.
+
+        ``ref`` supplies dtype/device and the batch shape when ``frozen`` is
+        absent -- a residual head called without a reference reconstructs against
+        an all-zero frozen tile (``s = expm1(d)``), which is the right thing for a
+        standalone forward pass and never happens on the reward path, where the
+        measured frozen summary is always passed in.
+        """
+        j, i = int(self.cfg.n_sub_bins), int(self.cfg.n_host_bins)
+        if frozen is None:
+            return torch.zeros(ref.shape[0], j + 2 * i,
+                               dtype=torch.float64, device=ref.device)
+        return torch.cat([
+            torch.log1p(frozen.n_sub.clamp_min(0.0).to(torch.float64)),
+            torch.log1p(frozen.n_host.clamp_min(0.0).to(torch.float64)),
+            torch.log1p(frozen.occ_numerator.clamp_min(0.0).to(torch.float64)),
+        ], dim=1)
+
+    def _counts_from_raw(self, raw: torch.Tensor,
+                         frozen: Optional[TorchSummary] = None) -> Dict[str, torch.Tensor]:
         """Split raw head outputs into the three count blocks, nonnegative.
 
-        Nonnegativity through ``softplus`` rather than a clamp: a clamp has zero
-        gradient on the wrong side, so a member that starts with a bin pushed
-        negative can never recover it, and the ensemble spread then reports
-        confidence about a bin one member has silently stopped modelling.
+        Residual head (the default): the raw outputs are a *signed* log-count
+        residual ``d``, and the counts are ``expm1(log1p(s0) + d)`` floored at
+        zero, with ``s0`` the measured frozen tile summary. Signed on purpose --
+        an edit can lower a bin as well as raise it -- so there is no ``softplus``
+        here; the floor is on the reconstructed count, where a negative would make
+        the occupation denominator nonsense.
+
+        Absolute head (loaded from a pre-residual checkpoint): the historical
+        ``softplus(raw) * scale``. Nonnegativity through ``softplus`` rather than a
+        clamp so a bin pushed negative can still recover its gradient.
         """
-        counts = F.softplus(raw.to(torch.float64)) * self.output_scale
         j, i = int(self.cfg.n_sub_bins), int(self.cfg.n_host_bins)
+        if self.residual_head:
+            counts = torch.expm1(self._frozen_log(frozen, raw)
+                                 + raw.to(torch.float64)).clamp_min(0.0)
+        else:
+            counts = F.softplus(raw.to(torch.float64)) * self.output_scale
         return {
             "n_sub": counts[:, :j],
             "n_host": counts[:, j:j + i],
             "occ_numerator": counts[:, j + i:j + 2 * i],
         }
 
-    def summary(self, features: torch.Tensor, volume_mpc3: torch.Tensor) -> TorchSummary:
-        out = self.forward(features)
+    def summary(self, features: torch.Tensor, volume_mpc3: torch.Tensor,
+                frozen: Optional[TorchSummary] = None) -> TorchSummary:
+        out = self.forward(features, frozen=frozen)
         return TorchSummary(
             n_sub=out["n_sub"], n_host=out["n_host"],
             occ_numerator=out["occ_numerator"],
@@ -188,11 +251,12 @@ def load_proxy(path: str | Path, map_location="cpu") -> ProxyBase:
     blob = torch.load(str(path), map_location=map_location, weights_only=False)
     name = str(blob.get("class", "CatalogProxy"))
     if name not in PROXY_CLASSES:
-        # Registration happens on import, and arm C lives in a module nothing
-        # here imports (it would be a cycle: it imports this one). Import it on
-        # demand rather than making every caller remember to.
+        # Registration happens on import, and the spatial arms live in modules
+        # nothing here imports (it would be a cycle: they import this one). Import
+        # them on demand rather than making every caller remember to. Arm C is in
+        # soft_rockstar; arms D/E/F are in spatial_proxy.
         try:
-            from . import soft_rockstar  # noqa: F401
+            from . import soft_rockstar, spatial_proxy  # noqa: F401
         except Exception as exc:                     # pragma: no cover - defensive
             raise KeyError(
                 f"checkpoint {path} names proxy class {name!r}, which is not "
@@ -232,6 +296,7 @@ class CatalogProxy(ProxyBase):
                 layers.append(nn.Dropout(float(self.cfg.dropout)))
         layers.append(nn.Linear(dims[-1], self.cfg.n_outputs))
         self.net = nn.Sequential(*layers)
+        self._zero_init_head(self.net[-1])
         self.seed = None if seed is None else int(seed)
 
         scale = list(self.cfg.output_scale) or [1.0] * self.cfg.n_outputs
@@ -259,20 +324,31 @@ class CatalogProxy(ProxyBase):
             raise ValueError(
                 f"expected (n, {self.cfg.n_features}) features, got {tuple(x.shape)}"
             )
-        self.feat_mean = x.mean(dim=0)
-        std = x.std(dim=0, unbiased=False)
-        self.feat_std = torch.where(std < 1e-12, torch.ones_like(std), std)
+        # ``copy_`` into the registered buffers -- a plain assignment would
+        # replace them with non-buffer CPU tensors that ``.to(device)`` never
+        # moves, which is what broke CUDA training.
+        mean = x.mean(dim=0).to(device=self.feat_mean.device, dtype=self.feat_mean.dtype)
+        std = x.std(dim=0, unbiased=False).to(device=self.feat_std.device,
+                                               dtype=self.feat_std.dtype)
+        self.feat_mean.copy_(mean)
+        self.feat_std.copy_(torch.where(std < 1e-12, torch.ones_like(std), std))
         return self
 
     def _standardize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.feat_mean.to(x.dtype)) / self.feat_std.to(x.dtype)
+        return ((x - self.feat_mean.to(device=x.device, dtype=x.dtype))
+                / self.feat_std.to(device=x.device, dtype=x.dtype))
 
     # -- forward ----------------------------------------------------------- #
-    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """``{'n_sub': (B,J), 'n_host': (B,I), 'occ_numerator': (B,I)}``."""
+    def forward(self, features: torch.Tensor,
+                frozen: Optional[TorchSummary] = None) -> Dict[str, torch.Tensor]:
+        """``{'n_sub': (B,J), 'n_host': (B,I), 'occ_numerator': (B,I)}``.
+
+        ``frozen`` is the measured frozen tile summary the residual head
+        reconstructs against; it is ignored by an absolute-count checkpoint.
+        """
         x = self._standardize(features.to(self.feat_mean.dtype))
         raw = self.net(x.to(next(self.net.parameters()).dtype))
-        return self._counts_from_raw(raw)
+        return self._counts_from_raw(raw, frozen)
 
     # -- persistence ------------------------------------------------------- #
     @staticmethod
@@ -319,9 +395,9 @@ class ProxyEnsemble(nn.Module):
             p.requires_grad_(False)
         return self
 
-    def summaries(self, features: torch.Tensor,
-                  volume_mpc3: torch.Tensor) -> List[TorchSummary]:
-        return [m.summary(features, volume_mpc3) for m in self.members]
+    def summaries(self, features: torch.Tensor, volume_mpc3: torch.Tensor,
+                  frozen: Optional[TorchSummary] = None) -> List[TorchSummary]:
+        return [m.summary(features, volume_mpc3, frozen) for m in self.members]
 
     def delta_rewards_all(
         self,
@@ -341,7 +417,7 @@ class ProxyEnsemble(nn.Module):
         """
         rows: Dict[str, List[torch.Tensor]] = {}
         for m in self.members:
-            pred = m.summary(features, box.volume_mpc3)
+            pred = m.summary(features, box.volume_mpc3, frozen_tile)
             d = reward.delta_reward_swap(box, frozen_tile, pred,
                                          w_joint=w_joint, w_occ=w_occ)
             for k, v in d.items():
@@ -491,63 +567,112 @@ def count_loss(
     return parts
 
 
+#: Pair-kind codes returned alongside the pairs. The two priority kinds carry the
+#: cleanest local signal -- a frozen tile against the edit that changed it, and
+#: two adjacent edit strengths -- and are constructed before any random fill.
+PAIR_FROZEN_VS_INTERVENTION = 0
+PAIR_ADJACENT_ALPHA = 1
+PAIR_RANDOM = 2
+
+
 def make_within_tile_pairs(
     box: Sequence[str],
     tile_id: Sequence[int],
     target: Sequence[float],
     *,
+    source: Optional[Sequence[str]] = None,
+    alpha: Optional[Sequence[float]] = None,
+    mode: Optional[Sequence[str]] = None,
     max_pairs_per_group: int = 32,
     min_margin: float = 0.0,
     rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
+    return_kinds: bool = False,
+):
     """``(P, 2)`` index pairs, ``pair[:, 0]`` the **better** (higher-reward) row.
 
     Grouping is by ``(box, unit)`` and nothing else, where ``tile_id`` carries
     the **supervision unit** -- a tile id at ``region_width = 1`` (the deployed
     configuration, where ``region_id == tile_id`` exactly) and a region id at any
-    coarser width. The argument keeps its historical name because every existing
-    caller passes tile ids and the width-1 case is the identity; what matters is
-    that the *same* array is used to group the training pairs and to group the
-    evaluation metrics, which is why both come from one helper
-    (``_proxy_data.unit_ids_of``) rather than being derived twice.
+    coarser width. The same array groups the training pairs and the evaluation
+    metrics (both from ``_proxy_data.unit_ids_of``), so the proxy is scored on the
+    comparison it was trained on. Pairing across units would let it score well by
+    learning which tiles are host-rich -- true, useless, not something the actor
+    can act on.
 
-    Pairing across units would let the proxy score well by learning which tiles
-    are host-rich -- true, useless, and not something the actor can act on. Pairs
-    whose true reward gap is below ``min_margin`` are dropped as ties: with a
-    small edit most pairs carry no signal and training on them is pure label
-    noise.
+    Pairs are built **deterministically by priority** within each group when the
+    ``source``/``alpha``/``mode`` metadata is supplied: first the frozen tile
+    against every intervention, then adjacent-``alpha`` pairs within each channel
+    mode, and only then a random fill up to the ``max_pairs_per_group`` budget.
+    The priority pairs are the ones whose reward gap is a real local edit rather
+    than an accident of which two candidates happened to be drawn, so they must
+    not be crowded out of the budget by random pairs. Ties (gap ``0`` or below
+    ``min_margin``) are dropped unconditionally -- their RankNet target is
+    undefined and training on them is pure label noise.
+
+    With ``return_kinds`` the per-pair kind code is returned too, so the caller
+    can weight priority pairs differently from random ones.
     """
     rng = rng or np.random.default_rng(0)
     t = np.asarray(target, dtype=np.float64)
+    src = None if source is None else np.asarray([str(s) for s in source])
+    al = None if alpha is None else np.asarray(alpha, dtype=np.float64)
+    md = None if mode is None else np.asarray([str(m) for m in mode])
     groups: Dict[Tuple[str, int], List[int]] = {}
     for i, (b, j) in enumerate(zip(box, tile_id)):
         groups.setdefault((str(b), int(j)), []).append(i)
 
     pairs: List[Tuple[int, int]] = []
+    kinds: List[int] = []
+    budget = int(max_pairs_per_group)
     for key in sorted(groups):
         idx = np.asarray(groups[key])
         if idx.size < 2:
             continue
+        used: set = set()
+
+        def add(a: int, b: int, kind: int) -> None:
+            a, b = int(a), int(b)
+            if a == b or len(used) >= budget:
+                return
+            k = (a, b) if a < b else (b, a)
+            if k in used or not (np.isfinite(t[a]) and np.isfinite(t[b])):
+                return
+            gap = abs(t[a] - t[b])
+            if gap == 0.0 or gap < float(min_margin):
+                return
+            used.add(k)
+            better, worse = (a, b) if t[a] > t[b] else (b, a)
+            pairs.append((better, worse))
+            kinds.append(kind)
+
+        # 1. Priority pairs -- frozen vs each intervention, then adjacent alpha.
+        if src is not None:
+            frozen_rows = [int(i) for i in idx if src[i] == "frozen"]
+            interv = [int(i) for i in idx if src[i] == "intervention"]
+            for f in frozen_rows:
+                for iv in interv:
+                    add(f, iv, PAIR_FROZEN_VS_INTERVENTION)
+            if al is not None and md is not None:
+                by_mode: Dict[str, List[int]] = {}
+                for iv in interv:
+                    by_mode.setdefault(str(md[iv]), []).append(iv)
+                for ivs in by_mode.values():
+                    ordered = sorted(ivs, key=lambda i: al[i])
+                    for a, b in zip(ordered[:-1], ordered[1:]):
+                        add(a, b, PAIR_ADJACENT_ALPHA)
+
+        # 2. Random fill of whatever budget remains.
         cand = [(a, b) for m, a in enumerate(idx) for b in idx[m + 1:]]
         rng.shuffle(cand)
-        kept = 0
         for a, b in cand:
-            if not (np.isfinite(t[a]) and np.isfinite(t[b])):
-                continue
-            gap = abs(t[a] - t[b])
-            # An equal-target pair carries no ranking signal and its RankNet
-            # target is undefined (which of two equal rewards is "better"?), so
-            # it is dropped *unconditionally* -- including at ``min_margin == 0``,
-            # where ``gap < 0`` is never true and an exact tie would otherwise
-            # slip through and train the proxy to prefer one of two identical
-            # rewards at random.
-            if gap == 0.0 or gap < float(min_margin):
-                continue
-            pairs.append((int(a), int(b)) if t[a] > t[b] else (int(b), int(a)))
-            kept += 1
-            if kept >= int(max_pairs_per_group):
+            if len(used) >= budget:
                 break
-    return np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+            add(int(a), int(b), PAIR_RANDOM)
+
+    out = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    if return_kinds:
+        return out, np.asarray(kinds, dtype=np.int64)
+    return out
 
 
 def split_indices_by_box(
@@ -605,6 +730,33 @@ def pairwise_ranking_loss(better: torch.Tensor, worse: torch.Tensor,
         raise ValueError(
             f"weights has {w.shape[0]} entries, expected {per_pair.shape[0]}")
     return (per_pair * w).sum() / w.sum().clamp_min(1e-12)
+
+
+def reward_change_loss(
+    predicted_dr: torch.Tensor, true_dr: torch.Tensor, sigma_r: float, *,
+    weights: Optional[torch.Tensor] = None, huber_delta: float = 1.0,
+) -> torch.Tensor:
+    """Huber on the **normalised** reward-change residual ``(dR_hat - dR) / sigma_R``.
+
+    A direct supervision on the quantity the actor is scored on, complementing the
+    ranking loss (which fixes only the *order*): two proxies can rank a unit's
+    candidates identically while disagreeing wildly on the *size* of ``dR``, and
+    the actor's lower-confidence bound is a magnitude, not a rank. ``sigma_R`` is a
+    robust scale of the true ``dR`` computed on the fit boxes only
+    (``_proxy_data.robust_scale``), so the residual is O(1) and the Huber
+    transition sits at a sensible place regardless of the reward's units. Rows
+    whose ``dR`` is undefined (no frozen reference) come in as NaN and are dropped.
+    """
+    z = (predicted_dr - true_dr) / float(max(sigma_r, 1e-12))
+    ok = torch.isfinite(z)
+    if not bool(ok.any()):
+        return predicted_dr.sum() * 0.0
+    per = F.huber_loss(z[ok], torch.zeros_like(z[ok]), delta=float(huber_delta),
+                       reduction="none")
+    if weights is None:
+        return per.mean()
+    w = weights.to(per.dtype).to(per.device).reshape(-1)[ok]
+    return (per * w).sum() / w.sum().clamp_min(1e-12)
 
 
 def _average_ranks(x: np.ndarray) -> np.ndarray:

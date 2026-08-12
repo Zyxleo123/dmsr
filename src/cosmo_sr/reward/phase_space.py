@@ -105,6 +105,9 @@ __all__ = [
     "deposit_phase_space",
     "phase_space_feature_names",
     "phase_space_features",
+    "phase_space_grid",
+    "phase_space_grid_channel_names",
+    "phase_space_paired_grid",
     "validate_phase_space_features",
 ]
 
@@ -334,6 +337,81 @@ def phase_space_features(
 
     return torch.stack(
         [vdisp_c, vdisp_e, ke_contrast, infall, corr, kb, *coh], dim=1)
+
+
+# --------------------------------------------------------------------------- #
+# The dense Eulerian phase-space grid (arm E)
+# --------------------------------------------------------------------------- #
+def phase_space_grid_channel_names() -> List[str]:
+    """The five channels of :func:`phase_space_grid`, in order."""
+    return ["log_density", "dv_x", "dv_y", "dv_z", "vdisp"]
+
+
+def phase_space_grid(
+    disp: torch.Tensor,
+    vel: torch.Tensor,
+    cfg: Optional[SoftStructureConfig] = None,
+    ps: Optional[PhaseSpaceConfig] = None,
+) -> torch.Tensor:
+    """``(B, 5, R, R, R)`` dense phase-space cells of a crop -- arm E's input.
+
+    NOT summarised: every valid-centre cell is kept. The five channels, all
+    dimensionless and O(1) so the arm's standardiser starts from a well-scaled
+    input, are
+
+    1. ``log(1 + delta)`` -- the cell's log density from the shared CIC deposit;
+    2-4. the three components of the **bulk-subtracted** mean velocity in units
+       of ``v_ref``. The crop's own mass-weighted bulk flow is a large-scale mode
+       -- identical in candidate and frozen and not something fine-tuning can move
+       -- so it is removed exactly as arm B removes it, leaving the internal
+       velocity structure the catalog actually depends on;
+    5. the intra-cell velocity dispersion ``sqrt(sigma^2)`` in units of
+       ``v_ref``, straight from the deposit (already bulk-free).
+
+    Differentiable in the field, and computed from the SAME
+    :func:`deposit_phase_space` pass as arms B and C so the arms cannot disagree
+    about which particles landed in which cell.
+    """
+    cfg = cfg or SoftStructureConfig()
+    ps = ps or PhaseSpaceConfig()
+    if disp.dim() != 5 or disp.shape[1] != 3:
+        raise ValueError(f"expected disp (B, 3, N, N, N), got {tuple(disp.shape)}")
+    m, vbar, sigma2 = deposit_phase_space(disp, vel, cfg, ps)
+    vref = float(ps.v_ref_km_s)
+
+    total = m.sum(dim=(1, 2, 3, 4)).clamp_min(1e-12)
+    v0 = (m * vbar).sum(dim=(2, 3, 4)) / total.unsqueeze(1)             # (B,3)
+    dv = (vbar - v0.view(-1, 3, 1, 1, 1)) / vref                        # (B,3,R,R,R)
+
+    log_dens = torch.log(m.clamp_min(1e-6))                            # (B,1,R,R,R)
+    # A per-cell sqrt is not pooled first the way arm C's is, so the many empty
+    # cells sit at sigma^2 = 0 exactly, where d/dx sqrt(x) is infinite and the
+    # actor's field gradient would come back NaN. The epsilon (1e-8 (km/s)^2,
+    # i.e. a 1e-4 km/s floor -- ~3e-7 in v_ref units) bounds the gradient without
+    # moving the feature: it only ever matters where there is nothing to measure.
+    vdisp = (sigma2.clamp_min(0.0) + 1e-8).sqrt() / vref               # (B,1,R,R,R)
+    return torch.cat([log_dens, dv, vdisp], dim=1)
+
+
+def phase_space_paired_grid(
+    candidate: torch.Tensor,
+    frozen: torch.Tensor,
+    cfg: Optional[SoftStructureConfig] = None,
+    ps: Optional[PhaseSpaceConfig] = None,
+) -> torch.Tensor:
+    """``(B, 2, 5, R, R, R)``: candidate grid and candidate-minus-frozen grid.
+
+    Same slot convention as :func:`arm_paired_features` and
+    :func:`cosmo_sr.reward.soft_rockstar.soft_rockstar_paired_tokens`: the first
+    block is the candidate, the second the candidate minus the frozen reference.
+    The frozen branch is detached -- a gradient through the reference would let
+    the optimiser shrink the difference by moving a baseline whose weights never
+    change. ``candidate`` and ``frozen`` are both ``(B, 6, N, N, N)`` fields.
+    """
+    cand = phase_space_grid(candidate[:, 0:3], candidate[:, 3:6], cfg, ps)
+    with torch.no_grad():
+        base = phase_space_grid(frozen[:, 0:3], frozen[:, 3:6], cfg, ps)
+    return torch.stack([cand, cand - base.detach()], dim=1)
 
 
 # --------------------------------------------------------------------------- #

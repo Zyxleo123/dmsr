@@ -51,8 +51,8 @@ import numpy as np
 import torch
 
 from _proxy_data import (  # noqa: E402
-    ARMS, as_arrays, build_row_context, ensemble_delta, load_rows, rank_metrics,
-    slice_rows, true_delta_rewards, unit_ids_of,
+    ARMS, as_arrays, build_row_context, load_rows, make_arm_features, rank_metrics,
+    slice_rows, stream_ensemble_delta, true_delta_rewards, unit_ids_of,
 )
 from _sr2_direct import (  # noqa: E402
     actor_config_of, add_direct_args, banner, boxes_of, code_commit, direct_root,
@@ -176,7 +176,7 @@ def _decide(verdicts: Dict[str, Dict], comparison: Dict,
 
     # Preference among the advanced arms: simplest first, displaced only by a
     # distinguishable win.
-    order = [a for a in ("a", "b", "c") if a in advance]
+    order = [a for a in ARMS if a in advance]
     preferred = order[0]
     for rival in order[1:]:
         key = f"{rival}-{preferred}" if rival > preferred else f"{preferred}-{rival}"
@@ -189,7 +189,7 @@ def _decide(verdicts: Dict[str, Dict], comparison: Dict,
 
     vel = vel_comparison.get("pairwise", {})
     notes = []
-    for rich, base in (("b", "a"), ("c", "a")):
+    for rich, base in [(r, "a") for r in ("b", "c", "d", "e", "f")]:
         if rich in advance:
             v = vel.get(f"{rich}-{base}", {}).get("verdict", "")
             if v == "second_better":
@@ -228,6 +228,7 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     add_direct_args(ap)
     ap.add_argument("--arms", nargs="*", default=list(ARMS))
+    ap.add_argument("--device", default="cuda")
     ap.add_argument("--n-bootstrap", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true",
@@ -272,10 +273,15 @@ def main(argv=None) -> int:
         return 0
 
     w_joint, w_occ = float(acfg.w_joint_reward), float(acfg.w_occ_reward)
-    ctx = build_row_context(rows)
-    true = true_delta_rewards(ctx, reward_t, w_joint=w_joint, w_occ=w_occ)
+    device = torch.device(args.device if (args.device != "cuda"
+                                          or torch.cuda.is_available()) else "cpu")
+    ctx_cpu = build_row_context(rows)
+    true = true_delta_rewards(ctx_cpu, reward_t, w_joint=w_joint, w_occ=w_occ)
+    reward_t = reward_t.to(device)
+    ctx = ctx_cpu.to(device)
     common = as_arrays(rows, "a")
     unit = unit_ids_of(common["tile_id"], width=region_width_of(cfg))
+    chunk = {"a": len(rows), "b": len(rows), "c": 4096, "d": 4096, "e": 512, "f": 48}
     preds: Dict[str, np.ndarray] = {}
     for arm in arms:
         d = run / f"proxy_{arm}"
@@ -283,10 +289,11 @@ def main(argv=None) -> int:
             print(f">>> MISSING INPUT: {d}")
             return 0
         ens = ProxyEnsemble.load(d).freeze()
-        feats = torch.as_tensor(as_arrays(rows, arm, table_dir=table.parent)["features"],
-                                dtype=torch.float64)
-        preds[arm], _ = ensemble_delta(ens.members, feats, ctx, reward_t,
-                                       w_joint=w_joint, w_occ=w_occ)
+        provider = make_arm_features(arm, rows, table_dir=table.parent, cfg=cfg)
+        members = [m.to(device) for m in ens.members]
+        preds[arm], _ = stream_ensemble_delta(
+            provider, members, ctx, reward_t, w_joint=w_joint, w_occ=w_occ,
+            chunk_rows=chunk.get(arm, 512), device=device)
 
     comparison = box_bootstrap(preds, true, common["box"], unit,
                                n=int(args.n_bootstrap), seed=int(args.seed))

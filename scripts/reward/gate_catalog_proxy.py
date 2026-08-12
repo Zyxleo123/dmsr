@@ -58,9 +58,10 @@ import torch
 
 from _proxy_baselines import load_baselines  # noqa: E402
 from _proxy_data import (  # noqa: E402
-    ARMS, COUNT_KEYS, as_arrays, build_row_context, ensemble_delta, load_rows,
-    pooled_count_error, rank_metrics, slice_rows, true_delta_rewards,
-    unit_ids_of,
+    ARMS, COUNT_KEYS, as_arrays, build_row_context, channel_mean_transform,
+    load_rows, make_arm_features, pooled_count_error,
+    pooled_count_error_by_candidate, rank_metrics, slice_rows,
+    stream_ensemble_delta, stream_pred_counts, true_delta_rewards, unit_ids_of,
 )
 from _sr2_direct import (  # noqa: E402
     actor_config_of, add_direct_args, banner, boxes_of, direct_root,
@@ -148,41 +149,41 @@ def uncertainty_calibration(mean: np.ndarray, std: np.ndarray,
     }
 
 
-def feature_ablation(members, features: np.ndarray, ctx, reward_t, arrays,
-                     true: np.ndarray, unit: np.ndarray, *, w_joint: float,
-                     w_occ: float, names: Sequence[str]) -> Dict[str, object]:
+def feature_ablation(provider, members, ctx, reward_t, arrays, true: np.ndarray,
+                     unit: np.ndarray, *, w_joint: float, w_occ: float,
+                     names: Sequence[str], storage: str, n_channels: int,
+                     device, chunk_rows: int, abl_rows: Optional[np.ndarray] = None
+                     ) -> Dict[str, object]:
     """Leave-one-feature-out: is any single coordinate doing all the work?
 
-    Each feature in turn is replaced by its own mean and the within-unit
-    Spearman recomputed. ``single_feature_dependence = 1 - min retention`` is
-    how much the most important single coordinate is worth: near 0 means the
-    vector is genuinely a vector, near 1 means the "proxy" is one number wearing
-    a vector's name.
+    Each input channel in turn is replaced by its own mean and the within-unit
+    Spearman recomputed. ``single_feature_dependence = 1 - min retention`` is how
+    much the most important single coordinate is worth: near 0 means the vector is
+    genuinely a vector, near 1 means the "proxy" is one number wearing a vector's
+    name. The unit of "one feature" per storage is defined in
+    :func:`_proxy_data.channel_mean_transform`.
 
-    For the token arm (``(n, 2, T, F)`` features) the unit of ablation is a
-    token CHANNEL -- candidate or difference slot of one token feature --
-    replaced by its mean over all rows *and all tokens*. Ablating a single
-    token would be meaningless (the model is permutation-invariant, and 512
-    tokens each carry ~nothing); the channel is the analogue of a coordinate.
+    Streamed, so it works for the dense arm E (10 channels) and the field arm F
+    (20 channels) without materialising their input. Evaluated on ``abl_rows`` (a
+    row subsample for the spatial arms) to bound cost: the dependence is a
+    robustness check, not a precise metric, and a few thousand rows estimate it.
     """
-    def _within(x: np.ndarray) -> float:
-        return rank_metrics(
-            ensemble_delta(members, torch.as_tensor(x, dtype=torch.float64),
-                           ctx, reward_t, w_joint=w_joint, w_occ=w_occ)[0],
-            true, arrays["box"], unit)["within_tile_spearman"]
+    box = arrays["box"]
+    idxs = (np.arange(len(provider)) if abl_rows is None
+            else np.asarray(abl_rows, dtype=np.int64))
 
-    base = _within(features)
-    flat = features.ndim == 2
-    n_channels = features.shape[1] if flat else 2 * features.shape[3]
+    def _within(transform=None) -> float:
+        mean, _ = stream_ensemble_delta(
+            provider, members, ctx, reward_t, w_joint=w_joint, w_occ=w_occ,
+            chunk_rows=chunk_rows, device=device, rows=idxs, transform=transform)
+        return rank_metrics(mean[idxs], true[idxs], box[idxs],
+                            unit[idxs])["within_tile_spearman"]
+
+    base = _within()
     retentions, per_feature = [], {}
-    for j in range(n_channels):
-        x = features.copy()
-        if flat:
-            x[:, j] = features[:, j].mean()
-        else:
-            slot, f = divmod(j, features.shape[3])
-            x[:, slot, :, f] = features[:, slot, :, f].mean()
-        s = _within(x)
+    for j in range(int(n_channels)):
+        tf = channel_mean_transform(provider, j, storage, rows=idxs, device=device)
+        s = _within(tf)
         r = float(s / base) if np.isfinite(base) and abs(base) > 1e-9 else float("nan")
         retentions.append(r)
         per_feature[str(names[j]) if j < len(names) else f"f{j}"] = r
@@ -197,6 +198,7 @@ def feature_ablation(members, features: np.ndarray, ctx, reward_t, arrays,
                                    else ""),
         "single_feature_dependence": (float(1.0 - min(finite)) if finite
                                       else float("nan")),
+        "n_ablation_rows": int(idxs.size),
     }
 
 
@@ -279,6 +281,9 @@ def main(argv=None) -> int:
     ap.add_argument("--table", default="")
     ap.add_argument("--arm", default="a", choices=list(ARMS))
     ap.add_argument("--proxy-dir", default="")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--ablation-max-rows", type=int, default=3000,
+                    help="row subsample for the spatial arms' feature ablation")
     ap.add_argument("--allow-incomplete", action="store_true")
     args = ap.parse_args(argv)
 
@@ -315,17 +320,37 @@ def main(argv=None) -> int:
                                   "reason": "no held-out rows"})
         return 0
 
-    arrays = as_arrays(rows, arm, table_dir=table.parent)
-    ctx = build_row_context(rows)
+    # Metadata is arm-independent; the per-arm features come from the streaming
+    # provider (arm E is ~80 GB float64 on the gate boxes, arm F has no cache).
+    arrays = as_arrays(rows, "a", table_dir=table.parent)
+    storage = arm_storage(arm)
     w_joint, w_occ = float(acfg.w_joint_reward), float(acfg.w_occ_reward)
-    true = true_delta_rewards(ctx, reward_t, w_joint=w_joint, w_occ=w_occ)
+    device = torch.device(args.device if (args.device != "cuda"
+                                          or torch.cuda.is_available()) else "cpu")
     unit = unit_ids_of(arrays["tile_id"], width=width)
-    feats = torch.as_tensor(arrays["features"], dtype=torch.float64)
-    n_channels = (int(arrays["features"].shape[1])
-                  if arrays["features"].ndim == 2
-                  else 2 * int(arrays["features"].shape[3]))
-    mean, std = ensemble_delta(ens.members, feats, ctx, reward_t,
-                               w_joint=w_joint, w_occ=w_occ)
+
+    # The true dR is a fixed numpy quantity -- compute it on CPU before the reward
+    # model is moved to the device the streaming eval runs on.
+    ctx_cpu = build_row_context(rows)
+    true = true_delta_rewards(ctx_cpu, reward_t, w_joint=w_joint, w_occ=w_occ)
+    reward_t = reward_t.to(device)
+    ctx = ctx_cpu.to(device)
+    members = [m.to(device) for m in ens.members]
+
+    provider = make_arm_features(arm, rows, table_dir=table.parent, cfg=cfg)
+    shape = provider.per_row_shape
+    if storage == "inline" or storage == "field":
+        n_channels = int(shape[0])
+    elif len(shape) == 3:                       # tokens (2, T, F)
+        n_channels = 2 * int(shape[-1])
+    else:                                       # grid (2, C, D, D, D)
+        n_channels = 2 * int(shape[1])
+    chunk = {"a": len(rows), "b": len(rows), "c": 4096, "d": 4096,
+             "e": 512, "f": 48}[arm]
+
+    mean, std = stream_ensemble_delta(provider, members, ctx, reward_t,
+                                      w_joint=w_joint, w_occ=w_occ,
+                                      chunk_rows=chunk, device=device)
 
     rank = rank_metrics(mean, true, arrays["box"], unit)
     sel = selection_enrichment(mean, true)
@@ -336,25 +361,24 @@ def main(argv=None) -> int:
     npz_names = proxy_dir / "feature_names.json"
     if npz_names.is_file():
         names = list(json.loads(npz_names.read_text()))
-    if len(names) != n_channels:
-        from _sr2_direct import (phase_space_config_of, soft_config_of,
-                                 soft_rockstar_config_of)
-        if arm_storage(arm) == "inline":
-            from cosmo_sr.reward.phase_space import arm_paired_feature_names
-            names = arm_paired_feature_names(arm, soft_config_of(cfg),
-                                             phase_space_config_of(cfg))
-        else:
-            from cosmo_sr.reward.soft_rockstar import paired_token_feature_names
-            names = paired_token_feature_names(soft_rockstar_config_of(cfg))
-    abl = feature_ablation(ens.members, arrays["features"], ctx, reward_t, arrays,
-                           true, unit, w_joint=w_joint, w_occ=w_occ, names=names)
+    abl_rows = None
+    if storage != "inline" and len(rows) > int(args.ablation_max_rows):
+        abl_rows = np.random.default_rng(0).choice(
+            len(rows), size=int(args.ablation_max_rows), replace=False)
+    abl = feature_ablation(provider, members, ctx, reward_t, arrays, true, unit,
+                           w_joint=w_joint, w_occ=w_occ, names=names,
+                           storage=storage, n_channels=n_channels, device=device,
+                           chunk_rows=chunk, abl_rows=abl_rows)
 
-    with torch.no_grad():
-        pred_counts = [m.summary(feats, ctx.tile_volume) for m in ens.members]
-    pooled = pooled_count_error(
-        {k: torch.stack([getattr(p, k) for p in pred_counts]).mean(0).numpy()
-         for k in COUNT_KEYS},
-        {k: arrays[k] for k in COUNT_KEYS})
+    pred_counts = stream_pred_counts(provider, members, ctx, chunk_rows=chunk,
+                                     device=device)
+    true_counts = {k: arrays[k] for k in COUNT_KEYS}
+    # The gated metric is PER CANDIDATE (sum a candidate's 512 tiles on their own,
+    # then average by box) so one candidate's error cannot cancel another's; the
+    # all-row aggregate is kept only under an explicitly diagnostic name.
+    pooled = pooled_count_error_by_candidate(pred_counts, true_counts,
+                                             arrays["box"], arrays["tag"])
+    pooled_all_rows = pooled_count_error(pred_counts, true_counts)
     occ_err = np.asarray(pooled["occupation_log_error"], dtype=np.float64)
     occ_bins = {
         "per_bin": occ_err.tolist(),
@@ -369,23 +393,24 @@ def main(argv=None) -> int:
 
     base_cmp: Dict[str, Dict] = {}
     bl_path = run / "proxy_baselines.json"
-    # The linear baseline is a flat design matrix; for the token arm it was
-    # fitted on arm B's flat features (see train_catalog_proxy.py) and must be
-    # evaluated on the same.
-    bl_feats = (feats if arrays["features"].ndim == 2
-                else torch.as_tensor(as_arrays(rows, "b")["features"],
-                                     dtype=torch.float64))
+    # The linear baseline is a flat design matrix; for a spatial arm it was fitted
+    # on arm B's flat features (see train_catalog_proxy.py) and is evaluated on
+    # the same, per candidate, against the same per-candidate pooled metric.
+    bl_feats = torch.as_tensor(
+        as_arrays(rows, arm if storage == "inline" else "b",
+                  table_dir=table.parent)["features"], dtype=torch.float64)
     if bl_path.is_file():
         for name, b in load_baselines(bl_path).get(arm, {}).items():
             with torch.no_grad():
-                s = b.summary(bl_feats, ctx.tile_volume, ctx.frozen)
-            bp = pooled_count_error({k: getattr(s, k).numpy() for k in COUNT_KEYS},
-                                    {k: arrays[k] for k in COUNT_KEYS})
+                s = b.summary(bl_feats, ctx_cpu.tile_volume, ctx_cpu.frozen)
+            bp = pooled_count_error_by_candidate(
+                {k: getattr(s, k).numpy() for k in COUNT_KEYS}, true_counts,
+                arrays["box"], arrays["tag"])
             base_cmp[name] = {
                 "mean_log_error": bp["mean_log_error"],
                 "occupation_log_error_max": bp["occupation_log_error_max"],
                 # Positive means the proxy is closer to the truth than this
-                # baseline, in dex, pooled over N, H, S and O.
+                # baseline, in dex, per candidate pooled over N, H, S and O.
                 "margin": float(bp["mean_log_error"] - pooled["mean_log_error"]),
             }
     else:
@@ -394,21 +419,18 @@ def main(argv=None) -> int:
 
     actor = actor_verification(run / f"actor_verification_{arm}.jsonl", agate)
 
-    # --- predeclared slices -----------------------------------------------
+    # --- predeclared slices -- index the already-streamed mean/std ---------
     sliced: Dict[str, Dict] = {}
     for name, spec in slices.items():
         idx = slice_rows(arrays, spec or {})
         if idx.size == 0:
             sliced[name] = {"n_rows": 0, "note": "no rows in this slice"}
             continue
-        sub = ctx.index(idx)
-        m, s2 = ensemble_delta(ens.members, feats[idx], sub, reward_t,
-                               w_joint=w_joint, w_occ=w_occ)
         sliced[name] = {
             "n_rows": int(idx.size),
-            "ranking": rank_metrics(m, true[idx], arrays["box"][idx], unit[idx]),
-            "selection": selection_enrichment(m, true[idx]),
-            "uncertainty": uncertainty_calibration(m, s2, true[idx]),
+            "ranking": rank_metrics(mean[idx], true[idx], arrays["box"][idx], unit[idx]),
+            "selection": selection_enrichment(mean[idx], true[idx]),
+            "uncertainty": uncertainty_calibration(mean[idx], std[idx], true[idx]),
         }
     for mode in ("both", "disp", "vel"):
         sliced[f"alpha_ordering_{mode}"] = alpha_ordering(arrays, mean, unit,
@@ -451,7 +473,12 @@ def main(argv=None) -> int:
         "n_features": n_channels,
         "region_width": width,
         "ranking": rank, "selection": sel, "alpha": alpha, "ablation": abl,
-        "pooled": pooled, "occupation_by_bin": occ_bins,
+        "pooled": pooled,
+        "pooled_all_rows_DIAGNOSTIC": {
+            "mean_log_error": pooled_all_rows["mean_log_error"],
+            "occupation_log_error_max": pooled_all_rows["occupation_log_error_max"],
+            "note": "cross-candidate cancellation; not gated. Use 'pooled'."},
+        "occupation_by_bin": occ_bins,
         "baseline_comparison": base_cmp, "uncertainty": unc,
         "actor": actor, "slices": sliced,
         "proxy_dir": str(proxy_dir), "table": str(table),

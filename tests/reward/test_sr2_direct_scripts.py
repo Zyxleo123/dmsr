@@ -118,8 +118,12 @@ def _write_rows(path: Path, *, boxes, tiles, seed=0, invalid_box=None):
 
 def _mark_labels_complete():
     from _sr2_direct import labels_complete_path, write_json_atomic
+    from cosmo_sr.reward.arms import FEATURE_SCHEMA_VERSION
 
-    return write_json_atomic(labels_complete_path(), {"complete": True})
+    return write_json_atomic(labels_complete_path(), {
+        "complete": True,
+        "feature_schema_version": int(FEATURE_SCHEMA_VERSION),
+    })
 
 
 @pytest.fixture
@@ -152,7 +156,8 @@ def trained(direct_cfg, fitted_reward):
                 tiles=range(3))
     _mark_labels_complete()
     assert train_catalog_proxy.main(
-        ["--config", str(direct_cfg), "--run-name", "t", "--device", "cpu"]) == 0
+        ["--config", str(direct_cfg), "--run-name", "t", "--device", "cpu",
+         "--arms", "a", "b", "c"]) == 0
     return run_dir("t")
 
 
@@ -186,8 +191,8 @@ def test_all_three_arms_are_fitted_with_fixed_predeclared_configs(trained):
         assert (trained / f"proxy_{arm}" / "member_00.pt").is_file()
         assert report["arm_reports"][arm]["members"]
     # Arm B really is the wider feature vector, or the comparison is vacuous.
-    assert (report["arm_reports"]["b"]["n_features"]
-            > report["arm_reports"]["a"]["n_features"])
+    assert (report["arm_reports"]["b"]["feature_shape"]
+            > report["arm_reports"]["a"]["feature_shape"])
     # Arm C is a token grid and its ensemble loads back as the DeepSets class.
     assert report["arm_reports"]["c"]["feature_shape"] == [
         2, N_TOKENS, N_TOKEN_FEATURES]
@@ -325,7 +330,7 @@ def test_benchmark_writes_the_decision_and_is_immutable(trained, direct_cfg, cap
             ["--config", str(direct_cfg), "--run-name", "t", "--arm", arm])
     assert proxy_benchmark.main(
         ["--config", str(direct_cfg), "--run-name", "t",
-         "--n-bootstrap", "50"]) == 0
+         "--arms", "a", "b", "c", "--n-bootstrap", "50"]) == 0
     doc = json.loads((trained / "proxy_benchmark.json").read_text())
     assert set(doc["passed"]) == {"a", "b", "c"}
     # No arm can advance here: the actor-like Rockstar checks were never run,
@@ -342,7 +347,7 @@ def test_benchmark_writes_the_decision_and_is_immutable(trained, direct_cfg, cap
     before = (trained / "proxy_benchmark.json").read_text()
     assert proxy_benchmark.main(
         ["--config", str(direct_cfg), "--run-name", "t",
-         "--n-bootstrap", "50"]) == 0
+         "--arms", "a", "b", "c", "--n-bootstrap", "50"]) == 0
     assert (trained / "proxy_benchmark.json").read_text() == before
     assert "immutable" in capsys.readouterr().out
 
@@ -354,7 +359,8 @@ def test_benchmark_refuses_without_every_arm_verdict(trained, direct_cfg, capsys
     gate_catalog_proxy.main(
         ["--config", str(direct_cfg), "--run-name", "t", "--arm", "a"])
     assert proxy_benchmark.main(
-        ["--config", str(direct_cfg), "--run-name", "t"]) == 0
+        ["--config", str(direct_cfg), "--run-name", "t",
+         "--arms", "a", "b", "c"]) == 0
     assert not (trained / "proxy_benchmark.json").is_file()
     assert "MISSING INPUT" in capsys.readouterr().out
 

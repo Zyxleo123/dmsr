@@ -69,8 +69,11 @@ import torch.nn.functional as F
 
 from ..reward.arms import check_arm
 from ..reward.catalog_proxy import ProxyEnsemble
-from ..reward.phase_space import PhaseSpaceConfig, arm_paired_features
+from ..reward.phase_space import (
+    PhaseSpaceConfig, arm_paired_features, phase_space_paired_grid,
+)
 from ..reward.soft_rockstar import SoftRockstarConfig, soft_rockstar_paired_tokens
+from ..reward.sr2_adversarial import critic_input
 from ..reward.soft_structure import (
     SoftStructureConfig, density_from_disp, paired_features, structural_diversity,
 )
@@ -262,6 +265,9 @@ class DirectFinetuneTrainer:
         self.arm = check_arm(arm)
         self.phase_cfg = phase_cfg or PhaseSpaceConfig()
         self.rockstar_cfg = rockstar_cfg or SoftRockstarConfig()
+        # Arm F's fine density is inverse-pixel-shuffled at this multiple; 2 is
+        # the SR2 recipe and matches arm F's offline provider.
+        self.f_grid_mult = int(getattr(self.cfg, "density_grid_mult", 2) or 2)
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(int(self.cfg.seed))
@@ -369,22 +375,41 @@ class DirectFinetuneTrainer:
         """The gate-comparable RMS ratio from the squared loss term."""
         return float(max(float(loss_value), 0.0) ** 0.5)
 
-    def _extract(self, cand: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+    def _extract(self, cand: torch.Tensor, base: torch.Tensor,
+                 lr: Optional[torch.Tensor] = None) -> torch.Tensor:
         """The trainable candidate's proxy features, arm-appropriately.
 
-        Arm A is :func:`paired_features` (density only), arm B adds the
-        phase-space block, arm C is the soft-Rockstar token grid. Each is the
-        exact function the labelled training features came from, which is the
-        whole contract: a proxy fine-tuned against features it was not trained
-        on is answering a different question than the one it was gated on.
+        Each is the EXACT function the labelled training features came from --
+        the whole contract is that a proxy fine-tuned against features it was not
+        trained on is answering a different question than the one it was gated on:
+
+        * ``a`` density summaries, ``b`` + phase space (flat vectors);
+        * ``c`` and ``d`` the SAME soft-Rockstar token grid (arm D differs only in
+          the model that reads it, so its live extractor IS arm C's);
+        * ``e`` the dense 32^3 phase-space grid;
+        * ``f`` the 20-channel SR2 critic input, which needs the LR conditioning --
+          the unpadded LR core (``lr[pad:pad+chunk]``) matching the output tile,
+          exactly the region arm F's offline provider crops.
         """
         if self.arm == "a":
             return paired_features(cand, base, self.soft_cfg)
         if self.arm == "b":
             return arm_paired_features(cand, base, "b", self.soft_cfg,
                                        self.phase_cfg)
-        return soft_rockstar_paired_tokens(cand, base, self.soft_cfg,
-                                           self.phase_cfg, self.rockstar_cfg)
+        if self.arm in ("c", "d"):
+            return soft_rockstar_paired_tokens(cand, base, self.soft_cfg,
+                                               self.phase_cfg, self.rockstar_cfg)
+        if self.arm == "e":
+            return phase_space_paired_grid(cand, base, self.soft_cfg, self.phase_cfg)
+        # arm f: build the exact SR2 critic input from the generated tile and the
+        # LR core. No candidate-minus-frozen block -- F keeps its original input.
+        if lr is None:
+            raise ValueError("arm 'f' needs the LR conditioning to build critic_input")
+        p, c = int(self.geom.pad), int(self.geom.chunk)
+        lr_core = lr[:, :, p:p + c, p:p + c, p:p + c]
+        return critic_input(lr_core, cand, cellsize_kpc_h=self.soft_cfg.cellsize_kpc_h,
+                            dis_norm_kpc_h=float(self.soft_cfg.dis_norm_kpc_h),
+                            grid_mult=int(self.f_grid_mult))
 
     # -- the step ---------------------------------------------------------- #
     def loss_terms(self, batch: Mapping) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:
@@ -415,7 +440,7 @@ class DirectFinetuneTrainer:
 
         # fold_draws lays the batch out as (example, draw) -> example * d + draw,
         # so draw 0 is every d-th row.
-        feats = self._extract(cand[::d], base[::d])
+        feats = self._extract(cand[::d], base[::d], lr=lr[::d])
         box = batch["box_summary"].to(self.device)
         frozen_tile = batch["frozen_tile_summary"].to(self.device)
         all_dr = self.proxies.delta_rewards_all(

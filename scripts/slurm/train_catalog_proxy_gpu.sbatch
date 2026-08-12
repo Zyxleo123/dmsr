@@ -1,26 +1,24 @@
 #!/bin/bash
-# Fit BOTH proxy arms on set0-7, then gate each on set8-11, in one job. CPU:
-# the proxy is a float64 two-layer MLP on ~39k rows and the reward model is a
-# 16-vector Mahalanobis, so there is nothing here a GPU accelerates -- and the
-# GPU build of this job ran on the CPU regardless, because DEVICE is empty in
-# the preamble and --device fell through to "cpu".
+# Fit one (or more) proxy arms on set0-7, then offline-gate each on set8-11.
+# GPU: flat arms (A/B) are fine on CPU, but spatial arms (C-F) are 3-D convs /
+# streamed critic input, so the job defaults to CUDA.
 #
-# One job because the arm comparison's whole value is that only the feature
-# vector differed: one process, one table, one set of shared hyperparameters
-# chosen by cross-validation on the mean over both arms. Two jobs would be two
-# chances for a difference nobody intended.
+# submit_proxy_benchmark.sh fit submits ONE of these per arm so A..F run as
+# sibling GPU jobs. Shared state (bootstrap_draws.json, proxy_baselines.json,
+# train_report.json) is flock-merged inside train_catalog_proxy.py -- safe to
+# overlap. You can still pass ARMS="a b" to pack several arms into one allocation.
 #
-# The gates run here too, rather than as separate jobs, because their verdict is
-# the only thing that decides whether an actor may start, and splitting them
-# adds a window in which a stale "pass" from a previous fit sits on disk next to
-# a new ensemble.
+# The gate for each arm listed in ARMS runs in this same job, so a fresh
+# ensemble is never paired with a stale proxy_gate_*.json from a prior fit.
 #
-#   sbatch scripts/slurm/train_catalog_proxy_gpu.sbatch <envfile>
+#   sbatch scripts/slurm/train_catalog_proxy_gpu.sbatch <envfile> ARMS=c
 #SBATCH --job-name=sd_proxy
-#SBATCH --partition=cpu
-#SBATCH --cpus-per-task=16
+#SBATCH --partition=general
+#SBATCH --qos=qos_general
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/sr2_direct/logs/slurm-sd_proxy-%j.out
 
 set -euo pipefail
@@ -30,7 +28,7 @@ _D="${SLURM_SUBMIT_DIR:-/zfsauton2/home/yixiz/DMSR/cosmo_sr_project}/scripts/slu
 source "$_D/_sr2_direct_common.sh" "$@"
 set -euo pipefail
 
-: "${ARMS:=a b}"
+: "${ARMS:=a b c d e f}"
 
 require_input "$REWARD_MODEL_JSON" "scripts/slurm/fit_reward_model_cpu.sbatch"
 # The marker, not the table: a rows.jsonl exists as soon as ONE candidate has
@@ -40,12 +38,13 @@ require_input "$DMSR_SR2_DIRECT_ROOT/proxy_data/labels_complete.json" \
     "scripts/slurm/index_proxy_labels_cpu.sbatch (after every label job)"
 
 python -u scripts/reward/train_catalog_proxy.py \
-    --config "$DIRECT_CFG" --run-name "$RUN_NAME" --device "${DEVICE:-cpu}" \
+    --config "$DIRECT_CFG" --run-name "$RUN_NAME" --device "${DEVICE:-cuda}" \
     --arms ${ARMS//,/ }
 
 for ARM in ${ARMS//,/ }; do
     python -u scripts/reward/gate_catalog_proxy.py \
-        --config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM"
+        --config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM" \
+        --device "${DEVICE:-cuda}"
 done
 
 python - "$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME" ${ARMS//,/ } <<'PY'

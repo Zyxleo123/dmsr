@@ -10,11 +10,16 @@
 # did not exist yet. The decision is still made once, here.
 #
 #   sbatch scripts/slurm/proxy_benchmark_cpu.sbatch <envfile>
+# GPU, despite the name: the re-gate and the arm comparison now STREAM arm E's
+# dense grid and arm F's built-on-GPU critic input through the ensembles, which a
+# CPU-only node cannot do in minutes. The flat arms are unaffected.
 #SBATCH --job-name=sd_bench
-#SBATCH --partition=cpu
+#SBATCH --partition=general
+#SBATCH --qos=qos_general
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/sr2_direct/logs/slurm-sd_bench-%j.out
 
 set -euo pipefail
@@ -24,7 +29,7 @@ _D="${SLURM_SUBMIT_DIR:-/zfsauton2/home/yixiz/DMSR/cosmo_sr_project}/scripts/slu
 source "$_D/_sr2_direct_common.sh" "$@"
 set -euo pipefail
 
-: "${ARMS:=a b}"
+: "${ARMS:=a b c d e f}"
 : "${OVERWRITE:=0}"
 
 require_input "$DMSR_SR2_DIRECT_ROOT/proxy_data/labels_complete.json" \
@@ -32,10 +37,12 @@ require_input "$DMSR_SR2_DIRECT_ROOT/proxy_data/labels_complete.json" \
 
 for ARM in ${ARMS//,/ }; do
     python -u scripts/reward/gate_catalog_proxy.py \
-        --config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM"
+        --config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM" \
+        --device "${DEVICE:-cuda}"
 done
 
-ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME" --arms ${ARMS//,/ })
+ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME" --arms ${ARMS//,/ }
+      --device "${DEVICE:-cuda}")
 [ "$OVERWRITE" = "1" ] && ARGS+=(--overwrite)
 python -u scripts/reward/proxy_benchmark.py "${ARGS[@]}"
 

@@ -106,11 +106,12 @@ def _fake_candidate(box, tag, *, n_tiles=2, label_ok=True, additivity=0.0,
     from _sr2_direct import direct_root, write_json_atomic
     from cosmo_sr.reward.phase_space import arm_paired_feature_names
 
-    from cosmo_sr.reward.arms import FEATURE_SCHEMA_VERSION
+    from cosmo_sr.reward.arms import FEATURE_SCHEMA_VERSION, FIELD_CHANGED_KEY
 
     d = direct_root("candidates", f"{box}__{tag}", create=True)
     feats = {"tile_id": np.arange(n_tiles, dtype=np.int64),
-             "feature_schema_version": np.int64(FEATURE_SCHEMA_VERSION)}
+             "feature_schema_version": np.int64(FEATURE_SCHEMA_VERSION),
+             FIELD_CHANGED_KEY: np.zeros(n_tiles, dtype=np.int8)}
     for arm in ("a", "b"):
         n = len(arm_paired_feature_names(arm))
         feats[f"features_{arm}"] = np.arange(n_tiles * n,
@@ -118,6 +119,9 @@ def _fake_candidate(box, tag, *, n_tiles=2, label_ok=True, additivity=0.0,
     # Arm C's paired token grid, sidecar-bound: (n_tiles, 2, T, F).
     feats["features_c"] = np.arange(n_tiles * 2 * 8 * 4, dtype=np.float32
                                     ).reshape(n_tiles, 2, 8, 4)
+    # Arm E's paired dense grid. Tiny spatial size so the test sidecar stays
+    # small; the indexer copies whatever shape is on disk.
+    feats["features_e"] = np.zeros((n_tiles, 2, 5, 4, 4, 4), dtype=np.float16)
     np.savez_compressed(d / "features.npz", **feats)
     write_json_atomic(d / "manifest.json", {
         "box": box, "tag": tag, "source": ("hr" if tag == "hr" else "frozen"),
@@ -241,6 +245,36 @@ def test_index_warns_when_there_is_no_within_tile_variation(small_cfg, capsys):
     assert "easy binary distinction" in out
 
 
+def test_index_treats_schema3_without_features_e_as_stale(small_cfg, capsys):
+    """A hand-stamped schema-3 manifest must not KeyError the indexer."""
+    from _sr2_direct import direct_root
+
+    d = _fake_candidate("set0", "hr")
+    z = dict(np.load(d / "features.npz"))
+    del z["features_e"]
+    del z["field_changed"]
+    np.savez_compressed(d / "features.npz", **z)
+    assert _index(small_cfg) == 0
+    report = json.loads((direct_root("proxy_data") / "index_report.json").read_text())
+    assert any("set0/hr" == x or x.endswith("/hr")
+               for x in report["candidates_stale_features"])
+    out = capsys.readouterr().out
+    assert "treating as schema-stale" in out
+
+
+def test_load_rows_refuses_a_stale_feature_schema(reward_root, tmp_path):
+    """Fitting on schema-2 would train without field_changed / grids_e."""
+    from _sr2_direct import direct_root, write_json_atomic
+    import _proxy_data as P
+
+    table = direct_root("proxy_data", create=True) / "rows.jsonl"
+    table.write_text("{}\n")
+    write_json_atomic(direct_root("proxy_data") / "labels_complete.json", {
+        "complete": True, "rows": 1, "feature_schema_version": 2})
+    with pytest.raises(SystemExit, match="feature schema 2"):
+        P.load_rows(table, require_complete=True)
+
+
 # --------------------------------------------------------------------------- #
 # Row weighting
 # --------------------------------------------------------------------------- #
@@ -253,10 +287,10 @@ def test_source_balance_and_changed_tile_weighting():
     from _proxy_data import row_weights
 
     source = np.asarray(["hr"] * 1 + ["frozen"] * 1 + ["intervention"] * 8)
-    feats = np.zeros((10, 4))
-    feats[:, 2:] = np.asarray([[0.0, 0.0]] * 2 + [[3.0, 0.0]] * 8)
-    out = row_weights(source, feats, balance_sources=True, changed_weight=3.0,
-                      changed_threshold=0.5)
+    # The arm-neutral field_changed flag (raw six-channel diff), not a feature
+    # threshold: the frozen row is unchanged, the interventions changed.
+    changed = np.asarray([False, False] + [True] * 8)
+    out = row_weights(source, changed, balance_sources=True, changed_weight=3.0)
     w = out["weight"]
     assert np.isclose(w.mean(), 1.0)
     # The single hr row must not be worth less than one of eight interventions.
