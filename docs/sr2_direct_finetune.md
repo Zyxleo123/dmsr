@@ -229,6 +229,129 @@ one to carry — pending the set8/set9 pilot screen and the trained gate.
 Reports: old `runs/direct_a/attribution_diagnostic.json` (unchanged, historical);
 new `runs/direct_a/region_attribution_diagnostic.json`.
 
+## The reward target — from the occupation ratio to the hosted-subhalo count (2026-08-13)
+
+The joint 11-d Mahalanobis reward `R_cat` was replaced, as the proxy training
+target, by
+
+```
+dR_hosted_subs = log10(sum_i occ_numerator_i)      # after a tile swap, minus before
+```
+
+the log of the whole-box count of subhalos that live inside a resolved host
+(`occ_numerator` summed over host-mass bins). Three findings drove this, in
+order.
+
+### 1. The occupation ratio is not seed-stable, and is gameable by host deletion
+
+`reward/reward_stability_scan.py` (job `sd_rstab`, report
+`runs/direct_a/reward_stability_scan.json`) scores a menu of scalar catalog
+functionals for the ratio that actually matters when choosing a training signal:
+the improvement to be detected over the churn a statistic shows when the **same**
+frozen generator is re-run with a different noise seed. The selection metric is
+`d' = (gap) / sigma_seed`, not a correlation; rank consistency is the monotone
+`Phi(d'/sqrt2)` of it.
+
+Measured over 12 boxes x 4 frozen seeds:
+
+* seed noise is **not** the bottleneck — the SR2->HR gap is 100-190 `sigma_seed`
+  wide for every candidate;
+* **`R_cat` has the worst cross-seed box ordering on the menu, `rho_box = 0.477`**
+  (vs 0.86 for the pooled log counts). This, not 0.58, is the real content of the
+  "reward is unstable across seeds" complaint;
+* the oracle alpha-ladder **raises mean occupation by ~1.9% while adding ~0
+  subhalos** — it does it by shrinking the host denominator (hosts -0.5%). The
+  occupation *ratio* is gameable by deleting low-mass hosts, and on the only
+  "achievable edit" evidence we have that is most of what it rewards.
+
+`log_hosted_subs` was chosen because it is the literal goal, numerator-only (host
+deletion cannot raise it), monotone (no dead zone or sign flip at the target),
+seed-stable (`sigma_seed` 0.5%, `rho_box` 0.86), and sums exactly over tiles so a
+tile swap is linear in the swapped counts — no covariance inversion, no bin
+whitening of proxy error. It is implemented in `reward/torch_reward.py`
+(`reward_hosted_subs`, key `dR_hosted_subs`) with a matching `dR_hosted_subs`
+emitted by `delta_reward_swap`, selected by `proxy.reward_target` in the config,
+and threaded identically through the trainer and the offline gate so the two
+never score different rewards. Test invariants in `tests/reward/test_torch_reward.py`.
+
+### 2. The alpha-ladder is NOT valid training data for a count target
+
+The oracle intervention is `x_alpha = x_SR2 + alpha * w * (x_HR - x_SR2)` with `w`
+a smooth Lagrangian mask over **24 target subhalos** (`oracle_hr.max_targets`).
+Measured mask coverage: ~2% of cells, 0.85% by mask-mass. So its designed maximum
+effect at `alpha=1` is recovering ~24 objects, against a whole-box count of
+~16 860 — a rounding error below the +-85-subhalo seed-noise floor.
+
+The **ground-truth** count vs alpha (real Rockstar labels, both-mode, 12 boxes):
+
+| alpha | whole-box hosted subs | delta vs frozen |
+| --- | --- | --- |
+| 0.00 | 16859 | — |
+| 0.25 | 16793 | **-66** |
+| 0.50 | 16784 | **-75** |
+| 1.00 | 16872 | **+13** |
+
+Seed noise +-85; monotone-increasing in **0%** of boxes. The count *dips*
+negative at intermediate alpha and returns to ~frozen at alpha=1, all inside the
+noise band. This is not a proxy failure: **the labels themselves do not increase
+with alpha.** Two reasons — (a) the ladder is masked to 24 targets, not a global
+HR blend, so it cannot move a whole-box count; (b) subhalo formation is a
+nonlinear threshold, so a partial-alpha displacement disturbs marginal SR2
+structure (and churns the fractional member-id attribution box-wide) without yet
+forming the HR object — hence the negative dip. This is exactly the Experiment-1
+outcome "recovery only near alpha=1 -> the representation works but the reward
+landscape is flat."
+
+Consequence: for `dR_hosted_subs` the interventions are near-ties and carry no
+monotone, above-noise ranking signal. They remain useful as **count-calibration**
+rows (the count-error and selection checks pass), but the only real *ranking*
+signal is the single frozen->HR jump. NOTE: the old claim that the alpha ladder
+is "monotone by construction" (config `report_only_alpha_ordering`) was true only
+under the occupation reward; it is false for the count target.
+
+### 3. The within-tile ranking gate was partly grading ties; a margin was added
+
+Because the non-HR candidates within a tile are near-ties, the zero-margin
+within-tile Spearman/pairwise graded the proxy on ordering label noise.
+`rank_metrics` and `tie_aware_agreement` now take `min_margin` (a reward-gap
+floor below which two candidates are a tie); the gate uses
+`proxy_gate.rank_min_margin: auto` = the robust scale of the interventions' true
+`dR`, always reports a `ranking_margin_sweep` (0, floor, 2x, 4x), and dumps
+`ranking_arrays_<arm>.npz` for free CPU re-scoring. Re-gate with
+`scripts/slurm/rescore_proxy_gate_cpu.sbatch`.
+
+Result on arms a, b, d (hosted-subs fits, held-out set8-11):
+
+| margin | within-tile Spearman | pairwise | pairs kept |
+| --- | --- | --- | --- |
+| 0 | 0.25 | 0.59 | 118k |
+| 1x floor | 0.26 | 0.63 | 81k |
+| 2x floor | 0.28 | 0.67 | 62k |
+| 4x floor | 0.31 | 0.76 | 42k |
+
+Both readings are true: **part** of the failure was the tie artifact (pairwise
+0.59 -> 0.76 as ties are dropped), but a **real** deficit remains — even on the
+most-separated third of pairs pairwise tops out ~0.76 (a cleanly-ranking proxy
+hits ~0.95), Spearman never crosses 0.31 against the 0.5 bar, and **arm d (3-D
+CNN) equals a and b to three digits**. When the flat MLP and the conv land on the
+same number it is the data, not the features. (Tie-aware Spearman is structurally
+depressed when most candidates are legitimate ties, so pairwise-with-margin is
+the fairer statistic for a count target — worth revisiting whether
+`min_within_tile_spearman` is the right gate here at all.)
+
+### The open item — a count-increasing candidate set
+
+The blocker is a **data gap** no reward functional or architecture closes: there
+are no candidates whose hosted-subhalo count rises above noise, monotonically, at
+tile scale. The localized alpha-ladder structurally cannot be that. The cheap
+decisive test is a **global-alpha ladder** (blend HR into SR2 over the whole box,
+no mask): the count rises to the full +30k at alpha=1, so it reads out directly
+whether the proxy tracks a genuinely increasing count. If it does, the pipeline
+works and the localized ladder was the wrong training set; if it does not, the
+tile->count map is itself the hard part. Reports/artifacts:
+`runs/direct_a/reward_stability_scan.json`, `proxy_gate_<arm>.json`
+(`ranking_margin_sweep`), `ranking_arrays_<arm>.npz`.
+
 ## Runbook
 
 ```bash
