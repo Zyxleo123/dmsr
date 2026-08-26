@@ -50,7 +50,7 @@ for kv in "$@"; do
 done
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/labels_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/labels_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_proxy_labels.sh at $(date '+%F %T'); sourced by
 # the job preamble as a positional argument.

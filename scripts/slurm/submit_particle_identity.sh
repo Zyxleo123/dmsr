@@ -48,7 +48,7 @@ PID_MAX_PAIRS="${PID_MAX_PAIRS:-20000}"
 PID_CHUNKS="${PID_CHUNKS:-8}"
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/particle_identity_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/particle_identity_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_particle_identity.sh at $(date '+%F %T');
 # sourced by the job preamble as a positional argument.

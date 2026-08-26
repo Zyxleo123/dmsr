@@ -233,8 +233,45 @@ def test_delta_reward_swap_is_zero_when_nothing_changes(tmodel, population):
         occ_numerator=box.occ_numerator * 0.02, volume_mpc3=box.volume_mpc3,
     )
     out = tmodel.delta_reward_swap(box, tile, tile)
-    for key in ("dR_cat", "dR_occ", "dR_abund", "dR_combined"):
+    for key in ("dR_cat", "dR_occ", "dR_abund", "dR_combined", "dR_hosted_subs"):
         assert float(out[key][0]) == pytest.approx(0.0, abs=1e-10)
+
+
+def test_reward_hosted_subs_is_log10_of_pooled_numerator(tmodel, population):
+    """The hosted-subhalo target reads log10(sum occ_numerator), nothing else.
+
+    This is the whole-box statistic reward_stability_scan selected; the swap
+    form must reduce to it so the trained proxy and the scan agree on what the
+    reward is.
+    """
+    box = summary_from_ensemble(_ens(population))
+    import numpy as np
+    ref = float(np.log10(max(float(box.occ_numerator.sum()), 0.5)))
+    assert float(tmodel.reward_hosted_subs(box)[0]) == pytest.approx(ref, abs=1e-9)
+
+
+def test_dR_hosted_subs_ignores_host_deletion(tmodel, population):
+    """Deleting hosts (occ_numerator unchanged) does not raise the hosted target.
+
+    This is the property the target was chosen for: the occupation *ratio* rose
+    on the alpha ladder by shrinking the host denominator, and dR_hosted_subs
+    must be immune to exactly that -- it depends on the numerator alone.
+    """
+    box = summary_from_ensemble(_ens(population))
+    frozen_tile = TorchSummary(
+        n_sub=box.n_sub * 0.05, n_host=box.n_host * 0.05,
+        occ_numerator=box.occ_numerator * 0.05, volume_mpc3=box.volume_mpc3,
+    )
+    # Same subhalos-in-hosts, but half the hosts removed from this tile.
+    fewer_hosts = TorchSummary(
+        n_sub=frozen_tile.n_sub, n_host=frozen_tile.n_host * 0.5,
+        occ_numerator=frozen_tile.occ_numerator, volume_mpc3=box.volume_mpc3,
+    )
+    out = tmodel.delta_reward_swap(box, frozen_tile, fewer_hosts)
+    assert float(out["dR_hosted_subs"][0]) == pytest.approx(0.0, abs=1e-10)
+    # The ratio target reacts to the same host-only edit; the hosted count does
+    # not. (Sign is fixture-dependent -- what matters is that it is not immune.)
+    assert abs(float(out["dR_occ"][0])) > 1e-6
 
 
 def test_delta_reward_swap_matches_direct_recomputation(tmodel, population):

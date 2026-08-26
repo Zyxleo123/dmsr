@@ -1,0 +1,18 @@
+# LAGRANGIAN-ONLY CRITIC, ARM B -- arm A plus a full-trajectory gradient path.
+#
+# WHY. `adv.bp_steps: 1` with `gen_ode_steps: 4` means the adversarial gradient
+# reaches only the LAST of four Euler steps; the first three are shaped by the
+# flow-matching loss alone. Raising lambda_adv amplifies a gradient that can only
+# edit a quarter of the trajectory, which is a candidate explanation for why the
+# ladder was flat that has nothing to do with the weight. bp_steps: null
+# backpropagates through the whole integration.
+#
+# COST: activations for 4 ODE steps instead of 1. `model.grad_checkpoint: true`
+# is inherited, and the crop is 64^3 at batch 2, but this is the arm most likely
+# to OOM -- it is pinned to a >= 48 GB GPU by the submitter for that reason.
+base: t13_lagonly_l003.yaml
+adv:
+  bp_steps: null             # <-- THE LEVER. full backprop through the ODE.
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_lagonly_bp4_l003, group: dmsr_lagonly}
+output: {run_dir: runs/dmsr/t13_lagonly_bp4_l003_s0}

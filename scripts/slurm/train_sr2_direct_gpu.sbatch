@@ -31,6 +31,11 @@ set -euo pipefail
 : "${ARM:=a}"
 : "${RESUME:=}"
 : "${BOXES:=}"
+# IGNORE_GATE=1 runs without a passing proxy gate. Diagnostic ONLY: the python
+# script stamps such a checkpoint as not-evidence, and the proxy currently fails
+# its offline gate (candidate collapse), so this is the only way to drive the
+# actor at all until the proxy is fixed. Never advance a rung on it.
+: "${IGNORE_GATE:=0}"
 
 require_input "$REWARD_MODEL_JSON" "scripts/slurm/fit_reward_model_cpu.sbatch"
 require_input "$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME/proxy_$ARM" \
@@ -41,6 +46,7 @@ ARGS=(--config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM")
 [ "$MAX_STEPS" != "0" ] && ARGS+=(--max-steps "$MAX_STEPS")
 [ "$OVERFIT" = "1" ] && ARGS+=(--overfit)
 [ "$PROBE" = "1" ] && ARGS+=(--probe)
+[ "$IGNORE_GATE" = "1" ] && ARGS+=(--ignore-gate)
 [ -n "$RESUME" ] && ARGS+=(--resume "$RESUME")
 [ -n "$BOXES" ] && ARGS+=(--boxes "$BOXES")
 [ -n "$DEVICE" ] && ARGS+=(--device "$DEVICE")

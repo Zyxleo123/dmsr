@@ -436,3 +436,98 @@ The headline to watch is `density_highk_pk_ratio` (baseline 0.282, SRS 0.977)
 **with `highk_power_ratio` held at ~0.487** — a density gain that costs
 displacement power is the mean-collapse failure returning, not progress.
 `summary.png` plots exactly that plane, with trilinear and SRS marked.
+
+---
+
+## Lagrangian-only critic sweep (2026-08-21) — built, not yet run
+
+### Why the existing lambda ladder cannot answer the weight question
+
+Final `val_*` at step 20000 for the SR2-match ladder, all on the **wrapped**
+density instrument (no `valid_center`), so the density columns are on the broken
+ruler and only the displacement columns and `grad_ratio` mean anything:
+
+| arm | `lambda_adv` | `grad_ratio` | `rk_high` | `Tk_err_high` | `diversity` |
+|---|---|---|---|---|---|
+| `..._off` | 0 | — | 0.8390 | 0.0599 | 0.5711 |
+| `..._l0003` | 3e-4 | 0.016 | 0.8368 | 0.0651 | 0.5590 |
+| `..._l001` | 1e-3 | 0.069 | 0.8373 | 0.0584 | 0.5903 |
+| `..._l003` | 3e-3 | 0.136 | 0.8350 | 0.0648 | 0.5679 |
+| `..._l03` | 3e-2 | 0.690 | 0.8359 | 0.0610 | 0.5990 |
+| `..._glob_l03` | 3e-2 | 4.865 | 0.8396 | 0.0817 | 0.5011 |
+
+**A 100x weight range moves nothing** (`rk_high` spans 0.835-0.840, diversity
+0.56-0.60). Only the global-pool arm at `grad_ratio` 4.9 moves, and it moves the
+wrong way on every column. Two confounds make this uninformative rather than
+conclusive:
+
+1. **Every arm's critic carries a noise channel.** `density_mode` is `highpass`,
+   `full` or `pshuffle8` in all of them, built by the wrap-in-crop deposit
+   measured at r = 0.080 (Stage 2 above). The critic is 3 channels of signal
+   concatenated with 1-8 of scramble.
+2. **The adversarial gradient reaches a quarter of the generator.**
+   `adv.bp_steps: 1` with `adv.gen_ode_steps: 4` backpropagates through the final
+   Euler step only; the first three are shaped by the flow-matching loss alone.
+   Raising `lambda_adv` amplifies a gradient that cannot edit most of the
+   trajectory, which predicts exactly the observed flatness without any appeal to
+   the weight being wrong.
+
+### What SR2 does instead
+
+SR2's discriminator has no density channel: it eats the Lagrangian
+displacement/velocity field directly (`map2map/train.py:364-371`,
+`adv_model(cat([input, output]))`). The only `lag2eul` call in that repository is
+in `utils/figures.py`. Where map2map *does* deposit, `lag2eul` removes the common
+mean displacement, **masks out** escaping particles rather than wrapping them
+(`periodic=False`), and offers `eul_pad` to catch them — the three things our
+`cic_density` did not do, and the reason theirs is a depleted-but-ordered field
+while ours was a scramble.
+
+Its loss structure differs too: when the adversary is on, map2map's generator step
+is `loss_adv.backward()` **alone** (`train.py:411-417`). The reconstruction loss is
+computed, logged, and never applied.
+
+And it works — our own reproduction of the released `G_z0.pt` on set14
+(`runs/dmsr/reproduce_srs/reproduce_srs_metrics.json`):
+
+| field | P_SR/P_HR (hi-k) | r(k) (hi-k) |
+|---|---|---|
+| displacement | 0.396 | 0.0002 |
+| velocity | 0.989 | −0.0002 |
+| density | **0.977** | 0.092 |
+
+`density_sigma_ratio = 1.0001`. Note the r(k) column: SR2's small scales carry
+**no information** about the truth. They are a sample, not a prediction — and
+`r(k)`, which this project gates on, is a metric SR2 does not try to win and
+which trilinear interpolation beats every arm we have on (density r(k) 0.338).
+
+### The sweep
+
+Four arms, one lever per rung off `t13_fix_vc32` (the current best density-fix
+arm), asserted by `tests/dmsr/test_lagonly_arms.py`:
+
+| arm | lever | question |
+|---|---|---|
+| `t13_lagonly_l003` | `critic.density_mode: "off"` | does removing the r=0.08 channel change anything? |
+| `t13_lagonly_bp4_l003` | `adv.bp_steps: null` | was the ladder flat because the gradient path was truncated? |
+| `t13_lagonly_bp4_l03` | `adv.lambda_adv: 0.030` | does SR2-like weight work once the path is open? |
+| `t13_lagonly_bp4_l03_flow01` | `adv.lambda_flow: 0.1` | is the mean-seeking term too strong, as distinct from the adversarial one too weak? |
+
+`adv.lambda_flow` is new (`train_dmsr.py`); it defaults to 1.0, which is
+byte-identical to every completed run. It is **not** settable to 0 unless
+`bp_steps` is null — with a truncated path that would leave the early Euler steps
+with no gradient from any term, and the trainer raises rather than train that.
+
+`valid_center: 32` is inherited, so the `val_density_*` columns are on the repaired
+ruler and are comparable to `t13_fix_vc32_s0` — the A/B partner — and to nothing
+without it.
+
+**These are training metrics and they cannot settle the density question.** Stage 0
+still can, and still hasn't: job 22252 was killed at ~8 h having completed 1 of 4
+arms at 5.3 GPU-h per full-box draw, and the tile-8 ruler that did finish landed
+three hours after `summary.md` was generated, so the table still prints `_not run_`.
+Run Stage 0 one arm per job.
+
+```bash
+scripts/slurm/submit_lagonly.sh            # DRY=1 to inspect first
+```

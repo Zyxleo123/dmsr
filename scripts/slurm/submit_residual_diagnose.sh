@@ -26,7 +26,7 @@ DRY="${DRY:-0}"
 : "${ALPHAS:=0,0.1,0.2,0.33,0.5,1.0}"
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/resdiag_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/resdiag_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_residual_diagnose.sh at $(date '+%F %T').
 PROJECT=$PROJECT

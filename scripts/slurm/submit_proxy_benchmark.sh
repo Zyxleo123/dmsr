@@ -85,7 +85,7 @@ PY
 fi
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/bench_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/bench_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_proxy_benchmark.sh at $(date '+%F %T'); sourced
 # by the job preamble as a positional argument.
@@ -106,16 +106,27 @@ SUB_OVERRIDES=()
 ABORT_FLAG="$ROOT/.submit_proxy_benchmark_aborted.$$"
 trap 'rm -f "$ABORT_FLAG"' EXIT
 
+# Optional node/partition targeting, following the myfree discipline: run myfree,
+# pick a node whose NOTE says AVAILABLE, and pin to it and its partition/GPU.
+#   NODE=gpu30 bash scripts/slurm/submit_proxy_benchmark.sh fit
+# These become sbatch CLI args (which override the script's #SBATCH lines) and
+# travel outside the env file, so they never trigger the user-env-retrieval bug.
+# PARTITION/QOS default to the sbatch script's own general/qos_general.
+NODE_ARGS=()
+[ -n "${NODE:-}" ]      && NODE_ARGS+=("--nodelist=$NODE")
+[ -n "${PARTITION:-}" ] && NODE_ARGS+=("--partition=$PARTITION")
+[ -n "${QOS:-}" ]       && NODE_ARGS+=("--qos=$QOS")
+
 sub() {   # sub <human label> <sbatch args...>
     local label="$1"; shift
     if [ "$DRY" = "1" ]; then
         echo "DRY  $label:" >&2
-        echo "       sbatch $* $ENVFILE ${SUB_OVERRIDES[*]}" >&2
+        echo "       sbatch ${NODE_ARGS[*]} $* $ENVFILE ${SUB_OVERRIDES[*]}" >&2
         echo "000000"
         return 0
     fi
     local jid rc
-    jid=$(sbatch --parsable "$@" "$ENVFILE" "${SUB_OVERRIDES[@]}") || rc=$?
+    jid=$(sbatch --parsable "${NODE_ARGS[@]}" "$@" "$ENVFILE" "${SUB_OVERRIDES[@]}") || rc=$?
     if [ -n "${rc:-}" ] || [ -z "$jid" ]; then
         echo "" >&2
         echo "!!! sbatch FAILED for: $label" >&2

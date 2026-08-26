@@ -1,0 +1,62 @@
+# Pilot step 5: moment-constrained substructure module, in-sample on set8.
+#   docs/sr2_substructure_module.md  section 4 (Option B, native tiles)
+#   docs/sr2_moment_constraint.md    section 5 (the target is Pi(Psi_HR-Psi_SR2))
+#
+# The flow generates the projected residual d (6 ch) per 64^3 Lagrangian tile,
+# conditioned on the frozen SR2 tile + LR host channels; inference adds Pi(d) back
+# to SR2 and Rockstar gates the box. Trained on set8's 512 tiles (in-sample) --
+# the one box with both host features and a moment target on disk.
+
+box: set8
+direct_config: configs/reward/sr2_direct_finetune.yaml  # data/model/geometry plumbing
+base_seed: 0            # frozen SR2 realisation; matches the cached moment target
+sr2_batch: 8            # tiles per generator forward when (re)building the SR2 box
+moment_mode: affine     # Pi basis at inference (matches build_moment_target)
+
+# Local-scale normalization (docs section 4.2): s = smoothed rms |Psi_SR2|.
+scale_k: 3              # box-filter width in Lagrangian sites (~3-4)
+scale_eps: 1.0e-3       # void floor so the division is stable
+
+model:
+  width: 64
+  num_levels: 3         # 64^3 tile -> bottleneck 8^3
+  blocks_per_level: 1
+  use_resblocks: true
+  norm: group
+  num_groups: 8
+  activation: silu
+  embed_dim: 128
+  zero_init_tail: true  # velocity starts at 0 (module is additive on frozen SR2)
+  use_checkpoint: false
+
+train:
+  seed: 0
+  device: cuda
+  steps: 20000
+  batch_size: 8
+  lr: 2.0e-4
+  amp: true             # fp16 autocast + GradScaler
+  log_every: 50
+  eval_every: 1000      # conditional-spread instrument (collapse alarm, item 5)
+  eval_sample_steps: 20 # Euler steps for the spread samples
+  save_every: 2000
+
+# In-loop Rockstar on the cluster host -- the physical signal (does d make bound
+# subhalos?). A region diagnostic on one host under a mini-box, not the full-box
+# gate; the cand-vs-base gap and the trend are what to watch. Runs a Rockstar
+# subprocess on the GPU node's CPUs every `every` steps (base/HR cached once).
+eval_rockstar:
+  enabled: true
+  every: 4000           # Rockstar is slower than the field metrics; run it rarely
+  host_id: 717          # set8's most massive host (logM 14.84), from the figure
+  region_sites: 192     # cube edge in HR sites (3 tiles ~ 37.5 Mpc/h) around it
+  n_steps: 20           # Euler steps for the eval samples
+
+wandb:
+  mode: online          # online | offline | disabled (WANDB_API_KEY from ~/.bashrc)
+  project: cosmo_sr
+  name: substructure_set8
+  group: null
+
+output:
+  run_dir: runs/substructure_set8

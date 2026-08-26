@@ -1,0 +1,23 @@
+# LAGRANGIAN-ONLY CRITIC, ARM D -- arm C with the flow loss demoted 10x.
+#
+# This is the closest reachable approximation to SR2's actual loss structure:
+# when the adversary is on, map2map runs `loss_adv.backward()` and nothing else
+# (map2map/train.py:411-417) -- the reconstruction loss is computed, logged, and
+# never applied. Its generator is trained by the critic alone.
+#
+# We do NOT go to lambda_flow: 0. In map2map the generator is a single forward
+# pass, so an adversarial-only gradient supervises all of it. Ours is a 4-step
+# rectified-flow ODE whose velocity field must be defined at every t, and the
+# flow-matching loss is the only term that supervises the trajectory rather than
+# just the endpoint. 0.1 demotes it to a regulariser while keeping the ODE
+# meaningful; the trainer refuses lambda_flow: 0 unless bp_steps is null.
+#
+# Read together with arm C, this separates "the adversarial term was too weak"
+# from "the mean-seeking term was too strong" -- they are not the same knob once
+# grad_clip and Adam's per-parameter scaling are in play.
+base: t13_lagonly_bp4_l03.yaml
+adv:
+  lambda_flow: 0.1           # <-- THE LEVER
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_lagonly_bp4_l03_flow01, group: dmsr_lagonly}
+output: {run_dir: runs/dmsr/t13_lagonly_bp4_l03_flow01_s0}

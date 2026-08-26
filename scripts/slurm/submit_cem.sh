@@ -38,7 +38,7 @@ OVERFIT_CFG="${OVERFIT_CFG:-configs/reward/fixed_host_overfit.yaml}"
 OVERFIT_BOXES="${OVERFIT_BOXES:-set0}"
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/cem_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/cem_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_cem.sh at $(date '+%F %T'); sourced by the
 # job preamble as a positional argument.

@@ -401,10 +401,14 @@ class SR2DiscriminatorProxy(ProxyBase):
     The input is the exact 20-channel :func:`critic_input` the SR2 discriminator
     was trained with (6 upsampled LR + 6 candidate displacement/velocity + 8
     inverse-pixel-shuffled fine density), built per tile and passed in as
-    ``features``; nothing is cached. Only the head differs from the original
-    critic: a ``Linear(hidden, 16)`` in place of the ``Linear(hidden, 1)``. The
-    weights are freshly initialised because no compatible SR2 discriminator
-    checkpoint exists, so this measures the architecture, not a pretraining.
+    ``features``; nothing is cached. Only the head differs from
+    :class:`~cosmo_sr.reward.sr2_adversarial.SR2Critic`: a ``Linear(hidden, 16)``
+    in place of ``Linear(hidden, 1)``. The weights are freshly initialised
+    because no compatible SR2 discriminator checkpoint exists, so this measures an
+    architecture, not a pretraining. And that architecture is SR2Critic's, which
+    is an SR2-STYLE reconstruction of the discriminator, not a verified copy of
+    the original (see SR2Critic's docstring): a negative arm-F result is evidence
+    about this network, not proof that "the original SR2 discriminator failed".
 
     No input standardiser on purpose: keeping the untouched critic input is what
     makes this a clean discriminator-architecture test, and the critic's own

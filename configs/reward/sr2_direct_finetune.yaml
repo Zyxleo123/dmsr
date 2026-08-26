@@ -14,6 +14,17 @@
 reward_config: configs/reward/reward.yaml
 freeze: configs/sr2_baseline/freeze.yaml
 
+# Weights & Biases logging. Every metrics.jsonl row is mirrored to a wandb run
+# so the guards, the reward and the per-term gradient norms are watchable live.
+# It is off only if `mode: disabled` here or `--no-wandb` on the command line;
+# without WANDB_API_KEY it falls back to `offline` (runs still captured under the
+# stage directory) rather than dropping the log. project/entity also read from
+# the WANDB_PROJECT / WANDB_ENTITY environment variables.
+wandb:
+  mode: online
+  project: cosmo_sr_direct
+  entity:
+
 model:
   # The pretrained generator every stage starts from. theta_0.
   path: external/SRS-map2map/SRmodel/G_z0.pt
@@ -168,6 +179,22 @@ proxy:
   # (primary), and a SMALL absolute-count calibration term. sigma_R (the dR
   # normaliser) is a robust scale computed from the fit boxes only, inside the
   # trainer.
+  # Which reward the proxy is trained to predict/rank. The per-tile swap dR is
+  # computed with this key in torch_reward.delta_reward_swap.
+  #   dR_hosted_subs  log10(sum occ_numerator): "subhalos in a resolved host".
+  #                   Monotone, numerator-only (cannot be gamed by deleting
+  #                   hosts), stable across seeds -- selected by
+  #                   reward_stability_scan (rho_box 0.86 vs 0.48 for R_cat).
+  #   dR_combined     the legacy w_occ*R_occ + w_joint*R_cat Mahalanobis target.
+  # The occupation ratio was raised by host deletion on the alpha ladder, so it
+  # is no longer the training target; see docs/sr2_direct_finetune.md.
+  reward_target: dR_hosted_subs
+  # Sources to EXCLUDE from the fit rows (never from disk). [] keeps everything.
+  # The intervention alpha ladder is kept deliberately under dR_hosted_subs: the
+  # target already scores its host-deleting tiles ~0, and the interventions are
+  # the only tile-scale small edits between frozen (0) and HR (+30k subhalos),
+  # which is the regime the actor works in. Set [intervention] to drop them.
+  drop_sources: []
   reward_change_weight: 1.0
   ranking_weight: 1.0
   count_calibration_weight: 0.1
@@ -200,11 +227,16 @@ proxy:
   # spread the actor's uncertainty penalty needs is the spread over which boxes
   # were seen, which is the real sampling variability.
   bootstrap_boxes: true
-  # Spatial arms (C-F) train for a fixed, smaller epoch budget than the MLP: a
-  # convolution over 512 tokens or 32^3 cells is a far larger step than a
-  # two-layer MLP on 44 numbers. Predeclared before any held-out number is seen;
-  # no per-arm tuning and no held-out sweep.
-  spatial_epochs: 50
+  # Spatial arms (C-F) train for the SAME number of full-batch Adam updates as
+  # the MLP. The earlier 50 was justified by "a convolution is a far larger step
+  # than a two-layer MLP" -- but that is a statement about per-epoch COST, not
+  # about how many optimisation steps a network needs to converge, and the larger
+  # spatial nets need at least as many as the flat one, not 8x fewer. 50 updates
+  # left them substantially undertrained (see the code review), which would read
+  # as "the spatial features do not work" when it was the budget. Raised to match
+  # `epochs` above. NOTE: this is a training-budget change; the spatial proxies
+  # (C-F) must be retrained and re-gated. It costs more GPU time per arm.
+  spatial_epochs: 400
   # Each spatial model class gets ONE fixed, predeclared architecture -- there is
   # no hyperparameter sweep in this experiment (see proxy_cv below). Everything
   # shared (losses, weights, optimizer budget, bootstrap draws) comes from the
@@ -223,10 +255,13 @@ proxy:
     # 10 -> 16 -> 32 -> 64, stride 2 each (32^3 -> 4^3), then mean+max pooling.
     channels: [16, 32, 64]
     strides: [2, 2, 2]
-  arm_f:                         # SR2DiscriminatorProxy: the SR2 critic body
-    # The exact SR2Critic trunk (width 64, depth 4) on the 20-channel critic
-    # input, with the scalar head replaced by the 16-output catalog head. Fresh
-    # weights -- no compatible SR2 discriminator checkpoint exists.
+  arm_f:                         # SR2DiscriminatorProxy: an SR2-style critic body
+    # The SR2Critic trunk (width 64, depth 4) on the 20-channel critic input,
+    # with the scalar head replaced by the 16-output catalog head. Fresh weights
+    # -- no compatible SR2 discriminator checkpoint exists. NOTE: SR2Critic
+    # reproduces the discriminator's INPUT contract exactly but its architecture
+    # is an SR2-style reconstruction, not a verified copy of the original; a
+    # negative arm-F result is not evidence that the original discriminator fails.
     width: 64
     depth: 4
 
@@ -245,9 +280,20 @@ proxy_cv:
 # reason to improve the proxy or its data, or to move to the true-catalog
 # oracle-renderer experiment.
 proxy_gate:
+  # Two candidates whose true reward differs by less than this are a tie and are
+  # not graded on ordering. "auto" = the seed-noise floor of the intervention
+  # rows' true dR, measured per run (robust scale). This matters for the
+  # numerator-count target dR_hosted_subs: the alpha ladder edits ~2% of the box
+  # around 24 hosts and so barely moves the whole-box count, leaving the non-HR
+  # candidates within a tile near-tied. At margin 0 the ranking metrics grade the
+  # proxy on ordering that noise; the margin removes it. The full sweep
+  # (0, floor, 2x, 4x) is always reported under ranking_margin_sweep. Set 0.0 to
+  # recover the old zero-margin behaviour.
+  rank_min_margin: auto
   min_within_tile_spearman: 0.5
   min_pairwise_accuracy: 0.65
-  # Fraction of proxy-selected top candidates that really improved R_occ.
+  # Fraction of proxy-selected top candidates that really improved the training
+  # target (proxy.reward_target; dR_hosted_subs by default).
   min_selected_positive_fraction: 0.6
   # Single-feature ablation: dropping any one feature must not leave the proxy
   # essentially as good, or the "proxy" is one number wearing a vector's name.
@@ -429,6 +475,16 @@ adversarial:
   # shuffled fine CIC density = 20 channels.
   density_grid_mult: 2
   critic_warmup_steps: 1000
+  # Arm F's density channel: deposit it with the valid-centre CIC (true) instead
+  # of the wrapped `% ng` deposit (false). On a single tile the wrap scrambles
+  # the density to r = 0.08 vs truth (docs/density_collapse_investigation.md);
+  # the valid-centre deposit scores the central tile/2 Eulerian sub-cube, which
+  # the tile's own particles fill at r = 1.0 with no neighbour buffer. Region
+  # follows soft_structure.region_fraction, so arms A and F share one convention.
+  # NOTE: changing this changes arm F's feature schema -- the arm-F proxy must be
+  # retrained and re-gated. Arm F features are not cached, so nothing else needs
+  # regenerating.
+  density_valid_center: true
 
 paths:
   # Every bulky artifact of this line. NOT the repository, NOT home.

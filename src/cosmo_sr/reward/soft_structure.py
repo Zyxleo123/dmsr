@@ -69,7 +69,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from ..eval.density import cic_density_valid_center
+from ..eval.density import cic_density_valid_center, valid_center_bulk
 from ..losses.flow import _kbin_index
 
 __all__ = [
@@ -155,12 +155,17 @@ class SoftStructureConfig:
 # Density
 # --------------------------------------------------------------------------- #
 def density_from_disp(
-    disp: torch.Tensor, cfg: Optional[SoftStructureConfig] = None
+    disp: torch.Tensor, cfg: Optional[SoftStructureConfig] = None,
+    bulk: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``(B, 1, R, R, R)`` valid-centre overdensity from ``(B, 3, N, N, N)`` displacement.
 
     Displacement channels only -- passing a six-channel field here would deposit
     particles at ``q + velocity``, which is not a position.
+
+    ``bulk`` shares an externally computed origin (see
+    :func:`cosmo_sr.eval.density.valid_center_bulk`) so a candidate is deposited
+    on its frozen reference's grid rather than its own rounded bulk.
     """
     cfg = cfg or SoftStructureConfig()
     if disp.dim() != 5:
@@ -171,6 +176,7 @@ def density_from_disp(
     return cic_density_valid_center(
         d, cfg.cellsize_kpc_h, float(cfg.dis_norm_kpc_h),
         region=cfg.region_of(int(d.shape[-1])), grid_mult=int(cfg.grid_mult),
+        bulk=bulk,
     )
 
 
@@ -292,9 +298,13 @@ def paired_features(
     such gradient is a pure artefact of the graph.
     """
     cfg = cfg or SoftStructureConfig()
-    cand = soft_structure_features(density_from_disp(candidate_disp, cfg), cfg)
+    # One shared origin, taken from the frozen reference, so the difference below
+    # is a true candidate-minus-frozen and not a whole-cell registration jitter.
+    bulk = valid_center_bulk(frozen_disp[:, 0:3], cfg.cellsize_kpc_h,
+                             float(cfg.dis_norm_kpc_h))
+    cand = soft_structure_features(density_from_disp(candidate_disp, cfg, bulk), cfg)
     with torch.no_grad():
-        base = soft_structure_features(density_from_disp(frozen_disp, cfg), cfg)
+        base = soft_structure_features(density_from_disp(frozen_disp, cfg, bulk), cfg)
     return torch.cat([cand, cand - base.detach()], dim=1)
 
 

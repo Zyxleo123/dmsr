@@ -38,6 +38,33 @@ from cosmo_sr.reward.torch_reward import TorchSummary  # noqa: E402
 
 COUNT_KEYS = ("n_sub", "n_host", "occ_numerator")
 
+#: Pooled-count floor, in objects, for the log-ratio error. A pooled count below
+#: half an object across a whole box is "not there"; two such counts agree
+#: (excluded, no error to score), but a zero on ONE side against a real count on
+#: the other is a miss and must be scored, not dropped. Without this floor
+#: ``log10(0)`` is undefined, the row goes to NaN, and ``nanmean``/``nanmax``
+#: silently exclude a catastrophic miss -- which makes a worse proxy look better.
+COUNT_FLOOR = 0.5
+
+
+def _log_ratio_error(pred: np.ndarray, true: np.ndarray,
+                     floor: float = COUNT_FLOOR) -> np.ndarray:
+    """``|log10(pred) - log10(true)|`` per bin, with a shared count floor.
+
+    Both sides are floored to ``floor`` before the log, so a bin that is a real
+    count on one side and exactly zero on the other yields a finite, magnitude-
+    aware penalty (missing 1000 objects costs more than missing one). Only a bin
+    that is below the floor on BOTH sides is excluded (NaN): there is genuinely
+    nothing there to get wrong. Bins already above the floor on both sides are
+    unchanged, so this only ever adds error where the old code dropped it.
+    """
+    p = np.asarray(pred, dtype=np.float64)
+    t = np.asarray(true, dtype=np.float64)
+    both_empty = (p < floor) & (t < floor)
+    e = np.abs(np.log10(np.maximum(p, floor)) - np.log10(np.maximum(t, floor)))
+    e[both_empty] = np.nan
+    return e
+
 
 # --------------------------------------------------------------------------- #
 # The table
@@ -286,7 +313,7 @@ class FieldArmFeatures(ArmFeatures):
 
     def __init__(self, rows: Sequence[Mapping], *, field_path, lr_loader, tile_grid,
                  cellsize_kpc_h: float, dis_norm_kpc_h: float, grid_mult: int,
-                 scale_factor: int, in_channels: int = 20):
+                 scale_factor: int, in_channels: int = 20, valid_center: int = 0):
         self.box = [str(r["box"]) for r in rows]
         self.tag = [str(r["tag"]) for r in rows]
         self.tile_id = [int(r["tile_id"]) for r in rows]
@@ -298,6 +325,10 @@ class FieldArmFeatures(ArmFeatures):
         self.grid_mult = int(grid_mult)
         self.scale = int(scale_factor)
         self.in_channels = int(in_channels)
+        # >0 switches critic_input to the valid-centre CIC that scores the
+        # central `valid_center` Eulerian sub-cube; the emitted tile then has
+        # that spatial size, not the full tile.
+        self.valid_center = int(valid_center)
         self._lr_box: Optional[str] = None
         self._lr: Optional[np.ndarray] = None
 
@@ -306,7 +337,7 @@ class FieldArmFeatures(ArmFeatures):
 
     @property
     def per_row_shape(self) -> Tuple[int, ...]:
-        s = int(self.grid.tile_hr)
+        s = self.valid_center if self.valid_center > 0 else int(self.grid.tile_hr)
         return (self.in_channels, s, s, s)
 
     def _lr_for(self, box: str) -> np.ndarray:
@@ -343,7 +374,8 @@ class FieldArmFeatures(ArmFeatures):
                 device=dev)
             ci = critic_input(lrtile.unsqueeze(0), ftile.unsqueeze(0),
                               cellsize_kpc_h=self.cellsize,
-                              dis_norm_kpc_h=self.dis_norm, grid_mult=self.grid_mult)
+                              dis_norm_kpc_h=self.dis_norm, grid_mult=self.grid_mult,
+                              valid_center=self.valid_center)
             out[k] = ci[0]
         return torch.stack(out, dim=0)
 
@@ -369,8 +401,8 @@ def make_arm_features(arm: str, rows: Sequence[Mapping],
                                   [int(r["row_id"]) for r in rows])
     if cfg is None:
         raise SystemExit(f"arm {arm!r} streams raw fields; make_arm_features needs cfg")
-    from _sr2_direct import (geometry_of, load_lr, soft_config_of,  # noqa: E402
-                             tile_grid_of)
+    from _sr2_direct import (arm_f_valid_center, geometry_of, load_lr,  # noqa: E402
+                             soft_config_of, tile_grid_of)
     scfg = soft_config_of(cfg)
     grid_mult = int(dict(cfg.get("adversarial", {})).get("density_grid_mult", 2))
     return FieldArmFeatures(
@@ -382,7 +414,8 @@ def make_arm_features(arm: str, rows: Sequence[Mapping],
         dis_norm_kpc_h=float(scfg.dis_norm_kpc_h),
         grid_mult=grid_mult,
         scale_factor=int(geometry_of(cfg).scale_factor),
-        in_channels=12 + grid_mult ** 3)
+        in_channels=12 + grid_mult ** 3,
+        valid_center=arm_f_valid_center(cfg))
 
 
 # --------------------------------------------------------------------------- #
@@ -762,14 +795,24 @@ def group_indices(box: np.ndarray, tile_id: np.ndarray) -> Dict[Tuple[str, int],
 
 
 def rank_metrics(pred: np.ndarray, true: np.ndarray, box: np.ndarray,
-                 tile_id: np.ndarray) -> Dict[str, float]:
+                 tile_id: np.ndarray, *, min_margin: float = 0.0) -> Dict[str, float]:
     """Within-``(box, tile)`` ranking quality.
 
     Grouped and never pooled: a correlation across tiles rewards knowing which
     tiles are host-rich, which is true and useless -- the actor changes what
     happens *in* a tile.
+
+    ``min_margin`` is the reward-difference floor below which two candidates are
+    a tie. At 0 (the default) every candidate is graded against every other,
+    including pairs separated only by label noise -- which is the wrong bar for a
+    numerator-count target, where a tile's non-HR candidates are near-tied. With
+    ``min_margin > 0`` the pairwise accuracy drops sub-margin pairs, and the
+    Spearman is taken against the true reward **snapped to the margin grid** so
+    that within-margin candidates become exact ties and carry averaged ranks
+    instead of demanding the proxy order noise.
     """
     rhos, accs, n_pairs = [], [], 0
+    m = float(min_margin)
     for idx in group_indices(box, tile_id).values():
         if len(idx) < 2:
             continue
@@ -778,10 +821,16 @@ def rank_metrics(pred: np.ndarray, true: np.ndarray, box: np.ndarray,
         if ok.sum() < 2:
             continue
         pi, ti = p[ok], t[ok]
-        rhos.append(spearman(pi, ti))
+        ts = np.round(ti / m) * m if m > 0 else ti
+        # A group whose true rewards are all within one margin of each other has
+        # no rankable structure at this resolution; skip it rather than average a
+        # NaN/degenerate rho into the mean.
+        if m > 0 and np.ptp(ts) == 0.0:
+            continue
+        rhos.append(spearman(pi, ts))
         # Tie-aware: a prediction tie on a non-tied true pair scores 0.5, not the
         # accidental "correct" a plain ``==`` gives it on a descending true pair.
-        acc, npair = tie_aware_agreement(pi, ti)
+        acc, npair = tie_aware_agreement(pi, ti, min_margin=m)
         if npair:
             accs.append(acc)
             n_pairs += npair
@@ -789,6 +838,7 @@ def rank_metrics(pred: np.ndarray, true: np.ndarray, box: np.ndarray,
         "within_tile_spearman": float(np.nanmean(rhos)) if rhos else float("nan"),
         "pairwise_accuracy": float(np.mean(accs)) if accs else float("nan"),
         "n_groups": len(rhos), "n_pairs": int(n_pairs), "n_rows": int(pred.size),
+        "min_margin": m,
     }
 
 
@@ -805,9 +855,7 @@ def pooled_count_error(pred: Mapping[str, np.ndarray],
     for k in COUNT_KEYS:
         p = np.asarray(pred[k], dtype=np.float64).sum(axis=0)
         t = np.asarray(true[k], dtype=np.float64).sum(axis=0)
-        ok = (p > 0) & (t > 0)
-        e = np.full(p.shape, np.nan)
-        e[ok] = np.abs(np.log10(p[ok]) - np.log10(t[ok]))
+        e = _log_ratio_error(p, t)
         out[f"pooled_{k}_pred"] = p.tolist()
         out[f"pooled_{k}_true"] = t.tolist()
         out[f"{k}_log_error"] = e.tolist()
@@ -818,9 +866,18 @@ def pooled_count_error(pred: Mapping[str, np.ndarray],
     ts = np.asarray(true["occ_numerator"], dtype=np.float64).sum(axis=0)
     po = np.divide(ps, ph, out=np.full_like(ps, np.nan), where=ph > 0)
     to = np.divide(ts, th, out=np.full_like(ts, np.nan), where=th > 0)
-    ok = np.isfinite(po) & np.isfinite(to) & (po > 0) & (to > 0)
+    # Occupation error floors the SUB numerator (not the ratio), so "hosts exist
+    # but no subhaloes predicted" (ps = 0, ph > 0) is a finite occupation miss
+    # rather than an excluded row. Occupation stays undefined -- and excluded --
+    # only where there are no hosts on a side (ph = 0 or th = 0); that host
+    # discrepancy is already scored in the n_host term above.
+    pof = np.divide(np.maximum(ps, COUNT_FLOOR), ph,
+                    out=np.full_like(ps, np.nan), where=ph > 0)
+    tof = np.divide(np.maximum(ts, COUNT_FLOOR), th,
+                    out=np.full_like(ts, np.nan), where=th > 0)
+    ok = np.isfinite(pof) & np.isfinite(tof)
     oe = np.full(po.shape, np.nan)
-    oe[ok] = np.abs(np.log10(po[ok]) - np.log10(to[ok]))
+    oe[ok] = np.abs(np.log10(pof[ok]) - np.log10(tof[ok]))
     out["predicted_occupation"] = po.tolist()
     out["true_occupation"] = to.tolist()
     out["occupation_log_error"] = oe.tolist()

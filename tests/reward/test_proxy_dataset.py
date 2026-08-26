@@ -95,12 +95,16 @@ def small_cfg(tmp_path, reward_root):
     cfg = yaml.safe_load(json.dumps(CONFIG))  # deep copy through json
     cfg["proxy_dataset"].update({"boxes": ["set0"], "frozen_seeds": [0, 1],
                                  "alphas": [1.0], "diagnostic_boxes": []})
+    # A tiny tiling (128/64 = 2 per axis -> 8 tiles) so a fixture can hold the
+    # WHOLE tiling: the indexer now requires every one of grid.n_tiles tiles to
+    # be labelled, and _fake_candidate writes exactly that many.
+    cfg.setdefault("geometry", {}).update({"ng_hr": 128, "tile_hr": 64})
     p = tmp_path / "direct.yaml"
     p.write_text(yaml.safe_dump(cfg))
     return p
 
 
-def _fake_candidate(box, tag, *, n_tiles=2, label_ok=True, additivity=0.0,
+def _fake_candidate(box, tag, *, n_tiles=8, label_ok=True, additivity=0.0,
                     field_sha="f00d"):
     """A candidate directory with the files the indexer reads, and nothing else."""
     from _sr2_direct import direct_root, write_json_atomic
@@ -224,6 +228,39 @@ def test_a_label_describing_a_stale_field_is_excluded(small_cfg):
                for x in report["candidates_invalid"])
 
 
+def test_a_candidate_short_of_the_full_tiling_is_excluded(small_cfg):
+    """Fewer tile summaries than the grid is incomplete, not a smaller candidate.
+
+    The old indexer silently dropped the unmatched feature rows and still counted
+    the candidate as labelled-ok, so a candidate short of 512 tiles could mark the
+    whole dataset complete.
+    """
+    from _sr2_direct import direct_root, labels_complete_path
+
+    matrix = candidate_matrix(yaml.safe_load(small_cfg.read_text()))
+    for i, c in enumerate(matrix):
+        # candidate 0 labels only 4 of the grid's 8 tiles
+        _fake_candidate(c["box"], c["tag"], n_tiles=(4 if i == 0 else 8))
+    assert _index(small_cfg) == 0
+    report = json.loads((direct_root("proxy_data") / "index_report.json").read_text())
+    assert report["candidates_incomplete_tiles"]
+    assert report["candidates_incomplete_tiles"][0]["n_feature_tiles"] == 4
+    assert not labels_complete_path().is_file()
+
+
+def test_an_undeclared_candidate_is_excluded_and_blocks_the_marker(small_cfg):
+    """A directory the matrix never asked for must not fold into the table."""
+    from _sr2_direct import direct_root, labels_complete_path
+
+    for c in candidate_matrix(yaml.safe_load(small_cfg.read_text())):
+        _fake_candidate(c["box"], c["tag"])
+    _fake_candidate("set0", "intervention_both_a9.99_seed7")  # not in the matrix
+    assert _index(small_cfg) == 0
+    report = json.loads((direct_root("proxy_data") / "index_report.json").read_text())
+    assert any("a9.99" in u for u in report["candidates_unexpected"])
+    assert not labels_complete_path().is_file()
+
+
 def test_the_index_is_written_atomically(small_cfg):
     """No .tmp survives, so a reader sees a complete table or the previous one."""
     from _sr2_direct import direct_root
@@ -273,6 +310,55 @@ def test_load_rows_refuses_a_stale_feature_schema(reward_root, tmp_path):
         "complete": True, "rows": 1, "feature_schema_version": 2})
     with pytest.raises(SystemExit, match="feature schema 2"):
         P.load_rows(table, require_complete=True)
+
+
+def test_pooled_error_scores_a_zero_prediction_miss():
+    """Truth positive, prediction exactly zero must be a large finite error.
+
+    The old ``(p>0)&(t>0)`` mask sent such a bin to NaN, which ``nanmean``/
+    ``nanmax`` then dropped -- so a catastrophic miss IMPROVED the metric.
+    """
+    from _proxy_data import pooled_count_error
+
+    true = {"n_host": np.array([[100.0, 50.0]]),
+            "n_sub": np.array([[200.0, 40.0]]),
+            "occ_numerator": np.array([[80.0, 30.0]])}
+    # Hosts are predicted correctly, but the second bin's subhaloes -- and thus
+    # its occupation -- are missed entirely (predicted zero where the truth has
+    # 40 subs / occupation 0.6). Both misses must score, not drop to NaN.
+    pred = {"n_host": np.array([[100.0, 50.0]]),
+            "n_sub": np.array([[200.0, 0.0]]),
+            "occ_numerator": np.array([[80.0, 0.0]])}
+    out = pooled_count_error(pred, true)
+    se = np.asarray(out["n_sub_log_error"])
+    oe = np.asarray(out["occupation_log_error"])
+    assert np.isfinite(se[1]) and se[1] > 1.0          # the subhalo miss is scored
+    assert np.isfinite(oe[1]) and oe[1] > 1.0          # the occupation miss too
+    assert np.isfinite(out["max_log_error"]) and out["max_log_error"] > 1.0
+
+    # A host miss (predicted zero hosts) is scored through the n_host term; its
+    # occupation is legitimately undefined (no hosts) and stays excluded.
+    pred_hostmiss = {"n_host": np.array([[100.0, 0.0]]),
+                     "n_sub": np.array([[200.0, 40.0]]),
+                     "occ_numerator": np.array([[80.0, 30.0]])}
+    out2 = pooled_count_error(pred_hostmiss, true)
+    assert np.isfinite(np.asarray(out2["n_host_log_error"])[1]) and \
+        np.asarray(out2["n_host_log_error"])[1] > 1.0
+
+
+def test_pooled_error_unchanged_when_both_sides_positive():
+    """Bins comfortably above the floor are scored exactly as before."""
+    from _proxy_data import pooled_count_error
+
+    true = {"n_host": np.array([[100.0, 50.0]]),
+            "n_sub": np.array([[200.0, 40.0]]),
+            "occ_numerator": np.array([[80.0, 30.0]])}
+    pred = {"n_host": np.array([[120.0, 40.0]]),
+            "n_sub": np.array([[180.0, 45.0]]),
+            "occ_numerator": np.array([[70.0, 25.0]])}
+    out = pooled_count_error(pred, true)
+    he = np.asarray(out["n_host_log_error"])
+    assert np.allclose(he, np.abs(np.log10([120.0, 40.0]) - np.log10([100.0, 50.0])))
 
 
 # --------------------------------------------------------------------------- #

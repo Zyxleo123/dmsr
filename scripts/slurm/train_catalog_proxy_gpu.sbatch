@@ -29,6 +29,13 @@ source "$_D/_sr2_direct_common.sh" "$@"
 set -euo pipefail
 
 : "${ARMS:=a b c d e f}"
+# SET: space-separated dotted config overrides, each passed as `--set K=V` to BOTH
+# the fit and the gate so they never disagree on the config. Lets an experiment
+# (e.g. within-tile-contrastive loss weights) run into its own RUN_NAME without
+# editing the yaml. Example: SET="proxy.ranking_weight=5 proxy.reward_change_weight=0.3"
+: "${SET:=}"
+SET_ARGS=()
+for kv in $SET; do SET_ARGS+=(--set "$kv"); done
 
 require_input "$REWARD_MODEL_JSON" "scripts/slurm/fit_reward_model_cpu.sbatch"
 # The marker, not the table: a rows.jsonl exists as soon as ONE candidate has
@@ -39,12 +46,12 @@ require_input "$DMSR_SR2_DIRECT_ROOT/proxy_data/labels_complete.json" \
 
 python -u scripts/reward/train_catalog_proxy.py \
     --config "$DIRECT_CFG" --run-name "$RUN_NAME" --device "${DEVICE:-cuda}" \
-    --arms ${ARMS//,/ }
+    --arms ${ARMS//,/ } "${SET_ARGS[@]}"
 
 for ARM in ${ARMS//,/ }; do
     python -u scripts/reward/gate_catalog_proxy.py \
         --config "$DIRECT_CFG" --run-name "$RUN_NAME" --arm "$ARM" \
-        --device "${DEVICE:-cuda}"
+        --device "${DEVICE:-cuda}" "${SET_ARGS[@]}"
 done
 
 python - "$DMSR_SR2_DIRECT_ROOT/runs/$RUN_NAME" ${ARMS//,/ } <<'PY'

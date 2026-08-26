@@ -76,7 +76,7 @@ read -r -a _SEEDS <<< "$FROZEN_SEEDS"
 read -r -a _ALPHAS <<< "$ALPHAS"
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/direct_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/direct_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_sr2_direct.sh at $(date '+%F %T'); sourced by
 # the job preamble as a positional argument.

@@ -49,7 +49,8 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "reward" / "sr2_direct_finetune.yaml
 
 __all__ = [
     "DEFAULT_CONFIG", "PROJECT_ROOT", "actor_config_of", "add_direct_args",
-    "append_jsonl", "banner", "bins_of", "boxes_of", "candidate_matrix",
+    "append_jsonl", "arm_f_valid_center", "banner", "bins_of", "boxes_of",
+    "candidate_matrix",
     "candidate_tag", "code_commit", "dataset_of", "direct_root", "file_sha",
     "geometry_of", "gate_of", "labels_complete_path", "load_direct_config",
     "load_lr", "load_hr", "load_reward_models", "manifest_row",
@@ -159,6 +160,25 @@ def soft_config_of(cfg: Mapping) -> SoftStructureConfig:
         ng_hr=int(g.get("ng_hr", 512)),
         dis_norm_kpc_h=float(g.get("dis_norm_kpc_h", 6000.0)),
     )
+
+
+def arm_f_valid_center(cfg: Mapping) -> int:
+    """The valid-centre CIC region (HR cells) for arm F's density channel.
+
+    One source of truth for both the OFFLINE feature provider
+    (:class:`_proxy_data.FieldArmFeatures`) and the LIVE extractor
+    (:meth:`cosmo_sr.train.train_sr2_direct.DirectFinetuneTrainer._extract`), so
+    the proxy is fine-tuned against exactly the density it was trained on.
+
+    ``0`` restores the historical wrapped ``% ng`` deposit -- a single-tile
+    scrambling that correlates ``r = 0.08`` with the tile's true density (see
+    ``docs/density_collapse_investigation.md``). The default follows arm A's
+    ``soft_structure.region_fraction`` so the two arms share one valid-centre
+    convention.
+    """
+    if not bool(dict(cfg.get("adversarial", {})).get("density_valid_center", True)):
+        return 0
+    return int(soft_config_of(cfg).region_of(int(tile_grid_of(cfg).tile_hr)))
 
 
 def phase_space_config_of(cfg: Mapping) -> PhaseSpaceConfig:

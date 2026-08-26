@@ -54,6 +54,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..eval.density import valid_center_bulk
 from .catalog_proxy import ProxyBase, register_proxy
 from .phase_space import (
     G_MPC_KMS2_PER_MSUN, PhaseSpaceConfig, _central_divergence,
@@ -158,13 +159,15 @@ def soft_rockstar_tokens(
     cfg: Optional[SoftStructureConfig] = None,
     ps: Optional[PhaseSpaceConfig] = None,
     rcfg: Optional[SoftRockstarConfig] = None,
+    bulk: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``(B, T, F)`` token features of a ``(B, C>=6, N, N, N)`` crop.
 
     Differentiable in the field. ``T = tokens_per_axis^3`` and ``F`` is
     ``len(token_feature_names())``; the token order is the C order of the token
     grid and is therefore deterministic -- the *model* is what must not depend
-    on it, which is the permutation-invariance test's job.
+    on it, which is the permutation-invariance test's job. ``bulk`` shares the
+    frozen reference's deposit origin (see :func:`soft_rockstar_paired_tokens`).
     """
     cfg = cfg or SoftStructureConfig()
     ps = ps or PhaseSpaceConfig()
@@ -177,7 +180,7 @@ def soft_rockstar_tokens(
             f"{field.shape[1]}; a 3-channel field has no phase space to token-ise")
 
     m, vbar, sigma2 = deposit_phase_space(
-        field[:, 0:3], field[:, 3:6], cfg, ps)
+        field[:, 0:3], field[:, 3:6], cfg, ps, bulk=bulk)
     b, r = int(m.shape[0]), int(m.shape[-1])
     t = int(rcfg.tokens_per_axis)
     if r % t:
@@ -208,8 +211,14 @@ def soft_rockstar_tokens(
                  for s in rcfg.contrast_scales]
 
     vref = float(ps.v_ref_km_s)
-    # 3. Velocity dispersion of the token's material.
-    tok_vdisp = _pool_weighted(sigma2, m, p).clamp_min(0.0).sqrt() / vref
+    # 3. Velocity dispersion of the token's material. The `+ 1e-8` is not a
+    # forward guard (the pooled value is already >= 0): it keeps the sqrt off its
+    # singular point so the BACKWARD stays finite. An empty/low-mass token pools
+    # to sigma^2 == 0 exactly, where d/dx sqrt(x) is infinite, and clamp_min(0.0)
+    # pins it there -- so the gradient into the field was NaN at those voxels
+    # (never seen offline: the gate is forward-only). Same idiom as the arm-E
+    # per-cell vdisp in phase_space.py.
+    tok_vdisp = (_pool_weighted(sigma2, m, p).clamp_min(0.0) + 1e-8).sqrt() / vref
 
     # 4. Convergence of the bulk-free flow: positive where material streams in.
     tok_neg_div = _pool_weighted(-_central_divergence(dv), m, p) / vref
@@ -255,9 +264,16 @@ def soft_rockstar_paired_tokens(
     weights never change. Slots pair token-by-token because the grids share
     their geometry -- token ``k`` of the candidate IS token ``k`` of frozen.
     """
-    cand = soft_rockstar_tokens(candidate, cfg, ps, rcfg)
+    cfg = cfg or SoftStructureConfig()
+    # Deposit both on the frozen reference's rounded origin so token k of the
+    # candidate is token k of frozen -- the claim the pairing depends on. Two
+    # independently rounded bulks can differ by a whole cell and misregister the
+    # grids, turning a sub-cell bulk change into a spurious token difference.
+    bulk = valid_center_bulk(frozen[:, 0:3], cfg.cellsize_kpc_h,
+                             float(cfg.dis_norm_kpc_h))
+    cand = soft_rockstar_tokens(candidate, cfg, ps, rcfg, bulk=bulk)
     with torch.no_grad():
-        base = soft_rockstar_tokens(frozen, cfg, ps, rcfg)
+        base = soft_rockstar_tokens(frozen, cfg, ps, rcfg, bulk=bulk)
     return torch.stack([cand, cand - base.detach()], dim=1)
 
 

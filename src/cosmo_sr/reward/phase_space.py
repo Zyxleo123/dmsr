@@ -82,7 +82,7 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from ..eval.density import cic_deposit_valid_center
+from ..eval.density import cic_deposit_valid_center, valid_center_bulk
 # The arm list lives in the torch-free :mod:`cosmo_sr.reward.arms` (so the
 # submitter can read it on a login node) and is re-exported here because every
 # existing caller imports it from this module.
@@ -204,6 +204,7 @@ def deposit_phase_space(
     vel: torch.Tensor,
     cfg: Optional[SoftStructureConfig] = None,
     ps: Optional[PhaseSpaceConfig] = None,
+    bulk: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(m, vbar, sigma2)`` from ONE CIC pass over the valid-centre region.
 
@@ -212,6 +213,10 @@ def deposit_phase_space(
     dispersion in (km/s)^2. Shared by arm B's crop summaries and arm C's token
     grid so the two arms cannot disagree about which particles landed in which
     cell -- a second, independent deposit could.
+
+    ``bulk`` shares an externally computed origin (see
+    :func:`cosmo_sr.eval.density.valid_center_bulk`) so a candidate and its
+    frozen reference land on the same grid.
     """
     cfg = cfg or SoftStructureConfig()
     ps = ps or PhaseSpaceConfig()
@@ -224,7 +229,8 @@ def deposit_phase_space(
     values = torch.cat([v, (v ** 2).sum(dim=1, keepdim=True)], dim=1)   # (B,4,...)
     raw_mass, acc = cic_deposit_valid_center(
         disp, values, cfg.cellsize_kpc_h, float(cfg.dis_norm_kpc_h),
-        region=cfg.region_of(int(disp.shape[-1])), grid_mult=int(cfg.grid_mult))
+        region=cfg.region_of(int(disp.shape[-1])), grid_mult=int(cfg.grid_mult),
+        bulk=bulk)
 
     m = raw_mass * float(int(cfg.grid_mult) ** 3)      # 1 + delta, as in the
     m = m.clamp_min(0.0)                               # density-only branch
@@ -246,16 +252,17 @@ def phase_space_features(
     vel: torch.Tensor,
     cfg: Optional[SoftStructureConfig] = None,
     ps: Optional[PhaseSpaceConfig] = None,
+    bulk: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``(B, 9)`` phase-space features of a crop.
 
     ``disp`` and ``vel`` are both ``(B, 3, N, N, N)`` in the stored normalised
     units -- the first three and last three channels of a six-channel field.
-    Differentiable in both.
+    Differentiable in both. ``bulk`` shares the frozen reference's deposit origin.
     """
     cfg = cfg or SoftStructureConfig()
     ps = ps or PhaseSpaceConfig()
-    m, vbar, sigma2 = deposit_phase_space(disp, vel, cfg, ps)
+    m, vbar, sigma2 = deposit_phase_space(disp, vel, cfg, ps, bulk=bulk)
     # Scalar fields are (B, 1, R, R, R) and reduce over `dims`; vector fields are
     # (B, 3, R, R, R) and must keep their component axis, so they reduce over
     # `sdims`. Using `dims` on a vector silently sums x, y and z together.
@@ -277,8 +284,13 @@ def phase_space_features(
     se = we.sum(dim=dims).clamp_min(1e-12)
 
     vref = float(ps.v_ref_km_s)
-    vdisp_c = ((wc * sigma2).sum(dim=dims) / sc).clamp_min(0.0).sqrt() / vref
-    vdisp_e = ((we * sigma2).sum(dim=dims) / se).clamp_min(0.0).sqrt() / vref
+    # `+ 1e-8` keeps the sqrt off its singular point so the gradient into the
+    # field stays finite: an empty region pools to sigma^2 == 0 exactly, where
+    # d/dx sqrt(x) is infinite and clamp_min(0.0) pins it there (NaN backward,
+    # invisible to the forward-only gate). Same fix as the arm-E per-cell vdisp
+    # below and the arm-C token vdisp in soft_rockstar.py.
+    vdisp_c = (((wc * sigma2).sum(dim=dims) / sc).clamp_min(0.0) + 1e-8).sqrt() / vref
+    vdisp_e = (((we * sigma2).sum(dim=dims) / se).clamp_min(0.0) + 1e-8).sqrt() / vref
 
     # Specific kinetic energy: bulk-relative streaming plus internal dispersion,
     # which together are the total kinetic energy per unit mass in the cell.
@@ -352,6 +364,7 @@ def phase_space_grid(
     vel: torch.Tensor,
     cfg: Optional[SoftStructureConfig] = None,
     ps: Optional[PhaseSpaceConfig] = None,
+    bulk: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``(B, 5, R, R, R)`` dense phase-space cells of a crop -- arm E's input.
 
@@ -376,7 +389,7 @@ def phase_space_grid(
     ps = ps or PhaseSpaceConfig()
     if disp.dim() != 5 or disp.shape[1] != 3:
         raise ValueError(f"expected disp (B, 3, N, N, N), got {tuple(disp.shape)}")
-    m, vbar, sigma2 = deposit_phase_space(disp, vel, cfg, ps)
+    m, vbar, sigma2 = deposit_phase_space(disp, vel, cfg, ps, bulk=bulk)
     vref = float(ps.v_ref_km_s)
 
     total = m.sum(dim=(1, 2, 3, 4)).clamp_min(1e-12)
@@ -408,9 +421,14 @@ def phase_space_paired_grid(
     the optimiser shrink the difference by moving a baseline whose weights never
     change. ``candidate`` and ``frozen`` are both ``(B, 6, N, N, N)`` fields.
     """
-    cand = phase_space_grid(candidate[:, 0:3], candidate[:, 3:6], cfg, ps)
+    cfg = cfg or SoftStructureConfig()
+    # Shared frozen origin so token/voxel k of the candidate really is voxel k of
+    # the frozen reference; see :func:`cosmo_sr.eval.density.valid_center_bulk`.
+    bulk = valid_center_bulk(frozen[:, 0:3], cfg.cellsize_kpc_h,
+                             float(cfg.dis_norm_kpc_h))
+    cand = phase_space_grid(candidate[:, 0:3], candidate[:, 3:6], cfg, ps, bulk=bulk)
     with torch.no_grad():
-        base = phase_space_grid(frozen[:, 0:3], frozen[:, 3:6], cfg, ps)
+        base = phase_space_grid(frozen[:, 0:3], frozen[:, 3:6], cfg, ps, bulk=bulk)
     return torch.stack([cand, cand - base.detach()], dim=1)
 
 
@@ -445,15 +463,17 @@ def arm_paired_feature_names(arm: str, cfg: Optional[SoftStructureConfig] = None
 
 def arm_features(field: torch.Tensor, arm: str,
                  cfg: Optional[SoftStructureConfig] = None,
-                 ps: Optional[PhaseSpaceConfig] = None) -> torch.Tensor:
+                 ps: Optional[PhaseSpaceConfig] = None,
+                 bulk: Optional[torch.Tensor] = None) -> torch.Tensor:
     """``(B, F)`` base features of one arm from a ``(B, C>=3, N, N, N)`` crop.
 
     Arm ``a`` needs only the displacement channels; arm ``b`` needs all six and
-    says so rather than silently scoring velocity as zero.
+    says so rather than silently scoring velocity as zero. ``bulk`` shares the
+    frozen reference's deposit origin (see :func:`arm_paired_features`).
     """
     cfg = cfg or SoftStructureConfig()
     a = _check_arm(arm)
-    dens = soft_structure_features(density_from_disp(field, cfg), cfg)
+    dens = soft_structure_features(density_from_disp(field, cfg, bulk), cfg)
     if a == "a":
         return dens
     if field.shape[1] < 6:
@@ -461,7 +481,8 @@ def arm_features(field: torch.Tensor, arm: str,
             f"arm 'b' needs 6 channels (displacement + velocity), got "
             f"{field.shape[1]}; a 3-channel field has no phase space to summarise")
     return torch.cat(
-        [dens, phase_space_features(field[:, 0:3], field[:, 3:6], cfg, ps)], dim=1)
+        [dens, phase_space_features(field[:, 0:3], field[:, 3:6], cfg, ps, bulk=bulk)],
+        dim=1)
 
 
 def arm_paired_features(candidate: torch.Tensor, frozen: torch.Tensor, arm: str,
@@ -474,9 +495,15 @@ def arm_paired_features(candidate: torch.Tensor, frozen: torch.Tensor, arm: str,
     because a gradient through the reference would let the optimiser shrink the
     difference by moving a baseline whose weights never change.
     """
-    cand = arm_features(candidate, arm, cfg, ps)
+    cfg = cfg or SoftStructureConfig()
+    # Deposit both on the frozen reference's rounded origin, so cand - base is a
+    # true difference and not a one-cell registration artefact between two
+    # independently rounded bulks.
+    bulk = valid_center_bulk(frozen[:, 0:3], cfg.cellsize_kpc_h,
+                             float(cfg.dis_norm_kpc_h))
+    cand = arm_features(candidate, arm, cfg, ps, bulk=bulk)
     with torch.no_grad():
-        base = arm_features(frozen, arm, cfg, ps)
+        base = arm_features(frozen, arm, cfg, ps, bulk=bulk)
     return torch.cat([cand, cand - base.detach()], dim=1)
 
 

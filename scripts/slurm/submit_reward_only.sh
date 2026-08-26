@@ -48,7 +48,7 @@ SCALES="${SCALES:-$ROOT/audits/correction_scales/correction_scales.json}"
 CALIB_SPLIT="${CALIB_SPLIT:-train}"
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/reward_only_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/reward_only_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_reward_only.sh at $(date '+%F %T'); sourced by
 # the job preamble as a positional argument.

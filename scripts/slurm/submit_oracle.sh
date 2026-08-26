@@ -52,7 +52,7 @@ N_VERIFY="${N_VERIFY:-12}"
 MODEL_BOXES="${MODEL_BOXES:-set0 set1 set2 set3 set4 set5 set6 set7 set8 set9 set10 set11}"
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/oracle_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/oracle_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_oracle.sh at $(date '+%F %T'); sourced by the
 # job preamble as a positional argument.

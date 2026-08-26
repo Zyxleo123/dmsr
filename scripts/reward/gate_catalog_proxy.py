@@ -60,7 +60,7 @@ from _proxy_baselines import load_baselines  # noqa: E402
 from _proxy_data import (  # noqa: E402
     ARMS, COUNT_KEYS, as_arrays, build_row_context, channel_mean_transform,
     load_rows, make_arm_features, pooled_count_error,
-    pooled_count_error_by_candidate, rank_metrics, slice_rows,
+    pooled_count_error_by_candidate, rank_metrics, robust_scale, slice_rows,
     stream_ensemble_delta, stream_pred_counts, true_delta_rewards, unit_ids_of,
 )
 from _sr2_direct import (  # noqa: E402
@@ -152,8 +152,8 @@ def uncertainty_calibration(mean: np.ndarray, std: np.ndarray,
 def feature_ablation(provider, members, ctx, reward_t, arrays, true: np.ndarray,
                      unit: np.ndarray, *, w_joint: float, w_occ: float,
                      names: Sequence[str], storage: str, n_channels: int,
-                     device, chunk_rows: int, abl_rows: Optional[np.ndarray] = None
-                     ) -> Dict[str, object]:
+                     device, chunk_rows: int, abl_rows: Optional[np.ndarray] = None,
+                     key: str = "dR_combined") -> Dict[str, object]:
     """Leave-one-feature-out: is any single coordinate doing all the work?
 
     Each input channel in turn is replaced by its own mean and the within-unit
@@ -175,7 +175,8 @@ def feature_ablation(provider, members, ctx, reward_t, arrays, true: np.ndarray,
     def _within(transform=None) -> float:
         mean, _ = stream_ensemble_delta(
             provider, members, ctx, reward_t, w_joint=w_joint, w_occ=w_occ,
-            chunk_rows=chunk_rows, device=device, rows=idxs, transform=transform)
+            key=key, chunk_rows=chunk_rows, device=device, rows=idxs,
+            transform=transform)
         return rank_metrics(mean[idxs], true[idxs], box[idxs],
                             unit[idxs])["within_tile_spearman"]
 
@@ -325,6 +326,9 @@ def main(argv=None) -> int:
     arrays = as_arrays(rows, "a", table_dir=table.parent)
     storage = arm_storage(arm)
     w_joint, w_occ = float(acfg.w_joint_reward), float(acfg.w_occ_reward)
+    # Gate on the SAME reward the proxy was trained to predict, or every rank and
+    # selection number below scores it against a target it never learned.
+    reward_key = str(cfg.get("proxy", {}).get("reward_target", "dR_combined"))
     device = torch.device(args.device if (args.device != "cuda"
                                           or torch.cuda.is_available()) else "cpu")
     unit = unit_ids_of(arrays["tile_id"], width=width)
@@ -332,7 +336,8 @@ def main(argv=None) -> int:
     # The true dR is a fixed numpy quantity -- compute it on CPU before the reward
     # model is moved to the device the streaming eval runs on.
     ctx_cpu = build_row_context(rows)
-    true = true_delta_rewards(ctx_cpu, reward_t, w_joint=w_joint, w_occ=w_occ)
+    true = true_delta_rewards(ctx_cpu, reward_t, w_joint=w_joint, w_occ=w_occ,
+                              key=reward_key)
     reward_t = reward_t.to(device)
     ctx = ctx_cpu.to(device)
     members = [m.to(device) for m in ens.members]
@@ -349,10 +354,31 @@ def main(argv=None) -> int:
              "e": 512, "f": 48}[arm]
 
     mean, std = stream_ensemble_delta(provider, members, ctx, reward_t,
-                                      w_joint=w_joint, w_occ=w_occ,
+                                      w_joint=w_joint, w_occ=w_occ, key=reward_key,
                                       chunk_rows=chunk, device=device)
 
-    rank = rank_metrics(mean, true, arrays["box"], unit)
+    # Seed-noise floor of the per-tile true reward: the interventions carry ~no
+    # signal under a numerator-count target (they edit ~2% of the box around 24
+    # hosts), so the spread of their true dR is a data-driven tie threshold.
+    interv = arrays["source"] == "intervention"
+    noise_floor = (float(robust_scale(true[interv & np.isfinite(true)]))
+                   if interv.any() else 0.0)
+    rank_margin = gate.get("rank_min_margin", "auto")
+    rank_margin = noise_floor if rank_margin == "auto" else float(rank_margin)
+
+    rank = rank_metrics(mean, true, arrays["box"], unit, min_margin=rank_margin)
+    # A margin sweep, always reported: it shows whether the within-tile ranking
+    # is real once tied (noise-separated) candidates stop being graded, without
+    # silently moving the gate -- the bound applies at rank_margin only.
+    ranking_margin_sweep = {
+        f"{mm:.4g}": rank_metrics(mean, true, arrays["box"], unit, min_margin=mm)
+        for mm in sorted({0.0, noise_floor, 2 * noise_floor, 4 * noise_floor})
+    }
+    # Save the arrays so any future re-score (other margins, other cuts) is a
+    # cheap CPU read rather than another GPU pass over the features.
+    np.savez(run / f"ranking_arrays_{arm}.npz", mean=mean, std=std, true=true,
+             box=arrays["box"], tile_id=arrays["tile_id"], unit=unit,
+             source=arrays["source"], alpha=arrays["alpha"])
     sel = selection_enrichment(mean, true)
     alpha = alpha_ordering(arrays, mean, unit)
     unc = uncertainty_calibration(mean, std, true)
@@ -366,13 +392,22 @@ def main(argv=None) -> int:
         abl_rows = np.random.default_rng(0).choice(
             len(rows), size=int(args.ablation_max_rows), replace=False)
     abl = feature_ablation(provider, members, ctx, reward_t, arrays, true, unit,
-                           w_joint=w_joint, w_occ=w_occ, names=names,
+                           w_joint=w_joint, w_occ=w_occ, key=reward_key, names=names,
                            storage=storage, n_channels=n_channels, device=device,
                            chunk_rows=chunk, abl_rows=abl_rows)
 
     pred_counts = stream_pred_counts(provider, members, ctx, chunk_rows=chunk,
                                      device=device)
     true_counts = {k: arrays[k] for k in COUNT_KEYS}
+    # Save the per-candidate count vectors alongside the dR arrays, in identical
+    # row order, so diagnose_rank_ceiling.py can ask whether a flat within-tile
+    # PREDICTED dR originates in flat predicted COUNTS (proxy/features) or in the
+    # count->dR reduction -- a cheap CPU read, no second GPU pass over features.
+    np.savez(run / f"ranking_counts_{arm}.npz",
+             **{f"pred_{k}": np.asarray(pred_counts[k], dtype=np.float64)
+                for k in COUNT_KEYS},
+             **{f"true_{k}": np.asarray(true_counts[k], dtype=np.float64)
+                for k in COUNT_KEYS})
     # The gated metric is PER CANDIDATE (sum a candidate's 512 tiles on their own,
     # then average by box) so one candidate's error cannot cancel another's; the
     # all-row aggregate is kept only under an explicitly diagnostic name.
@@ -472,6 +507,10 @@ def main(argv=None) -> int:
         "gate_boxes": sorted(gate_boxes), "n_rows": len(rows),
         "n_features": n_channels,
         "region_width": width,
+        "reward_target": reward_key,
+        "rank_min_margin": rank_margin,
+        "rank_noise_floor": noise_floor,
+        "ranking_margin_sweep": ranking_margin_sweep,
         "ranking": rank, "selection": sel, "alpha": alpha, "ablation": abl,
         "pooled": pooled,
         "pooled_all_rows_DIAGNOSTIC": {

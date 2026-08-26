@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from typing import Dict, List, Optional
 
@@ -34,9 +35,10 @@ import numpy as np
 import torch
 
 from _sr2_direct import (  # noqa: E402
-    actor_config_of, add_direct_args, append_jsonl, assert_not_sealed, banner,
-    boxes_of, direct_root, geometry_of, load_direct_config, load_hr, load_lr,
-    load_reward_models, model_path_of, run_dir, soft_config_of, write_json,
+    actor_config_of, add_direct_args, append_jsonl, arm_f_valid_center,
+    assert_not_sealed, banner, boxes_of, direct_root, geometry_of,
+    load_direct_config, load_hr, load_lr, load_reward_models, model_path_of,
+    run_dir, soft_config_of, write_json,
 )
 
 from cosmo_sr.reward.base import find_base_field  # noqa: E402
@@ -44,6 +46,7 @@ from cosmo_sr.reward.catalog_proxy import ProxyEnsemble  # noqa: E402
 from cosmo_sr.reward.tiles import TileSummary, read_tile_summaries  # noqa: E402
 from cosmo_sr.reward.torch_reward import summary_from_tiles  # noqa: E402
 from cosmo_sr.train import sr2_unfreeze  # noqa: E402
+from cosmo_sr.train.common import finish_wandb, maybe_init_wandb  # noqa: E402
 from cosmo_sr.train.sr2_finetune_data import SR2TileDataset, collate_tiles  # noqa: E402
 from cosmo_sr.train.train_sr2_direct import (  # noqa: E402
     DirectFinetuneTrainer, attach_summaries,
@@ -108,6 +111,11 @@ def main(argv=None) -> int:
     ap.add_argument("--ignore-gate", action="store_true",
                     help="run without a passing proxy gate (debugging only; the "
                          "resulting checkpoint is not evidence about anything)")
+    ap.add_argument("--no-wandb", action="store_true",
+                    help="disable Weights & Biases logging for this run "
+                         "(overrides the config's wandb.mode)")
+    ap.add_argument("--wandb-mode", default="",
+                    help="override wandb.mode (online/offline/disabled)")
     args = ap.parse_args(argv)
 
     cfg = load_direct_config(args)
@@ -275,7 +283,7 @@ def main(argv=None) -> int:
     trainer = DirectFinetuneTrainer(
         model_path_of(cfg), proxies, reward_t, cfg=acfg, geom=geom,
         soft_cfg=scfg, device=device, arm=str(args.arm), phase_cfg=pscfg,
-        rockstar_cfg=rcfg)
+        rockstar_cfg=rcfg, f_valid_center=arm_f_valid_center(cfg))
     described = sr2_unfreeze.print_trainable(trainer.actor, rung, acfg.group_lr)
     stage = run / (f"probe_{args.arm}" if args.probe
                    else "overfit" if args.overfit else f"rung_{rung}")
@@ -300,6 +308,25 @@ def main(argv=None) -> int:
         "adversarial_weight": float(cfg.get("adversarial", {}).get("weight", 0.0)),
     })
 
+    # ---- wandb ------------------------------------------------------------
+    # One run per (run_name, arm, stage); grouped by run_name so the arms of a
+    # sweep land together. The metrics.jsonl row is the source of truth and is
+    # mirrored verbatim, so a wandb outage never loses a number.
+    job_type = "probe" if args.probe else "overfit" if args.overfit else "train"
+    wcfg = dict(cfg.get("wandb", {}) or {})
+    if args.no_wandb:
+        wcfg["mode"] = "disabled"
+    elif args.wandb_mode:
+        wcfg["mode"] = args.wandb_mode
+    wcfg.setdefault("group", args.run_name)
+    wcfg.setdefault("name", f"{args.run_name}-{args.arm}-{stage.name}")
+    cfg["wandb"] = wcfg
+    use_wandb = maybe_init_wandb(cfg, stage, job_type=job_type)
+    if use_wandb:
+        banner(f"wandb: logging to project "
+               f"{wcfg.get('project', os.environ.get('WANDB_PROJECT', 'cosmo_sr'))}"
+               f" as {wcfg['name']}")
+
     # ---- train ------------------------------------------------------------
     # Stamped into every checkpoint. `probe_only` is what the resume ban above
     # keys on, so a probe artifact carries its own quarantine.
@@ -317,6 +344,12 @@ def main(argv=None) -> int:
             m = trainer.step(batch)
             m["elapsed_s"] = round(time.time() - t0, 1)
             append_jsonl(log, m)
+            if use_wandb:
+                try:
+                    import wandb
+                    wandb.log(m, step=int(m["step"]))
+                except Exception:
+                    pass
             if step % int(acfg.log_every) == 0:
                 print(f"  step {step:5d} loss {m['loss']:+.5f} "
                       f"q_safe {m['q_safe']:+.4f} dR_occ {m['dR_occ']:+.4f} "
@@ -333,6 +366,7 @@ def main(argv=None) -> int:
     banner(f"done in {time.time() - t0:.0f}s -> {stage}")
     print("  the EMA checkpoint is the one to evaluate; it loads through "
           "load_controlled_generator like G_z0.pt.", flush=True)
+    finish_wandb()
     return 0
 
 

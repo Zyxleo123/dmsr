@@ -812,7 +812,8 @@ def spearman(a: np.ndarray, b: np.ndarray) -> float:
     return float((ra * rb).sum() / den) if den > 0 else float("nan")
 
 
-def tie_aware_agreement(pred: np.ndarray, true: np.ndarray) -> Tuple[float, int]:
+def tie_aware_agreement(pred: np.ndarray, true: np.ndarray,
+                        *, min_margin: float = 0.0) -> Tuple[float, int]:
     """Mean pairwise ordering agreement, tie-aware, and the pair count.
 
     Over pairs with **distinct true values** only: a correctly ordered
@@ -823,6 +824,12 @@ def tie_aware_agreement(pred: np.ndarray, true: np.ndarray) -> Tuple[float, int]
     also False), which turns "the proxy cannot tell these apart" into a coin that
     lands heads half the time by construction. Returns ``(nan, 0)`` when no pair
     has distinct true values.
+
+    ``min_margin`` widens "distinct" to ``|t_i - t_j| > min_margin``: a pair
+    whose true rewards differ by less than the measurement floor is a tie, not a
+    thing the proxy should be graded on ordering. With a numerator-count target
+    the candidates within a tile are mostly separated by pure label noise, so a
+    zero-margin accuracy grades the proxy on ordering noise.
     """
     p = np.asarray(pred, dtype=np.float64)
     t = np.asarray(true, dtype=np.float64)
@@ -832,7 +839,7 @@ def tie_aware_agreement(pred: np.ndarray, true: np.ndarray) -> Tuple[float, int]
     n = p.shape[0]
     for i in range(n):
         for j in range(i + 1, n):
-            if t[i] == t[j]:
+            if abs(t[i] - t[j]) <= float(min_margin):
                 continue
             if p[i] == p[j]:
                 scores.append(0.5)

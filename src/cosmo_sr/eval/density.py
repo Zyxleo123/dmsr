@@ -29,7 +29,7 @@ applied identically to the prediction, the truth and the ``A`` baseline, so the
 """
 from __future__ import annotations
 
-from typing import Dict, Iterator, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 
@@ -97,12 +97,38 @@ def cic_density(disp: torch.Tensor, cellsize: float, dis_norm: float,
     return dens / mean - 1.0
 
 
+def valid_center_bulk(
+    disp: torch.Tensor, cellsize: float, dis_norm: float
+) -> torch.Tensor:
+    """The rounded per-crop bulk displacement ``(B, 3)`` in coarse cells.
+
+    This is the whole-cell offset :func:`_valid_center_corners` centres the
+    scored cube on. Exposed so a candidate and its frozen reference can be
+    deposited on ONE shared origin: otherwise each rounds its OWN continuous
+    bulk, and a sub-cell difference between the two bulks -- which is all
+    fine-tuning ever produces at large scales -- becomes a whole-cell *relative*
+    shift between the grids, injecting a spurious candidate-minus-frozen signal
+    into the paired arms C/D/E. Independent of ``grid_mult`` (the offset is in
+    coarse cells, applied before the fine-mesh scaling).
+    """
+    if disp.dim() != 5 or disp.shape[1] != 3:
+        raise ValueError(f"expects (B, 3, N, N, N), got {tuple(disp.shape)}")
+    n = disp.shape[-1]
+    dev, dt = disp.device, torch.float32
+    lat = torch.arange(n, device=dev, dtype=dt) + 0.5
+    q = torch.stack(torch.meshgrid(lat, lat, lat, indexing="ij"))
+    g = disp.float() * (dis_norm / cellsize) + q.unsqueeze(0)
+    bulk = g.mean(dim=(2, 3, 4)) - q.mean(dim=(1, 2, 3)).unsqueeze(0)
+    return torch.round(bulk)
+
+
 def _valid_center_corners(
     disp: torch.Tensor,
     cellsize: float,
     dis_norm: float,
     region: int,
     grid_mult: int = 1,
+    bulk: Optional[torch.Tensor] = None,
 ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
     """The eight CIC corners of the valid-centre deposit, one at a time.
 
@@ -118,6 +144,10 @@ def _valid_center_corners(
     identical origin, identical bulk offset, identical discards. Anything less
     and a per-cell ratio like ``momentum / mass`` would be dividing two grids
     that do not describe the same cells.
+
+    ``bulk`` overrides the crop's own rounded bulk offset with an externally
+    supplied ``(B, 3)`` one (see :func:`valid_center_bulk`), so a candidate can
+    be deposited on its frozen reference's origin.
     """
     if disp.dim() != 5 or disp.shape[1] != 3:
         raise ValueError(f"expects (B, 3, N, N, N), got {tuple(disp.shape)}")
@@ -136,9 +166,15 @@ def _valid_center_corners(
     # The crop's bulk displacement is a rigid translation: it moves where the
     # matter is without changing its clustering, so the scored cube follows it.
     # Rounded to whole cells (and detached) so it introduces no sub-cell offset
-    # and no gradient path of its own.
-    bulk = g.detach().mean(dim=(2, 3, 4)) - q.mean(dim=(1, 2, 3)).unsqueeze(0)
-    bulk = torch.round(bulk)                                            # (B,3)
+    # and no gradient path of its own. An externally supplied `bulk` (the frozen
+    # reference's) shares one origin between a candidate and its baseline.
+    if bulk is None:
+        bulk = g.detach().mean(dim=(2, 3, 4)) - q.mean(dim=(1, 2, 3)).unsqueeze(0)
+        bulk = torch.round(bulk)                                        # (B,3)
+    else:
+        bulk = torch.round(bulk.detach().to(dev, dt))
+        if tuple(bulk.shape) != (b, 3):
+            raise ValueError(f"bulk must be (B, 3) = ({b}, 3), got {tuple(bulk.shape)}")
     origin = (n - R) / 2.0 + bulk                                       # (B,3)
     u = (g - origin.view(b, 3, 1, 1, 1)) * m                            # region coords
 
@@ -167,6 +203,7 @@ def cic_deposit_valid_center(
     dis_norm: float,
     region: int,
     grid_mult: int = 1,
+    bulk: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(mass, weighted)``: the valid-centre CIC of ``1`` and of ``values``.
 
@@ -193,7 +230,8 @@ def cic_deposit_valid_center(
     mass = torch.zeros(b, ng ** 3, device=disp.device, dtype=dt)
     acc = torch.zeros(b, k, ng ** 3, device=disp.device, dtype=dt)
     flat = values.to(dt).reshape(b, k, -1)
-    for idx, w in _valid_center_corners(disp, cellsize, dis_norm, region, grid_mult):
+    for idx, w in _valid_center_corners(disp, cellsize, dis_norm, region, grid_mult,
+                                        bulk=bulk):
         mass.scatter_add_(1, idx, w)
         acc.scatter_add_(2, idx.unsqueeze(1).expand(-1, k, -1), flat * w.unsqueeze(1))
     return mass.view(b, 1, ng, ng, ng), acc.view(b, k, ng, ng, ng)
@@ -205,6 +243,7 @@ def cic_density_valid_center(
     dis_norm: float,
     region: int,
     grid_mult: int = 1,
+    bulk: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CIC of a crop's own particles into the Eulerian sub-cube it actually fills.
 
@@ -255,7 +294,8 @@ def cic_density_valid_center(
     b, ng = disp.shape[0], int(region) * int(grid_mult)
     dev, dt = disp.device, torch.float32
     dens = torch.zeros(b, ng ** 3, device=dev, dtype=dt)
-    for idx, w in _valid_center_corners(disp, cellsize, dis_norm, region, grid_mult):
+    for idx, w in _valid_center_corners(disp, cellsize, dis_norm, region, grid_mult,
+                                        bulk=bulk):
         dens.scatter_add_(1, idx, w)
 
     dens = dens.view(b, 1, ng, ng, ng)

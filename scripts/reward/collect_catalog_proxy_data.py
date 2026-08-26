@@ -96,6 +96,7 @@ from cosmo_sr.reward.arms import (  # noqa: E402
     ARMS, FEATURE_SCHEMA_VERSION, FIELD_CHANGED_KEY, features_key,
     owned_sidecar_arms, sidecar_file,
 )
+from cosmo_sr.eval.density import valid_center_bulk  # noqa: E402
 from cosmo_sr.reward.oracle_hr import CHANNEL_MODES  # noqa: E402
 from cosmo_sr.reward.phase_space import (  # noqa: E402
     FLAT_ARMS, arm_features, arm_paired_feature_names, phase_space_grid_channel_names,
@@ -246,10 +247,21 @@ def tile_features(cfg, field: np.ndarray, frozen: np.ndarray,
         c = torch.from_numpy(np.ascontiguousarray(cand, dtype=np.float32)).to(device)
         b = torch.from_numpy(np.ascontiguousarray(base, dtype=np.float32)).to(device)
         with torch.no_grad():
-            cand_rows.append(arm_features(c, "b", scfg, pcfg).cpu().numpy())
-            base_rows.append(arm_features(b, "b", scfg, pcfg).cpu().numpy())
-            cand_tok.append(soft_rockstar_tokens(c, scfg, pcfg, rcfg).cpu().numpy())
-            base_tok.append(soft_rockstar_tokens(b, scfg, pcfg, rcfg).cpu().numpy())
+            # One shared origin from the frozen crop, so every arm's cand and
+            # base land on the SAME valid-centre grid. This is the offline twin
+            # of the paired extractors in the trainer (which take the frozen
+            # bulk); without it a whole-cell difference between two independently
+            # rounded bulks would inject a spurious cand-minus-frozen signal, and
+            # the labels would not match what the live extractor computes. Arm E
+            # already shares the origin inside phase_space_paired_grid.
+            bulk = valid_center_bulk(b[:, 0:3], scfg.cellsize_kpc_h,
+                                     float(scfg.dis_norm_kpc_h))
+            cand_rows.append(arm_features(c, "b", scfg, pcfg, bulk=bulk).cpu().numpy())
+            base_rows.append(arm_features(b, "b", scfg, pcfg, bulk=bulk).cpu().numpy())
+            cand_tok.append(
+                soft_rockstar_tokens(c, scfg, pcfg, rcfg, bulk=bulk).cpu().numpy())
+            base_tok.append(
+                soft_rockstar_tokens(b, scfg, pcfg, rcfg, bulk=bulk).cpu().numpy())
             # Arm E: the paired dense grid, cached as float16 (train/eval upcast).
             grid_blocks.append(
                 phase_space_paired_grid(c, b, scfg, pcfg).cpu().to(torch.float16).numpy())
@@ -584,10 +596,21 @@ def stage_label(cfg, args) -> int:
     # decomposition of a catalog that never existed. A complete attempt always
     # leaves label_report.json, so its absence is the exact signal that the
     # leftovers are debris.
-    reuse_rockstar = bool(args.reuse) and report_path.is_file()
+    # ...AND only if that finished attempt labelled THIS field. A report is
+    # written at the end of a complete attempt, so its presence means the halo
+    # output is not debris; its field_sha matching the field on disk means the
+    # halos describe the particles we are about to summarise. `report_path.is_file()`
+    # alone would reuse Rockstar output from a PREVIOUS field after a regenerate
+    # (we reach here precisely when the old label described a different field --
+    # see the relabel branch above), decomposing the new particles against the
+    # old catalog: a well-formed, meaningless label.
+    old_report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+    reuse_rockstar = (bool(args.reuse) and report_path.is_file()
+                      and old_report.get("field_sha") == gen.get("field_sha"))
     if args.reuse and not reuse_rockstar and Path(halo_dir).exists():
-        print(">>> discarding Rockstar output from an attempt that never "
-              ">>> finished labelling; re-running the halo finder.", flush=True)
+        print(">>> discarding Rockstar output from an attempt that never finished "
+              ">>> labelling, or that labelled a different field; re-running the "
+              ">>> halo finder.", flush=True)
     cat = run_rockstar_on_particles(
         particles, halo_dir, tag=tag,
         binary=PROJECT_ROOT / rk.get("binary", "external/rockstar/rockstar"),
@@ -749,6 +772,7 @@ def stage_index(cfg, args) -> int:
 
     expected = {(c["box"], c["tag"]): c for c in candidate_matrix(cfg)}
     found = _scan_candidates()
+    n_tiles = int(tile_grid_of(cfg).n_tiles)
     rows: List[Dict] = []
     # Arm C's tokens are small enough to hold and stack; arm E's dense grid is
     # ~32 GB across the table, so it is never held -- each row records a reference
@@ -757,6 +781,7 @@ def stage_index(cfg, args) -> int:
     token_blocks: List[np.ndarray] = []
     e_refs: List[Tuple[str, int]] = []
     labelled, invalid, unlabelled, stale_features = [], [], [], []
+    unexpected, incomplete_tiles = [], []
     leftover_particles: List[str] = []
 
     for entry in found:
@@ -768,6 +793,14 @@ def stage_index(cfg, args) -> int:
         for p in list(Path(entry["dir"]).rglob("*.particles")) + \
                 list(Path(entry["dir"]).rglob("*.gadget2")):
             leftover_particles.append(str(p))
+        # A candidate on disk that the predeclared matrix never asked for is
+        # contamination, not a bonus: folding its rows into the table silently
+        # trains the proxy on undeclared data and lets a polluted set still be
+        # marked complete. Exclude it and record it; its presence blocks the
+        # marker below, same as any other "someone should look" condition.
+        if key not in expected:
+            unexpected.append(key)
+            continue
         if lab is None:
             unlabelled.append(key)
             continue
@@ -798,10 +831,28 @@ def stage_index(cfg, args) -> int:
             print(f">>> {key[0]}/{key[1]}: features.npz missing {missing_keys}; "
                   "treating as schema-stale", flush=True)
             continue
-        labelled.append(key)
-
         summaries = {int(s.tile_id): s
                      for s in read_tile_summaries(lab["tile_summaries_path"])}
+        # Require the FULL tiling. Every one of the candidate's n_tiles feature
+        # rows must have a matching summary, and there must be exactly n_tiles of
+        # each. A candidate that labelled only some tiles is not a smaller valid
+        # candidate -- its pooled sums cannot reproduce the box, the identity the
+        # per-label gate enforces -- so its partial rows must not be folded in.
+        # The old `if s is None: continue` dropped the unmatched rows silently and
+        # still counted the candidate as labelled-ok, so a candidate short of the
+        # full tiling passed as complete.
+        feat_tids = [int(t) for t in feats["tile_id"].tolist()]
+        n_unmatched = sum(1 for t in feat_tids if t not in summaries)
+        if len(feat_tids) != n_tiles or len(summaries) != n_tiles or n_unmatched:
+            incomplete_tiles.append({
+                "key": list(key), "n_feature_tiles": len(feat_tids),
+                "n_summaries": len(summaries), "n_unmatched": int(n_unmatched)})
+            print(f">>> {key[0]}/{key[1]}: {len(feat_tids)} feature tiles / "
+                  f"{len(summaries)} summaries / {n_unmatched} unmatched vs "
+                  f"{n_tiles} expected; excluding (incomplete tiling).", flush=True)
+            continue
+        labelled.append(key)
+
         # Only the small blocks are read here; arm E's grid is left in the file
         # and streamed in a second pass (see e_refs). Arm D reads arm C's tokens
         # and arm F streams raw fields, so neither has a block to gather.
@@ -809,9 +860,7 @@ def stage_index(cfg, args) -> int:
         c_block = feats[features_key("c")]
         changed = np.asarray(feats[FIELD_CHANGED_KEY], dtype=np.int8)
         for i, tid in enumerate(feats["tile_id"].tolist()):
-            s = summaries.get(int(tid))
-            if s is None:
-                continue
+            s = summaries[int(tid)]
             row = {
                 # The row's position in the full table, which is what joins it
                 # to the sidecar arrays after any filtering.
@@ -898,7 +947,13 @@ def stage_index(cfg, args) -> int:
     # Leftover halo-finder debris blocks the marker too: it means a label job
     # died between Rockstar and the summaries (or cleanup failed), and at ~10 GB
     # per candidate "someone will clean it later" is how a TB disappears.
-    complete = not missing and not leftover_particles
+    # Undeclared candidates and candidates with an incomplete tiling block it as
+    # well: the first means the on-disk set is not the predeclared one, the
+    # second that a candidate that passed the earlier gates still did not label
+    # all n_tiles (incomplete candidates are also absent from `done`, so they
+    # already appear in `missing`; they are listed separately for legibility).
+    complete = (not missing and not leftover_particles and not unexpected
+                and not incomplete_tiles)
     report = {
         "rows": len(rows), "table": str(table),
         "feature_schema_version": int(FEATURE_SCHEMA_VERSION),
@@ -909,6 +964,9 @@ def stage_index(cfg, args) -> int:
         "candidates_unlabelled": [f"{b}/{t}" for b, t in sorted(unlabelled)],
         "candidates_stale_features": [f"{b}/{t}" for b, t in sorted(stale_features)],
         "candidates_invalid": invalid,
+        "candidates_unexpected": [f"{b}/{t}" for b, t in sorted(unexpected)],
+        "candidates_incomplete_tiles": incomplete_tiles,
+        "expected_tiles_per_candidate": int(n_tiles),
         "leftover_particles": leftover_particles,
         "missing_from_predeclared_matrix": missing,
         "complete": bool(complete),
@@ -928,6 +986,8 @@ def stage_index(cfg, args) -> int:
     banner(json.dumps({k: v for k, v in report.items()
                        if k not in ("candidates_unlabelled",
                                     "missing_from_predeclared_matrix",
+                                    "candidates_incomplete_tiles",
+                                    "candidates_unexpected",
                                     "leftover_particles")}, indent=2))
 
     marker = labels_complete_path()
@@ -953,6 +1013,20 @@ def stage_index(cfg, args) -> int:
             print(f">>> {len(stale_features)} candidates hold valid labels but "
                   "schema-stale features; repair them with --stage generate "
                   "(features-only backfill, no Rockstar re-run).")
+        if incomplete_tiles:
+            print(f">>> {len(incomplete_tiles)} candidates labelled fewer than "
+                  f"{n_tiles} tiles (or tiles with no matching feature row); "
+                  "relabel them (OVERWRITE=1). They are excluded from the table:")
+            for it in incomplete_tiles[:10]:
+                print(f">>>   {it['key'][0]}/{it['key'][1]}: "
+                      f"{it['n_feature_tiles']} feature tiles, "
+                      f"{it['n_summaries']} summaries, {it['n_unmatched']} unmatched")
+        if unexpected:
+            print(f">>> {len(unexpected)} candidates on disk are NOT in the "
+                  "predeclared matrix and were excluded; remove them or add them "
+                  "to the matrix:")
+            for b, t in unexpected[:10]:
+                print(f">>>   {b}/{t}")
         if leftover_particles:
             print(f">>> {len(leftover_particles)} leftover .particles/.gadget2 "
                   "files block completeness; a relabel (OVERWRITE=1) or manual "

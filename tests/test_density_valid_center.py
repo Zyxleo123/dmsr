@@ -125,6 +125,31 @@ def test_region_larger_than_crop_is_rejected():
         _f(torch.zeros(1, 3, 8, 8, 8), region=16)
 
 
+def test_shared_bulk_removes_rounding_jitter():
+    """A candidate whose bulk straddles the rounding boundary must not fabricate
+    a large candidate-minus-frozen signal. Two independently rounded bulks differ
+    by a whole cell there (0.49 -> 0, 0.51 -> 1) and misregister the grids; one
+    shared origin (the frozen reference's) keeps the difference at the true
+    sub-cell size.
+    """
+    from cosmo_sr.eval.density import valid_center_bulk
+
+    f = CELLSIZE / DIS_NORM                       # normalised units per HR cell
+    n, R = 16, 8
+    lat = torch.arange(n, dtype=torch.float32) - (n - 1) / 2.0
+    q = torch.stack(torch.meshgrid(lat, lat, lat, indexing="ij")).unsqueeze(0)
+    clump = -q * 0.03                             # infall -> a central density peak
+    base = clump + 0.49 * f                       # bulk ~0.49 cell -> rounds to 0
+    cand = clump + 0.51 * f                       # bulk ~0.51 cell -> rounds to 1
+
+    b0 = valid_center_bulk(base, CELLSIZE, DIS_NORM)
+    indep = (cic_density_valid_center(cand, CELLSIZE, DIS_NORM, R)
+             - cic_density_valid_center(base, CELLSIZE, DIS_NORM, R))
+    shared = (cic_density_valid_center(cand, CELLSIZE, DIS_NORM, R, bulk=b0)
+              - cic_density_valid_center(base, CELLSIZE, DIS_NORM, R, bulk=b0))
+    assert float(indep.abs().mean()) > 3.0 * float(shared.abs().mean())
+
+
 def test_highpass_valid_center_is_off_by_default():
     from cosmo_sr.dmsr.density import HighPassDensity
 

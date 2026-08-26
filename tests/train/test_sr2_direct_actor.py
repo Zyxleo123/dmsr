@@ -147,7 +147,32 @@ def test_step_zero_reward_delta_uses_a_zero_feature_difference(trainer, batch, g
 # --------------------------------------------------------------------------- #
 # Gradients
 # --------------------------------------------------------------------------- #
+def _wake_residual_head(ens, std: float = 0.1, seed: int = 0):
+    """Give each member's zero-init residual head a real feature dependence.
+
+    The head is deliberately zero-initialised (``ProxyBase._zero_init_head``) so
+    the untrained proxy predicts "no change from frozen" -- the correct prior and
+    the strongest count baseline. But a zero head makes the prediction *constant*
+    in the features, so ``d(reward)/d(features)`` -- and therefore
+    ``d(reward)/d(SR2)`` -- is analytically zero: there is nothing to propagate,
+    however sound the plumbing. To test that the gradient chain is actually
+    connected (field -> CIC -> features -> proxy -> reward) the proxy has to read
+    its input, so nudge the final head off zero with a fixed-seed perturbation.
+    """
+    g = torch.Generator().manual_seed(seed)
+    for m in ens.members:
+        # The last Linear is the shared residual head (``net[-1]`` for the flat
+        # arms, ``head[-1]`` for arm C); everything upstream is already random.
+        final = [mod for mod in m.modules() if isinstance(mod, torch.nn.Linear)][-1]
+        with torch.no_grad():
+            final.weight.normal_(0.0, std, generator=g)
+            if final.bias is not None:
+                final.bias.normal_(0.0, std, generator=g)
+    return ens
+
+
 def test_gradient_reaches_sr2_weights_through_cic_and_the_proxy(trainer, batch):
+    _wake_residual_head(trainer.proxies)
     terms, _ = trainer.loss_terms(batch)
     params = [p for p in trainer.actor.parameters() if p.requires_grad]
     g = torch.autograd.grad(terms["reward"], params, allow_unused=True)
@@ -414,6 +439,7 @@ def test_reward_gradient_flows_through_the_arm_extractor(
     """
     reward, _ = reward_and_box
     ens, pcfg, rcfg = _arm_proxies(arm, soft_cfg)
+    _wake_residual_head(ens)
     t = DirectFinetuneTrainer(
         model_path, ens, reward,
         cfg=DirectFinetuneConfig(rung="proj_noise", amp=False,

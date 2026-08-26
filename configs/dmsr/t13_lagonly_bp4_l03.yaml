@@ -1,0 +1,15 @@
+# LAGRANGIAN-ONLY CRITIC, ARM C -- arm B at SR2-like adversarial weight.
+#
+# The previous ladder measured grad_ratio_adv_flow = 0.690 at lambda_adv 0.030
+# (t13_unc_fulldisp_l03_s0) with a truncated gradient path and a part-noise
+# critic. With the path opened and the noise channel gone, this rung is where the
+# adversarial term first becomes comparable to the flow term rather than
+# subordinate to it. `grad_ratio_adv_flow` is logged every 200 steps and is
+# exactly linear in lambda_adv, so this run also recalibrates the ladder for the
+# new critic.
+base: t13_lagonly_bp4_l003.yaml
+adv:
+  lambda_adv: 0.030          # <-- THE LEVER
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_lagonly_bp4_l03, group: dmsr_lagonly}
+output: {run_dir: runs/dmsr/t13_lagonly_bp4_l03_s0}

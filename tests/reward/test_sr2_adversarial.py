@@ -49,6 +49,41 @@ def test_critic_input_is_twenty_channels():
     assert torch.isfinite(x).all()
 
 
+def test_critic_input_valid_center_scores_the_central_cube():
+    """valid_center>0 emits the central R^3 cube on every channel, still 20-wide."""
+    lr = torch.randn(2, 6, 4, 4, 4)
+    field = torch.randn(2, 6, 16, 16, 16) * 0.01
+    x = critic_input(lr, field, cellsize_kpc_h=195.3125, grid_mult=2,
+                     valid_center=8)
+    assert x.shape == (2, 20, 8, 8, 8)
+    # the field channels are the centre-crop of the input field...
+    assert torch.allclose(x[:, 6:12], field[:, :, 4:12, 4:12, 4:12])
+    assert torch.isfinite(x).all()
+
+
+def test_critic_input_valid_center_is_translation_invariant():
+    """A rigid bulk shift of every particle leaves the valid-centre density put.
+
+    The wrapped deposit fails this: a shift moves mass across the `% ng` seam.
+    The offset deposit follows the bulk, so the density channel is unchanged --
+    the property that makes it a real density rather than a scrambling.
+    """
+    torch.manual_seed(0)
+    cellsize, dis_norm = 195.3125, 6000.0
+    lr = torch.zeros(1, 6, 4, 4, 4)
+    field = torch.randn(1, 6, 16, 16, 16) * 0.02
+    shifted = field.clone()
+    # + exactly one HR cell of displacement on every particle: an integer rigid
+    # translation, which the rounded bulk offset absorbs with no sub-cell change.
+    shifted[:, 0:3] += cellsize / dis_norm
+    a = critic_input(lr, field, cellsize_kpc_h=cellsize, dis_norm_kpc_h=dis_norm,
+                     grid_mult=1, valid_center=8)
+    b = critic_input(lr, shifted, cellsize_kpc_h=cellsize, dis_norm_kpc_h=dis_norm,
+                     grid_mult=1, valid_center=8)
+    # density channel is the last grid_mult^3 == 1 channel here
+    assert torch.allclose(a[:, 12:], b[:, 12:], atol=1e-5)
+
+
 def test_critic_input_rejects_the_wrong_channel_count():
     with pytest.raises(ValueError, match="6 LR and 6 field"):
         critic_input(torch.randn(1, 3, 4, 4, 4), torch.randn(1, 6, 16, 16, 16),

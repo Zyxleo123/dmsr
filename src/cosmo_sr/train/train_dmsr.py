@@ -513,6 +513,23 @@ def main() -> None:
 
     adv_n_steps = int(acfg.get("gen_ode_steps", 4))
     bp_steps = acfg.get("bp_steps", 1)
+    # Weight on the flow-matching (mean-seeking) term. 1.0 = every previous run,
+    # byte-identical. SR2/map2map trains the generator from the adversarial loss
+    # ALONE when the adversary is on (map2map/train.py: only `loss_adv.backward()`
+    # runs; the reconstruction loss is computed, logged, and never backpropagated),
+    # so lowering this is how that loss structure is reached from here. It is NOT
+    # settable to 0 in a config by accident -- see the guard below.
+    lam_flow = float(acfg.get("lambda_flow", 1.0))
+    if lam_flow < 0:
+        raise ValueError(f"adv.lambda_flow must be >= 0, got {lam_flow}")
+    if lam_flow == 0.0 and (bp_steps is not None and int(bp_steps) < adv_n_steps):
+        raise ValueError(
+            "adv.lambda_flow=0 removes the ONLY supervision on the velocity field "
+            f"at t < 1, but bp_steps={bp_steps} < gen_ode_steps={adv_n_steps} means "
+            "the adversarial gradient reaches only the final Euler step(s). The "
+            "earlier steps would then receive no gradient at all. Set "
+            "adv.bp_steps: null (full backprop) if you really want adv-only."
+        )
     warmup_d = int(acfg.get("critic_warmup_steps", 0))
     log_every = int(tcfg.get("log_every", 50))
     eval_every = int(tcfg.get("eval_every", 500))
@@ -522,6 +539,11 @@ def main() -> None:
     # to Stage C. When > 0 it reuses the flow loss's own (v_pred, v_target) via
     # return_fields, so enabling it draws NO extra RNG and does not perturb training.
     fourier_diag_every = int(cfg.get("diagnostics", {}).get("fourier_band_every", 0))
+    if adversarial:
+        print(f"[adv] lambda_flow={lam_flow:g}  lambda_adv={float(acfg.get('lambda_adv', 0.1)):g}  "
+              f"gen_ode_steps={adv_n_steps}  bp_steps={bp_steps}  "
+              f"residual_mode={res_mode!r}  density_mode={den_mode!r} "
+              f"(critic in_channels={channels + n_density_ch})")
     best_metric_name = str(cfg.get("eval", {}).get("best_metric", "val_rk_transition"))
     best_mode = str(cfg.get("eval", {}).get("best_mode", "max"))
     best_value = -np.inf if best_mode == "max" else np.inf
@@ -588,7 +610,9 @@ def main() -> None:
             # lambda_adv can be calibrated (target ratio 0.1-0.3).
             if loss_adv_p is not None and step % grad_log_every == 0:
                 opt_g.zero_grad(set_to_none=True)
-                loss_flow.backward(retain_graph=True)
+                # Scaled by lam_flow so the logged ratio compares the two terms as
+                # they are actually applied, not as they would be at unit weight.
+                (lam_flow * loss_flow).backward(retain_graph=True)
                 row["grad_norm_flow"] = _flow_grad_norm(flow)
                 opt_g.zero_grad(set_to_none=True)
                 (lam * loss_adv_p).backward(retain_graph=True)
@@ -596,7 +620,7 @@ def main() -> None:
                 row["grad_ratio_adv_flow"] = row["grad_norm_adv"] / max(row["grad_norm_flow"], 1e-12)
                 opt_g.zero_grad(set_to_none=True)
 
-            loss_g = loss_flow + (lam * loss_adv_p if loss_adv_p is not None else 0.0)
+            loss_g = lam_flow * loss_flow + (lam * loss_adv_p if loss_adv_p is not None else 0.0)
 
             if joint_ft:   # mean trained ONLY by its own recon loss (flow keeps it detached)
                 loss_mean, m_mean = mean_reconstruction_loss(flow, y_p, x_p)

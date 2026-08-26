@@ -49,7 +49,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..eval.density import cic_density
+from ..eval.density import cic_density, cic_density_valid_center
 
 __all__ = [
     "AdversarialConfig",
@@ -151,6 +151,16 @@ def _inverse_pixel_shuffle(x: torch.Tensor, r: int) -> torch.Tensor:
     return x.reshape(b, c * r ** 3, d // r, h // r, w // r)
 
 
+def _center_crop(x: torch.Tensor, region: int) -> torch.Tensor:
+    """The central ``region^3`` cube of a ``(B, C, N, N, N)`` tensor."""
+    n = x.shape[-1]
+    r = int(region)
+    if r >= n:
+        return x
+    lo = (n - r) // 2
+    return x[..., lo:lo + r, lo:lo + r, lo:lo + r]
+
+
 def critic_input(
     lr: torch.Tensor,
     field: torch.Tensor,
@@ -158,6 +168,7 @@ def critic_input(
     cellsize_kpc_h: float,
     dis_norm_kpc_h: float = 6000.0,
     grid_mult: int = 2,
+    valid_center: int = 0,
 ) -> torch.Tensor:
     """The 20-channel discriminator input SR2 was trained with.
 
@@ -170,6 +181,23 @@ def critic_input(
     Density is CIC-deposited from its displacement channels on a ``grid_mult``x
     finer mesh and inverse-pixel-shuffled back, giving ``grid_mult^3 = 8``
     channels.
+
+    ``valid_center``
+        Density deposition mode. ``0`` (the default) keeps the historical
+        wrapped ``% ng`` deposit -- which, on a single tile rather than a whole
+        periodic box, is a *scrambling*: only ~10% of a tile's particles stay
+        inside it (median displacement ~36 HR cells against a 64-cell tile), so
+        the wrapped density correlates just ``r = 0.08`` with the tile's true
+        density (see :func:`cosmo_sr.eval.density.cic_density_valid_center` and
+        ``docs/density_collapse_investigation.md``). A positive value switches to
+        the buffer-free valid-centre deposit: it follows the tile's bulk
+        displacement, discards escaping particles rather than wrapping them, and
+        scores the central ``valid_center^3`` Eulerian sub-cube, which the tile's
+        own particles fill exactly (``r = 1.0`` at region = tile/2). The LR and
+        field channels are centre-cropped to the same ``valid_center^3`` so all
+        20 channels describe the one sub-region; the critic pools globally, so
+        the smaller grid is not an obstacle. This is the same valid-centre CIC
+        arm A already deposits through :func:`density_from_disp`.
     """
     if lr.dim() != 5 or field.dim() != 5:
         raise ValueError("critic_input wants (B, C, N, N, N) tensors")
@@ -179,14 +207,36 @@ def critic_input(
         )
     up = F.interpolate(lr, size=tuple(field.shape[-3:]), mode="trilinear",
                        align_corners=False)
-    rho = cic_density(field[:, 0:3], float(cellsize_kpc_h), float(dis_norm_kpc_h),
-                      grid_mult=int(grid_mult))
+    r = int(valid_center)
+    if r > 0:
+        rho = cic_density_valid_center(
+            field[:, 0:3], float(cellsize_kpc_h), float(dis_norm_kpc_h),
+            region=r, grid_mult=int(grid_mult))
+        up = _center_crop(up, r)
+        field = _center_crop(field, r)
+    else:
+        rho = cic_density(field[:, 0:3], float(cellsize_kpc_h),
+                          float(dis_norm_kpc_h), grid_mult=int(grid_mult))
     rho = _inverse_pixel_shuffle(rho, int(grid_mult))
     return torch.cat([up, field, rho], dim=1)
 
 
 class SR2Critic(nn.Module):
     """Strided 3-D convolutional critic over the 20-channel SR2 input.
+
+    IMPORTANT -- what this is and is NOT. This reproduces the *input contract* of
+    SR2's discriminator exactly (the 20 channels above), but the *architecture*
+    here -- ``Conv3d(3, stride 2, padding 1)`` blocks, ``GroupNorm``, LeakyReLU,
+    global mean pool, linear head -- is a reasonable SR2-STYLE reconstruction, not
+    a verified copy of the original SR2 discriminator's layer stack. No original
+    discriminator checkpoint or architecture spec exists in this checkout (see
+    :func:`find_discriminator_checkpoint`), so there is nothing to match it
+    against. A result obtained with this network -- in particular a negative arm-F
+    proxy result -- is evidence about *an SR2-style discriminator architecture on
+    these features*, NOT evidence that "the original SR2 discriminator failed".
+    If the authentic discriminator is ever recovered, load it through
+    :func:`build_critic` (which stamps the provenance) and re-run before drawing
+    any conclusion about the original.
 
     No normalisation layers with batch statistics: WGAN-GP's gradient penalty is
     a per-sample constraint, and BatchNorm makes the critic's output for one

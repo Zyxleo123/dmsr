@@ -51,7 +51,7 @@ read -r -a _BOXES <<< "${BOXES//,/ }"
 N_BOXES=${#_BOXES[@]}
 
 mkdir -p "$ROOT/logs" "$ROOT/env"
-ENVFILE="$ROOT/env/le_$(date +%Y%m%d_%H%M%S).env"
+ENVFILE="$ROOT/env/le_$(date +%Y%m%d_%H%M%S)_$$.env"
 cat > "$ENVFILE" <<EOF
 # Written by scripts/slurm/submit_local_editor.sh at $(date '+%F %T'); sourced
 # by the job preamble as a positional argument.

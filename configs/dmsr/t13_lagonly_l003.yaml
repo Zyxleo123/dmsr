@@ -1,0 +1,31 @@
+# LAGRANGIAN-ONLY CRITIC, ARM A -- remove the density channel entirely.
+#
+# WHY. Every adversarial arm run so far carries a density channel built by
+# `cic_density`'s wrap-in-crop deposit, which is correlated r = 0.080 with the
+# true density of a 64^3 crop (docs/density_collapse_investigation.md, Stage 2).
+# The lambda ladder (off / 3e-4 / 1e-3 / 3e-3 / 3e-2) is therefore a ladder on a
+# critic whose input is part signal, part noise -- and it came out flat on every
+# displacement metric (val_rk_high 0.825-0.840 across a 100x weight range).
+#
+# SR2 does not have this problem because SR2 has no density channel at all: its
+# discriminator eats the Lagrangian displacement/velocity field directly
+# (map2map/train.py:364-371, `adv_model(cat([input, output]))`; the only lag2eul
+# call in that repo is in utils/figures.py). And it reaches density
+# P_SR/P_HR = 0.977 with sigma ratio 1.0001 on our own set14 reproduction
+# (runs/dmsr/reproduce_srs/reproduce_srs_metrics.json).
+#
+# This arm is the clean A/B against `t13_fix_vc32_s0`: same base, same
+# valid_center (so the VALIDATION density instrument is identical and the density
+# columns are comparable), lambda unchanged. The one lever is density_mode.
+#
+# `valid_center: 32` is inherited from the base and still matters even with the
+# density channel off: HighPassDensity is shared with validate(), so it sets the
+# ruler the val_density_* columns are read on.
+base: t13_fix_vc32.yaml
+critic:
+  density_mode: "off"         # <-- THE LEVER. critic in_channels 3+8 -> 3.
+adv:
+  lambda_adv: 0.0030         # unchanged from the base, so density_mode is isolated
+train: {steps: 20000, seed: 0}
+wandb: {name: dmsr_t13_lagonly_l003, group: dmsr_lagonly}
+output: {run_dir: runs/dmsr/t13_lagonly_l003_s0}

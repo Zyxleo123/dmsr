@@ -61,9 +61,10 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import os
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -83,6 +84,7 @@ from _sr2_direct import (  # noqa: E402
 )
 
 from cosmo_sr.reward.arms import arm_storage  # noqa: E402
+from cosmo_sr.train.common import finish_wandb, maybe_init_wandb  # noqa: E402
 from cosmo_sr.reward.catalog_proxy import (  # noqa: E402
     CatalogProxy, ProxyConfig, ProxyEnsemble, bin_weights_from_counts, count_loss,
     make_within_tile_pairs, pairwise_ranking_loss, reward_change_loss,
@@ -286,7 +288,10 @@ def _merge_arm_artifacts(out_root: Path, baselines: Dict, report: Dict,
 def _train_member(*, arm, provider, arrays, ctx, reward_t, targets, unit, weight,
                   mult, changed, pairs, kinds, chunks, pcfg, scale, bin_w, sigma_r,
                   w_joint, w_occ, seed, epochs, device, lambdas,
-                  log_prefix: str = "") -> Tuple:
+                  reward_key: str = "dR_combined",
+                  log_prefix: str = "",
+                  wlog: Optional[Callable[[Dict], None]] = None,
+                  wtag: str = "") -> Tuple:
     """Fit one proxy member full-batch (in exact chunks) under the row weights.
 
     Rows of weight zero are the box-bootstrap's way of saying "this box was not
@@ -346,7 +351,8 @@ def _train_member(*, arm, provider, arrays, ctx, reward_t, targets, unit, weight
             loss = count_w * frac * count_loss(
                 pred, {k: y[k][it] for k in COUNT_KEYS}, weights=bin_w,
                 row_weights=rw[it], huber_delta=huber)["loss"]
-            dr = delta_of_summary(s, sub, reward_t, w_joint=w_joint, w_occ=w_occ)
+            dr = delta_of_summary(s, sub, reward_t, w_joint=w_joint, w_occ=w_occ,
+                                  key=reward_key)
             loss = loss + dr_w * frac * reward_change_loss(
                 dr, tgt[it], sigma_r, weights=rw[it], huber_delta=huber)
             ps = pair_sets[ci]
@@ -359,8 +365,20 @@ def _train_member(*, arm, provider, arrays, ctx, reward_t, targets, unit, weight
             loss.backward()
             total += float(loss.detach())
         opt.step()
-        if log_prefix and epoch % max(1, int(epochs) // 5) == 0:
-            print(f"  {log_prefix} epoch {epoch:4d} loss {total:.5f}", flush=True)
+        # A member is many full-batch epochs; report on a cadence that stays
+        # readable in the .out log (~20 lines/member) and carries an ETA, and
+        # mirror every epoch to wandb where it is watchable live. metrics stay in
+        # train_report.json as the source of truth, so a wandb outage loses
+        # nothing.
+        if wlog is not None:
+            wlog({f"{wtag}/loss": total, f"{wtag}/epoch": epoch})
+        if log_prefix and (epoch % max(1, int(epochs) // 20) == 0
+                           or epoch == int(epochs) - 1):
+            done = epoch + 1
+            rate = (time.time() - t0) / done
+            eta = rate * (int(epochs) - done)
+            print(f"  {log_prefix} epoch {epoch:4d}/{int(epochs)} "
+                  f"loss {total:.5f}  {rate:.2f}s/ep  eta {eta:5.0f}s", flush=True)
     return model.cpu(), {
         "seed": int(seed), "final_loss": float(total),
         "n_pairs": int(len(pairs)), "n_rows_drawn": int(drawn.sum()),
@@ -380,6 +398,10 @@ def main(argv=None) -> int:
     ap.add_argument("--arms", nargs="*", default=list(ARMS))
     ap.add_argument("--allow-incomplete", action="store_true",
                     help="fit on a partial table; nothing gated may use the result")
+    ap.add_argument("--no-wandb", action="store_true",
+                    help="disable Weights & Biases logging (overrides wandb.mode)")
+    ap.add_argument("--wandb-mode", default="",
+                    help="override wandb.mode (online/offline/disabled)")
     args = ap.parse_args(argv)
 
     cfg = load_direct_config(args)
@@ -419,13 +441,26 @@ def main(argv=None) -> int:
     rows = [r for r in rows_all if r["box"] in set(fit_boxes)]
     if not rows:
         raise SystemExit(f"no rows from the fit boxes {fit_boxes}")
+
+    # Which reward the proxy predicts, and any source excluded from the fit.
+    reward_key = str(pcfg.get("reward_target", "dR_combined"))
+    drop_sources = {str(s) for s in (pcfg.get("drop_sources") or [])}
+    if drop_sources:
+        before = len(rows)
+        rows = [r for r in rows if str(r["source"]) not in drop_sources]
+        if not rows:
+            raise SystemExit(
+                f"drop_sources={sorted(drop_sources)} removed every fit row")
+        banner(f"drop_sources={sorted(drop_sources)}: {before} -> {len(rows)} rows")
     banner(f"{len(rows_all)} rows total; fitting on {len(rows)} from "
-           f"{sorted({r['box'] for r in rows})}. set8-11 are not read here.")
+           f"{sorted({r['box'] for r in rows})} with target {reward_key}. "
+           "set8-11 are not read here.")
 
     # Everything except the feature block is shared between the arms.
     common = as_arrays(rows, "a", table_dir=table.parent)
     ctx = build_row_context(rows).to(device)
-    targets = true_delta_rewards(ctx, reward_t, w_joint=w_joint, w_occ=w_occ)
+    targets = true_delta_rewards(ctx, reward_t, w_joint=w_joint, w_occ=w_occ,
+                                 key=reward_key)
     unit = unit_ids_of(common["tile_id"], width=width)
     sigma_r = robust_scale(targets)
 
@@ -464,7 +499,9 @@ def main(argv=None) -> int:
         "reward_change": float(pcfg.get("reward_change_weight", 1.0)),
     }
     flat_epochs = int(pcfg.get("epochs", 400))
-    spatial_epochs = int(pcfg.get("spatial_epochs", 50))
+    # Default to the flat budget, not a smaller one: the larger spatial nets need
+    # at least as many full-batch updates to converge (see the config note).
+    spatial_epochs = int(pcfg.get("spatial_epochs", flat_epochs))
 
     # --- box-bootstrap ensemble --------------------------------------------- #
     n_members = int(pcfg.get("n_members", 5))
@@ -501,6 +538,36 @@ def main(argv=None) -> int:
         "allow_incomplete": bool(args.allow_incomplete), "arm_reports": {},
     }
 
+    # ---- wandb ------------------------------------------------------------
+    # One run per fit job (the benchmark launches one job per arm), grouped by
+    # run_name so a sweep's arms land together. Every logged metric is tagged
+    # arm_<arm>/member_<m>/... so a multi-arm process stays legible in one run,
+    # and a shared monotonic step keeps wandb happy across members and arms.
+    wcfg = dict(cfg.get("wandb", {}) or {})
+    if args.no_wandb:
+        wcfg["mode"] = "disabled"
+    elif args.wandb_mode:
+        wcfg["mode"] = args.wandb_mode
+    wcfg.setdefault("group", args.run_name)
+    wcfg.setdefault("name", f"{args.run_name}-proxyfit-{''.join(arms)}")
+    cfg["wandb"] = wcfg
+    use_wandb = maybe_init_wandb(cfg, out_root, job_type="proxy_fit")
+    if use_wandb:
+        banner(f"wandb: logging to project "
+               f"{wcfg.get('project', os.environ.get('WANDB_PROJECT', 'cosmo_sr'))}"
+               f" as {wcfg['name']}")
+    _gstep = {"n": 0}
+
+    def wlog(d: Dict) -> None:
+        if not use_wandb:
+            return
+        try:
+            import wandb
+            wandb.log(d, step=_gstep["n"])
+            _gstep["n"] += 1
+        except Exception:
+            pass
+
     baselines: Dict[str, Dict] = {}
     for arm in arms:
         provider = make_arm_features(arm, rows, table_dir=table.parent, cfg=cfg)
@@ -521,7 +588,9 @@ def main(argv=None) -> int:
                 mult=mult, changed=changed, pairs=pairs, kinds=kinds, chunks=chunks,
                 pcfg=pcfg, scale=scale, bin_w=bin_w, sigma_r=sigma_r,
                 w_joint=w_joint, w_occ=w_occ, seed=m, epochs=epochs, device=device,
-                lambdas=lambdas, log_prefix=f"arm {arm} member {m}")
+                lambdas=lambdas, reward_key=reward_key,
+                log_prefix=f"arm {arm} member {m}",
+                wlog=wlog, wtag=f"arm_{arm}/member_{m}")
             hist["boxes_drawn"] = draw
             members.append(model)
             history.append(hist)
@@ -535,7 +604,7 @@ def main(argv=None) -> int:
         dev_members = [m_.to(device) for m_ in members]
         mean, _std = stream_ensemble_delta(
             provider, dev_members, ctx, reward_t, w_joint=w_joint, w_occ=w_occ,
-            chunk_rows=max_rows, device=device)
+            key=reward_key, chunk_rows=max_rows, device=device)
         pred_counts = stream_pred_counts(provider, dev_members, ctx,
                                          chunk_rows=max_rows, device=device)
         for m_ in members:
@@ -567,10 +636,17 @@ def main(argv=None) -> int:
                 "occupation_log_error": pooled_cand["occupation_log_error"],
                 "occupation_log_error_max": pooled_cand["occupation_log_error_max"]},
         }
+        sp = report['arm_reports'][arm]['train_ranking']['within_tile_spearman']
         print(f"  arm {arm}: train within-unit spearman "
-              f"{report['arm_reports'][arm]['train_ranking']['within_tile_spearman']:.4f}"
+              f"{sp:.4f}"
               f", per-candidate pooled mean log error "
               f"{pooled_cand['mean_log_error']:.4f}", flush=True)
+        # End-of-arm summary metrics, watchable alongside the per-epoch loss.
+        wlog({f"arm_{arm}/train_within_tile_spearman": float(sp),
+              f"arm_{arm}/train_pooled_mean_log_error":
+                  float(pooled_cand["mean_log_error"]),
+              f"arm_{arm}/train_final_loss":
+                  float(np.mean([h["final_loss"] for h in history]))})
 
     # Merge under a flock so parallel per-arm GPU jobs compose cleanly.
     _merge_arm_artifacts(out_root, baselines, report, arms)
@@ -581,6 +657,7 @@ def main(argv=None) -> int:
     print(f"  ensembles -> {out_root}/proxy_<arm>/", flush=True)
     print("  !! These are TRAINING numbers. The decision is made once, on "
           "set8-11, by scripts/reward/gate_catalog_proxy.py.", flush=True)
+    finish_wandb()
     return 0
 
 

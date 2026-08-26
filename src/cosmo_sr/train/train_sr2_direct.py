@@ -254,6 +254,7 @@ class DirectFinetuneTrainer:
         arm: str = "a",
         phase_cfg: Optional[PhaseSpaceConfig] = None,
         rockstar_cfg: Optional[SoftRockstarConfig] = None,
+        f_valid_center: Optional[int] = None,
     ):
         self.cfg = cfg or DirectFinetuneConfig()
         self.geom = geom or SR2TileGeometry()
@@ -268,6 +269,13 @@ class DirectFinetuneTrainer:
         # Arm F's fine density is inverse-pixel-shuffled at this multiple; 2 is
         # the SR2 recipe and matches arm F's offline provider.
         self.f_grid_mult = int(getattr(self.cfg, "density_grid_mult", 2) or 2)
+        # Valid-centre CIC region for arm F's density channel, in HR cells. None
+        # -> the same tile/2 region arm A deposits (soft_structure.region_fraction);
+        # 0 -> the legacy wrapped deposit. The offline provider derives the same
+        # number from the config through `_sr2_direct.arm_f_valid_center`, so the
+        # live extractor and the labelled features stay identical.
+        self.f_valid_center = (int(self.soft_cfg.region_of(int(self.geom.tile_hr)))
+                               if f_valid_center is None else int(f_valid_center))
         self.device = torch.device(device) if device else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(int(self.cfg.seed))
@@ -409,7 +417,8 @@ class DirectFinetuneTrainer:
         lr_core = lr[:, :, p:p + c, p:p + c, p:p + c]
         return critic_input(lr_core, cand, cellsize_kpc_h=self.soft_cfg.cellsize_kpc_h,
                             dis_norm_kpc_h=float(self.soft_cfg.dis_norm_kpc_h),
-                            grid_mult=int(self.f_grid_mult))
+                            grid_mult=int(self.f_grid_mult),
+                            valid_center=int(self.f_valid_center))
 
     # -- the step ---------------------------------------------------------- #
     def loss_terms(self, batch: Mapping) -> Tuple[Dict[str, torch.Tensor], Dict[str, float]]:

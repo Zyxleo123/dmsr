@@ -285,6 +285,25 @@ class TorchRewardModel(nn.Module):
     def reward_abundance(self, s: TorchSummary) -> torch.Tensor:
         return -self._block_mahalanobis2(s, "abundance")
 
+    def reward_hosted_subs(self, s: TorchSummary, *,
+                           floor: float = 0.5) -> torch.Tensor:
+        """``log10`` of the box's total hosted-subhalo count.
+
+        ``occ_numerator`` is the count of resolved subhalos binned by *host*
+        mass, so summed over the host bins it is exactly "subhalos that live
+        inside a resolved host" -- the literal target. A monotone functional,
+        numerator-only (a candidate cannot raise it by deleting hosts, unlike the
+        occupation ratio), and it sums exactly over tiles, so a tile swap is
+        linear in the swapped counts before the log. The floor keeps an empty box
+        finite and the gradient well defined; it matches the ``max(., 0.5)`` in
+        the NumPy stability scan that selected this target.
+
+        No covariance, no bin whitening: the proxy predicts one non-negative
+        count per tile and this reads their sum. See ``reward_stability_scan``.
+        """
+        tot = s.occ_numerator.to(self.mu.dtype).sum(dim=1)
+        return torch.log10(tot.clamp_min(float(floor)))
+
     def scores(self, s: TorchSummary) -> Dict[str, torch.Tensor]:
         """All three, always. Reporting one of them alone hides the trade."""
         return {
@@ -378,6 +397,12 @@ class TorchRewardModel(nn.Module):
         out["dR_combined"] = (
             self.combined(after, w_joint=w_joint, w_occ=w_occ) - before_comb.detach()
         )
+        # The hosted-subhalo target (reward_stability_scan): numerator-only,
+        # monotone, ungameable by host deletion. Baseline under no_grad like the
+        # others -- it is a constant of the box.
+        with torch.no_grad():
+            hosted_before = self.reward_hosted_subs(box)
+        out["dR_hosted_subs"] = self.reward_hosted_subs(after) - hosted_before.detach()
         out["clamped_fraction"] = self.swap_clamped_fraction(
             box, frozen_tile, predicted_tile)
         return out

@@ -123,8 +123,58 @@ def _require_field_gates(run: Path, arm: str, agate: Mapping) -> None:
 # --------------------------------------------------------------------------- #
 # select
 # --------------------------------------------------------------------------- #
+def _arm_f_tile_features(cfg, field, box: str, device) -> np.ndarray:
+    """``(n_tiles, 20, R, R, R)`` arm-F critic inputs from an in-memory field.
+
+    tile_features caches only arms a/b/c/e; arm F streams raw fields and so is
+    built here from the same primitives the OFFLINE provider uses
+    (:class:`_proxy_data.FieldArmFeatures`), including the valid-centre CIC
+    region -- otherwise the verifier would score the actor on a different arm-F
+    feature than the proxy was trained on.
+    """
+    from cosmo_sr.reward.sr2_adversarial import critic_input
+    from _sr2_direct import (arm_f_valid_center, geometry_of, load_lr,
+                             soft_config_of)
+
+    grid = tile_grid_of(cfg)
+    scfg = soft_config_of(cfg)
+    scale = int(geometry_of(cfg).scale_factor)
+    grid_mult = int(dict(cfg.get("adversarial", {})).get("density_grid_mult", 2))
+    vc = arm_f_valid_center(cfg)
+    lr = np.asarray(load_lr(cfg, box), dtype=np.float32)
+    field = np.asarray(field, dtype=np.float32)
+    blocks: List[np.ndarray] = []
+    for t in range(grid.n_tiles):
+        sx, sy, sz = grid.slices(t)
+        ftile = torch.as_tensor(field[:, sx, sy, sz], device=device)
+        lslice = tuple(slice(s.start // scale, s.stop // scale) for s in (sx, sy, sz))
+        lrtile = torch.as_tensor(lr[:, lslice[0], lslice[1], lslice[2]], device=device)
+        ci = critic_input(lrtile.unsqueeze(0), ftile.unsqueeze(0),
+                          cellsize_kpc_h=float(scfg.cellsize_kpc_h),
+                          dis_norm_kpc_h=float(scfg.dis_norm_kpc_h),
+                          grid_mult=grid_mult, valid_center=vc)
+        blocks.append(ci[0].cpu().numpy())
+    return np.stack(blocks, axis=0)
+
+
+def _arm_feature_block(cfg, field, frozen, box: str, device, arm: str) -> np.ndarray:
+    """One arm's per-tile feature block for the verifier, for EVERY arm.
+
+    ``tile_features`` returns blocks for a/b/c/e only: arm D reads arm C's token
+    grid (its live extractor IS arm C's), and arm F streams raw fields. Indexing
+    ``tile_features(...)[arm]`` therefore KeyErrors on 'd' and 'f' -- which is
+    why those two arms could not be actor-verified at all.
+    """
+    from collect_catalog_proxy_data import tile_features
+
+    if arm == "f":
+        return _arm_f_tile_features(cfg, field, box, device)
+    owner = "c" if arm == "d" else arm      # arm D reuses arm C's tokens
+    return tile_features(cfg, field, frozen, device)[owner]
+
+
 def stage_select(cfg, args, device) -> int:
-    from collect_catalog_proxy_data import generate_field, tile_features
+    from collect_catalog_proxy_data import generate_field
 
     agate = dict(cfg.get("actor_gate", {}))
     acfg = actor_config_of(cfg)
@@ -180,7 +230,7 @@ def stage_select(cfg, args, device) -> int:
                                mode="both", checkpoint=str(ck), device=device)
         frozen = generate_field(cfg, box, "frozen", base_seed, alpha=0.0,
                                 mode="both", checkpoint="", device=device)
-        feats = tile_features(cfg, field, frozen, device)[arm]
+        feats = _arm_feature_block(cfg, field, frozen, box, device, arm)
 
         out = actor_field_path(run, arm, box)
         out.parent.mkdir(parents=True, exist_ok=True)
