@@ -72,15 +72,24 @@ RUNG_ORDER: Tuple[str, ...] = (
     "proj_noise", "fine", "middle_fine", "all_blocks", "full",
 )
 
-#: Learning-rate groups, shallow (closest to the output) first.
-GROUP_NAMES: Tuple[str, ...] = ("proj_noise", "fine", "middle", "coarse")
+#: Learning-rate groups, shallow (closest to the output) first. ``cond`` is
+#: last because it is not a depth at all: it is the conditioning embedding
+#: (``cond0``), present only on a ``cond_chan > 0`` generator.
+GROUP_NAMES: Tuple[str, ...] = ("proj_noise", "fine", "middle", "coarse", "cond")
 
 #: Suggested initial rates. Every value is overridable from the config.
+#:
+#: ``cond`` is deliberately the LARGEST. The other groups start from pretrained
+#: values a fine-tune must not wreck; ``cond0`` starts at exactly zero and has
+#: no pretrained function to protect, so a coarse-sized 3e-7 would leave the
+#: channel wired in and inert for the whole run -- an expensive null result that
+#: looks like "conditioning does not help".
 DEFAULT_GROUP_LR: Dict[str, float] = {
     "proj_noise": 1e-5,
     "fine": 3e-6,
     "middle": 1e-6,
     "coarse": 3e-7,
+    "cond": 1e-5,
 }
 
 # Which ``blocks.<b>`` index each depth group owns. ``block0`` (the input
@@ -116,6 +125,11 @@ def _block0_names(model: nn.Module) -> List[str]:
     return [n for n, _ in model.named_parameters() if n.startswith("block0.")]
 
 
+def _cond_names(model: nn.Module) -> List[str]:
+    """The conditioning-embedding parameters, or ``[]`` on an unconditioned model."""
+    return [n for n, _ in model.named_parameters() if n.startswith("cond0.")]
+
+
 def rung_names(model: nn.Module, rung: str) -> List[str]:
     """The exact parameter names a rung makes trainable.
 
@@ -141,6 +155,11 @@ def rung_names(model: nn.Module, rung: str) -> List[str]:
         names += _block_conv_names(0)
     if rung == "full":
         names += _block0_names(model)
+    # The conditioning embedding is trained at EVERY rung it exists at. It is
+    # not a depth in the pretrained network -- it is the new input the arm is
+    # about -- and freezing it would run the arm as its own control (zero-init
+    # columns never move, so the generator stays bit-identical to frozen).
+    names += _cond_names(model)
 
     have = {n for n, _ in model.named_parameters()}
     missing = [n for n in names if n not in have]
@@ -162,6 +181,8 @@ def group_of_parameter(name: str) -> str:
     ``full``.
     """
     n = str(name)
+    if n.startswith("cond0."):
+        return "cond"
     if n.endswith(".std") or ".proj." in n:
         return "proj_noise"
     if n.startswith("block0."):

@@ -85,6 +85,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
+from .subhalo_gather import ENV_LABELS
+
 G_MPC_KMS2_PER_MSUN = 4.30091e-9
 
 __all__ = [
@@ -109,9 +111,71 @@ class MemberGatherConfig:
 
     # --- which sets ---------------------------------------------------------
     min_num_p: int = 200
+    #: Upper edge of the ``num_p`` window, exclusive. 0 is no ceiling and is the
+    #: default -- every arm recorded so far ran without one, because ``"sub"``
+    #: never selects the cluster host. It stops being optional the moment
+    #: ``population`` admits top-level halos: see :data:`population`.
+    max_num_p: int = 0
+    #: WHICH halos this loss is responsible for -- ``"sub"`` (``parent_ids >=
+    #: 0``, every arm so far), ``"top"``, or ``"all"``.
+    #:
+    #: ``"sub"`` encodes an assumption that was never tested: that the halos SR2
+    #: is missing are the ones Rockstar files inside a bigger halo's radius. The
+    #: held-out gate says otherwise -- in the edited region HR resolves 3,775
+    #: top-level halos >=200p against base's 3,028, a **747-halo deficit that is
+    #: entirely outside hosts** and that no supervised set in any arm has ever
+    #: pointed at. ``"all"`` selects on size alone and lets the parent split fall
+    #: where it falls, which is the right shape for that deficit if it turns out
+    #: to be a small-halo deficit rather than a substructure one.
+    #: ``scripts/features/halo_gap_census.py`` is the measurement that decides.
+    #:
+    #: With ``"top"`` or ``"all"``, :attr:`max_num_p` is what keeps the selection
+    #: away from the cluster itself. The pair sums are ``O(N^2)`` and a 1e14 host
+    #: is ~100k particles -- 1e10 pairs against a 200p set's 2e4 -- and its HR
+    #: reference asks the generator to concentrate a cluster, which is a
+    #: different objective from this one and is already handled, against the
+    #: FROZEN reference, by the host preservation guard.
+    population: str = "sub"
     min_purity: float = 0.5
     min_live_frac: float = 0.5
     max_sets: int = 256
+    #: How :attr:`max_sets` chooses when it binds. ``"largest"`` keeps the
+    #: biggest sets and is the default because it is what every recorded arm
+    #: ran; it is also exactly wrong for a small-halo run, where it would drop
+    #: the whole population the run was created to build. ``"stratified"``
+    #: fills log-``n_sites`` bins round-robin, so the cap thins the mass function
+    #: instead of truncating it; ``"random"`` is the unbiased-but-mass-weighted
+    #: middle option (the pool is dominated by small sets, so it lands close to
+    #: stratified without the binning). All three are deterministic in
+    #: :attr:`bg_seed`.
+    set_select: str = "largest"      # "largest" | "random" | "stratified"
+    #: WHICH environment the supervised sets are drawn from -- ``"any"`` (the
+    #: default and every recorded arm), or a comma list of
+    #: ``subhalo_gather.ENV_LABELS``: ``inside`` (<1 R_vir of a bigger resolved
+    #: host), ``near`` (1-3, the infall region), ``field`` (>3, isolated).
+    #:
+    #: Why a THIRD selection axis, after population and mass. *Measured*, set9
+    #: census at region scope, the small-halo arm against base and HR:
+    #:
+    #: ====== ========== ========== ========== ==========
+    #: env    base       smallhalo  HR         closed
+    #: ====== ========== ========== ========== ==========
+    #: near   1,899      2,148      8,456      249 of 6,557 (3.8%)
+    #: field  11,119     12,382     14,046     overshoots HR in every sub bin
+    #: ====== ========== ========== ========== ==========
+    #:
+    #: 56% of the region's deficit is in ``near`` and the arm put its budget in
+    #: ``field``, where it then overran the truth (field subhalos 3,316 against
+    #: HR's 2,466, and 2-6x too many above 200p). Selecting by size alone cannot
+    #: fix that, because the pool of a cluster region is dominated by field
+    #: halos and ``stratified`` stratifies on MASS. ``near`` sits inside a
+    #: cluster's own Lagrangian tiles, so unlike ``field`` it is reachable by
+    #: changing the selection rather than the tiling.
+    env_select: str = "any"
+    #: Particle floor for a halo to count as a "resolved host" when labelling
+    #: another halo's environment. 200 is the census's, and the number every
+    #: quoted host count in this line uses.
+    env_host_floor: int = 200
     #: Subsample a set to at most this many particles per evaluation; 0 is off
     #: and is the default, because this changes the ESTIMATOR and a silent
     #: estimator change is invisible in every metric. On, it is unbiased in
@@ -158,6 +222,64 @@ class MemberGatherConfig:
     bg_k: int = 4096
     bg_radius_factor: float = 4.0
     bg_seed: int = 0
+
+    # --- isolation: how much NON-MEMBER mass sits on top of the object -------
+    #: Weight on the local background OCCUPANCY, hinged above HR. 0 is off and
+    #: is the default; every arm recorded in
+    #: ``docs/sr2_member_gather_training.md`` ran without it.
+    #:
+    #: What it is for, and why no existing term can say it. Every other term in
+    #: this module is a moment of the members about their OWN centroid, or that
+    #: centroid's address. Rockstar's top-level/subhalo decision is not a
+    #: property of the members at all: it is whether some *other*, more massive
+    #: halo's virial radius contains this centre. So an intra-set loss pointed
+    #: at top-level HR halos gets full marks for an object that a pedestal then
+    #: swallows -- which is exactly what the small-halo arm did. *Measured*,
+    #: set9 region scope, ``--population all`` against base: it built 3,374 net
+    #: objects and Rockstar filed **every one of them as a subhalo** (subs
+    #: +4,260, top-level -886), so the top-level deficit the arm exists to close
+    #: went the wrong way, 3,872 -> 4,758.
+    #:
+    #: ``d6`` is the only existing term that looks outside the set and it does
+    #: not close this: it normalises by the background's *dispersion*, not its
+    #: density, so a set can be maximally compact against its neighbourhood's
+    #: position and velocity spread while sitting in a growing mass pile.
+    #:
+    #: This term charges the non-member mass inside :attr:`iso_radius_frac` of
+    #: the background sphere, against HR's value on the **same particle ids** --
+    #: so the background subsample fraction cancels exactly and the comparison
+    #: is id-matched rather than field-matched. Hinged ABOVE: costs nothing for
+    #: matching or beating HR, which keeps the module's standing property that
+    #: the loss can never ask for more than HR has.
+    #:
+    #: It is the same lever against the re-parenting damage measured in
+    #: `host-damage-is-mostly-reparenting` (~88% of the ``self`` arm's host loss
+    #: was objects crossing the parent split, not particles lost) and against
+    #: the radial over-concentration that killed the shell arm -- those are this
+    #: same emergent pedestal, seen from the host's side. A *placement* loss on
+    #: the supervised sets could not reach it; a *density* loss on the material
+    #: around them can.
+    w_isolation: float = 0.0
+    #: The counting radius, as a fraction of the background sphere
+    #: (``bg_radius_factor * r_ref``, with ``r_ref`` the HR set's rms radius).
+    #: 0.5 keeps the sphere comfortably inside the sampled one -- the background
+    #: ids are chosen ONCE on the frozen field within ``bg_radius_factor``
+    #: radii, so material arriving from further out is invisible to this term,
+    #: and a counting radius at the sampling edge would be counting an edge.
+    #: Widen ``bg_radius_factor`` rather than this if the sphere is too small.
+    iso_radius_frac: float = 0.5
+    #: Sigmoid width of the soft indicator, as a fraction of the counting
+    #: radius. The count has to be differentiable in the background particles'
+    #: positions or the term has no gradient at all; 0.15 is soft enough to
+    #: carry one everywhere in the shell and sharp enough that the count means
+    #: what it says.
+    iso_softness: float = 0.15
+    #: Minimum HR soft count for a set to be CHARGED at all. A set whose HR
+    #: reference holds a handful of background particles has a ratio dominated
+    #: by shot noise, and hinging on it would charge the run for the background
+    #: sampler's seed. Such sets are skipped and counted in ``n_iso``, exactly
+    #: as ``d6`` skips sets with no background at all.
+    iso_min_count: float = 8.0
 
     # --- weights ------------------------------------------------------------
     w_virial: float = 1.0
@@ -208,7 +330,145 @@ class MemberGatherConfig:
     #: Against ``full``, which leaves zero by construction. They are worth
     #: running as a GENERATOR objective, where the address is unavailable; they
     #: cannot beat ``full`` in the free field, which sees it.
-    centre_mode: str = "full"           # "full" | "radial" | "self"
+    #: ``self_tan`` is ``self`` with the RADIAL direction removed: it charges
+    #: only the transverse part of the offset from the frozen centroid. It has
+    #: no meaning on its own -- alone it is a weaker ``self`` -- and exists for
+    #: exactly one composition, with ``w_radius`` below. ``self`` pins a set to
+    #: where the frozen field put it, *including its host-centric radius*, which
+    #: is the coordinate the radius term is trying to move; ``self_tan`` hands
+    #: that one coordinate to the radius term and keeps the anchor on the two
+    #: the radius term says nothing about. The two terms are then orthogonal by
+    #: construction rather than competing (see ``w_radius``).
+    centre_mode: str = "full"      # "full" | "radial" | "self" | "self_tan"
+
+    # --- the shell: right distance from the host, any direction -------------
+    #: Weight on ``| |x_bar - x_host| - |x_target - x_host| |`` -- the set's
+    #: host-centric RADIUS, with the direction left free. 0 is off and is the
+    #: default; every arm recorded in ``docs/sr2_member_gather_training.md`` ran
+    #: without it.
+    #:
+    #: Why a radius and not an address: *measured*, on the 7,560-set pool in
+    #: ``centre_offset/pool/offsets.json``, the radius error is **60% of the
+    #: whole centre offset** by magnitude, and it is the half that is a rule
+    #: rather than noise -- 58.3% of frozen sets sit too CLOSE to their host
+    #: (median ratio 0.974, median error 2.80 search radii, p90 8.18), against
+    #: a transverse residual whose direction a linear fit on (d_host, num_p,
+    #: M_host) explains 11.5% of out of sample. This term asks for the part
+    #: that is predictable and stays silent about the part that is not.
+    #:
+    #: What it is FOR: the tuned ``self`` arm's subhalos are radially collapsed.
+    #: On held-out set9 (``subhalo_radial/set9/summary.json``) its subhalos sit
+    #: at a median 0.35 host R_vir against HR's 1.13, with **6,496 inside
+    #: 0.25 R_vir where HR has 593** and 932 in 0.75-1.0 R_vir where HR has
+    #: 3,846. Too many in the middle, not enough anywhere else.
+    #:
+    #: It CONFLICTS with ``centre_mode="self"``, and not marginally. That mode's
+    #: minimum is the frozen centroid, radius included; this term's minimum is
+    #: the true shell, a median 2.80 radii away. Both quadratic, a radial step
+    #: ``delta`` costs ``w_centre (delta/s)^2 + w_radius ((|dr| - delta)/s)^2``,
+    #: so the two settle at ``delta* = |dr| w_radius / (w_centre + w_radius)``:
+    #: at equal weights the run closes exactly HALF the radius error it was
+    #: added to close, and pays the centre term for the half it does close.
+    #: ``centre_mode="self_tan"`` removes the competition instead of outbidding
+    #: it -- the anchor keeps the two transverse coordinates, this term owns the
+    #: radial one, and ``delta* = |dr|``.
+    w_radius: float = 0.0
+    #: Search radii of slack: the term costs exactly nothing while the radius is
+    #: within this of the truth. The objective is a SHELL, not an address, and
+    #: it is not worth spending gradient on the last fraction of a radius when
+    #: the gate is a threshold at one -- and the frozen error is a median 2.80
+    #: radii, so a dead zone of 1 leaves 79% of sets still charged.
+    radius_dead_zone: float = 1.0
+    #: Search radii beyond which the radius term is linear rather than
+    #: quadratic, continuous in value and slope. Same argument as
+    #: ``centre_huber_radii``: the p90 set is 8.2 radii out, where a quadratic
+    #: charges 67 and the tail owns the batch gradient.
+    radius_huber_radii: float = 0.0
+
+    # --- the soft shell: match the host's radius DISTRIBUTION ---------------
+    #: Weight on a 1-D optimal-transport match between the candidate and target
+    #: host-centric radii of one host's sets: sort both, pair by RANK, and
+    #: charge the log ratio. 0 is off and is the default.
+    #:
+    #: Why, and it is the post-mortem of ``w_radius`` above. That term charges
+    #: each set against *its own* target radius -- a per-object address. On the
+    #: 7,560-set pool, a linear probe on (log ``d_host``, log ``num_p``, log
+    #: ``Mvir``, log ``n_live``) fit on train predicts that address with an
+    #: **out-of-sample R^2 of 0.022** in the term's own units (0.015 in log
+    #: units). Section 14.1's "the radius is the half that is a rule rather than
+    #: noise" is true of the AGGREGATE -- 58.3% of frozen sets sit too close,
+    #: median ratio 0.974 -- and false per set. Those are different claims and
+    #: ``w_radius`` was built on the wrong one.
+    #:
+    #: The ``all_blocks_selfshell`` run is that stated as a trajectory: train
+    #: ``radius_err_radii`` 2.860 -> 1.318 (memorised), held-out 2.678 -> 2.808
+    #: (the address is not there), held-out ``radius_ratio`` 0.9744 -> 0.9872 --
+    #: so the ONLY component that transferred was the multiplicative one. It
+    #: cost 55% of the abundance: host subhalos 367 (``self``) -> 167, against
+    #: HR's 374.
+    #:
+    #: This term asks for that component and nothing else. Measured on the same
+    #: pool, against the identity pairing (train / holdout):
+    #:
+    #: * median ``|log ratio|`` 0.164 / 0.143 -> **0.079 / 0.064** -- the sort
+    #:   halves the magnitude but the SIGNED median, the inward bias that is the
+    #:   whole signal, survives intact: -0.026 / -0.022 -> -0.041 / -0.026.
+    #: * mean square 0.345 / 0.320 -> 0.071 / 0.061, i.e. the monotone map
+    #:   removes 79% of it. A per-host constant rescale would remove **1.9%**
+    #:   (the between-host share of the variance; 98.1% is within-host), so what
+    #:   this term fixes is the SHAPE of the radial distribution, not its mean.
+    #:
+    #: What it deliberately does not buy: a PERFECT distribution match still
+    #: leaves 79% (train) / 85% (holdout) of the per-set address error standing.
+    #: That is the point -- see ``median_shell_resid``, which is the diagnostic
+    #: to read, because ``radius_err_radii`` will barely move on total success.
+    #:
+    #: Pairs with ``centre_mode="self_tan"`` for the same reason ``w_radius``
+    #: does: the anchor holds the two transverse coordinates and this term owns
+    #: the radial one. Unlike ``w_radius`` it never names a set's own target, so
+    #: its minimum is a DISTRIBUTION -- reachable by sets exchanging radii along
+    #: their own radial lines. Per-host ``spearman(r_frozen, r_true)`` is 0.92
+    #: median (0.62 worst) and 31% of sets sit more than 0.1N from their own
+    #: target rank, so that freedom is real and is why both diagnostics are
+    #: logged: distribution matched with the addresses rearranged is a different
+    #: outcome from both of them being right, and only the pair can tell.
+    w_shell: float = 0.0
+    #: Free zone, as a FRACTIONAL radius error: the term costs nothing while
+    #: the sorted candidate radius is within this of the sorted target. Applied
+    #: in log space as ``log1p(shell_dead_zone)``, so the knob means what it
+    #: says. 0.02 charges 81% / 78% of sets (train / holdout) against a sorted
+    #: median of 0.079 / 0.064; the 0.05 that ``radius_dead_zone``'s reasoning
+    #: would suggest charges only 61% / 55% and eats most of a signal half the
+    #: size of the one that number was set against.
+    shell_dead_zone: float = 0.02
+    #: Floor on both radii before the log, Mpc/h. On the target it is a plain
+    #: clamp (a constant; min ``r_true`` in the pool is 0.0047 and 0.119% sit
+    #: below 0.05). On the CANDIDATE it is a softened norm, ``sqrt(|d|^2 +
+    #: eps^2)`` rather than ``clamp_min``: a clamp is a gradient PLATEAU below
+    #: the floor, and the failure this term exists to prevent is collapse
+    #: toward the host centre -- the one place a plateau must not be. It does
+    #: not bind on the frozen field (the smallest frozen radius in a host is a
+    #: median 0.142, min 0.041 Mpc/h); it is there for where the run can go.
+    shell_eps_mpc_h: float = 1e-2
+    #: How many QUANTILE BINS the sorted pairing is reduced to before it is
+    #: charged. 0 (default) keeps the full rank-by-rank pairing, which is what
+    #: every arm through 2026-09-08 ran.
+    #:
+    #: Why the knob exists: the full pairing hands the loss one degree of
+    #: freedom per set (~134 for a big host), and MEASURED on 2026-09-08 the
+    #: w=30 arm drove the train residual 7.3x while holdout moved 1.4x -- it was
+    #: fitting per-host detail that did not transfer. The low-order shape of the
+    #: radius distribution is the part a shared operator can plausibly carry;
+    #: the high-rank-resolution wiggle is the part it can only memorise. Binning
+    #: the sorted arrays into Q bins and charging the bins' mean log radius
+    #: keeps the first and drops the second, so Q is a direct dial on "ask only
+    #: for what is predictable".
+    #:
+    #: Bins are equal-COUNT over the sorted arrays, not equal-radius, so each
+    #: carries the same weight however the radii pile up. Q >= the number of
+    #: sets is the full pairing again (one set per bin), so a small host is
+    #: never charged on emptier bins than it has sets.
+    shell_quantiles: int = 0
 
     def __post_init__(self) -> None:
         if self.softening_kind not in ("plummer", "clamp"):
@@ -227,9 +487,46 @@ class MemberGatherConfig:
                 f"max_set_particles {self.max_set_particles} is below 3; the "
                 "pair-sum rescaling divides by (K - 1) and a 2-particle sample "
                 "carries no information about a subhalo. Use 0 to disable.")
-        if self.centre_mode not in ("full", "radial", "self"):
+        if self.population not in ("sub", "top", "all"):
+            raise ValueError(f"population {self.population!r} is not 'sub', "
+                             "'top' or 'all'")
+        if self.max_num_p and self.max_num_p <= self.min_num_p:
+            raise ValueError(
+                f"max_num_p {self.max_num_p} is not above min_num_p "
+                f"{self.min_num_p}; the window is empty. Use 0 for no ceiling.")
+        if self.set_select not in ("largest", "random", "stratified"):
+            raise ValueError(f"set_select {self.set_select!r} is not 'largest', "
+                             "'random' or 'stratified'")
+        if self.centre_mode not in ("full", "radial", "self", "self_tan"):
             raise ValueError(f"centre_mode {self.centre_mode!r} is not "
-                             "'full', 'radial' or 'self'")
+                             "'full', 'radial', 'self' or 'self_tan'")
+        if self.w_radius < 0.0:
+            raise ValueError(f"w_radius {self.w_radius} is negative; the term "
+                             "would PAY for landing on the wrong shell")
+        if self.w_shell < 0.0:
+            raise ValueError(f"w_shell {self.w_shell} is negative; the term "
+                             "would PAY for the wrong radius distribution")
+        if self.shell_dead_zone < 0.0:
+            raise ValueError(
+                f"shell_dead_zone {self.shell_dead_zone} is negative")
+        if self.shell_eps_mpc_h <= 0.0:
+            raise ValueError(
+                f"shell_eps_mpc_h {self.shell_eps_mpc_h} is not positive; it "
+                "floors a radius before a log and softens a norm at zero")
+        if self.shell_quantiles < 0:
+            raise ValueError(
+                f"shell_quantiles {self.shell_quantiles} is negative; use 0 "
+                "for the full rank-by-rank pairing")
+        if self.radius_dead_zone < 0.0:
+            raise ValueError(
+                f"radius_dead_zone {self.radius_dead_zone} is negative")
+        if self.radius_huber_radii and (
+                self.radius_huber_radii <= self.radius_dead_zone):
+            raise ValueError(
+                f"radius_huber_radii {self.radius_huber_radii} is not above "
+                f"radius_dead_zone {self.radius_dead_zone}; the linear arm "
+                "would start inside the dead zone and the term would be "
+                "discontinuous.")
         if self.centre_huber_radii and (
                 self.centre_huber_radii <= self.centre_dead_zone):
             raise ValueError(
@@ -473,10 +770,16 @@ class SetTerms:
     bound_soft: torch.Tensor
     bound_hard: torch.Tensor
     d6: Optional[torch.Tensor] = None
+    #: Soft COUNT of local non-member particles inside the isolation
+    #: radius -- the only statistic here that is about what SURROUNDS the
+    #: object rather than about the object. ``None`` when there is no
+    #: background or no radius was supplied.
+    bg_occ: Optional[torch.Tensor] = None
 
     def detached(self) -> Dict[str, float]:
         d = {"n": float(self.n)}
-        for k in ("r_rms", "sigma_v", "virial", "bound_soft", "bound_hard", "d6"):
+        for k in ("r_rms", "sigma_v", "virial", "bound_soft", "bound_hard",
+                  "d6", "bg_occ"):
             v = getattr(self, k)
             d[k] = float("nan") if v is None else float(v.detach())
         return d
@@ -490,6 +793,7 @@ def set_statistics_torch(
     bg_pos: Optional[torch.Tensor] = None,
     bg_vel: Optional[torch.Tensor] = None,
     pot_mass_factor: float = 1.0,
+    iso_radius: float = 0.0,
 ) -> SetTerms:
     """Every differentiable statistic for one **already unwrapped** member set.
 
@@ -501,6 +805,14 @@ def set_statistics_torch(
     ``bound_scale`` is the sigmoid temperature; ``None`` means derive it
     adaptively (see :func:`_bound_temperature`). ``bg_pos``/``bg_vel`` are the
     local non-member background; without them ``d6`` is ``None``.
+
+    ``iso_radius`` (Mpc/h) turns on ``bg_occ``, the soft count of background
+    particles inside that radius of the set's centroid. The centroid is
+    **detached**: the term is meant to push the surrounding non-member mass
+    out to where HR has it, not to let the set run away from the pile, which
+    is what a live centroid would also permit and what would put it in a
+    tug-of-war with the centre term (the mistake ``w_radius`` made against
+    ``centre_mode='self'``, docs section 14).
 
     ``pot_mass_factor`` scales the mass **inside the pair sum only**. It is
     ``(N - 1) / (K - 1)`` when the set has been subsampled to ``K`` of its ``N``
@@ -543,8 +855,20 @@ def set_statistics_torch(
         sv = torch.sqrt((bdv * bdv).sum(dim=1).mean() + 1e-12)
         d6 = torch.sqrt((r_rms / sx) ** 2 + (sigma_v / sv) ** 2 + 1e-12)
 
+    bg_occ = None
+    if bg_pos is not None and bg_pos.shape[0] > 0 and float(iso_radius) > 0.0:
+        r_iso = float(iso_radius)
+        # The sphere is centred where the object actually is, so the term
+        # tracks the object rather than a fixed point in space -- but
+        # detached, so the gradient reaches the BACKGROUND particles only.
+        c = pos.mean(dim=0).detach()
+        d = torch.sqrt(((bg_pos - c) ** 2).sum(dim=1) + 1e-12)
+        w = max(float(cfg.iso_softness) * r_iso, 1e-9)
+        bg_occ = torch.sigmoid((r_iso - d) / w).sum()
+
     return SetTerms(n=n, r_rms=r_rms, sigma_v=sigma_v, virial=virial,
-                    bound_soft=bound_soft, bound_hard=bound_hard, d6=d6)
+                    bound_soft=bound_soft, bound_hard=bound_hard, d6=d6,
+                    bg_occ=bg_occ)
 
 
 def _bound_temperature(energy: torch.Tensor,
@@ -584,6 +908,26 @@ class MemberSets:
 
     halo_id: np.ndarray                  # (S,)
     num_p: np.ndarray                    # (S,) catalog size
+    #: (S,) the catalog's ``parent_id`` -- ``< 0`` for a top-level halo. Carried
+    #: so an eval can split "did the arm build this" by population: with
+    #: ``population="all"`` the pool holds both, and an aggregate that mixes a
+    #: satellite with an isolated field halo cannot say which of the two the run
+    #: actually learned. ``-1`` everywhere for a pool built before this field
+    #: existed is not possible -- it is always written by
+    #: :func:`build_member_sets`.
+    parent_id: np.ndarray                # (S,)
+    #: (S,) index into ``subhalo_gather.ENV_LABELS`` -- which environment
+    #: each set's halo sits in, measured on the HR catalog at build time.
+    #: Carried for the same reason as ``parent_id``: an aggregate that
+    #: pools an infall-region satellite with an isolated field halo cannot
+    #: say which of the two the run learned, and the set9 census says those
+    #: two bins are where the arm succeeded and failed respectively.
+    #: All ``-1`` when no environment was supplied.
+    env: np.ndarray                      # (S,)
+    #: (S,) the isolation term's counting radius, Mpc/h. Derived from each
+    #: set's own background sphere at build time and therefore a constant of
+    #: the data, not of the optimisation. 0 where the term cannot apply.
+    iso_radius: np.ndarray               # (S,)
     n_live: np.ndarray                   # (S,) members inside the trained tiles
     live_rows: List[torch.Tensor]        # (S,) long, rows of the particle table
     fixed_pos: List[Optional[torch.Tensor]]   # (S,) frozen positions, detached
@@ -600,6 +944,12 @@ class MemberSets:
     #: collection ``_gather_one`` builds, live rows plus frozen stragglers, so
     #: ``centre_mode="self"`` costs exactly zero at step 0 by construction.
     centre_self: torch.Tensor
+    #: (S, 3) the HOST's centre, on this set's unwrap branch. ``centre_rhat`` is
+    #: its direction and loses its length; the radius term needs the length, so
+    #: the point is kept rather than the ray. All-zero when no host position was
+    #: supplied -- which the loss refuses for ``w_radius > 0``, exactly as it
+    #: refuses ``centre_mode="radial"`` for an all-zero ``centre_rhat``.
+    centre_host: torch.Tensor
     ref: Dict[str, torch.Tensor]         # HR's value of every statistic
     particle_mass_msun_h: float
     boxsize_mpc_h: float
@@ -638,6 +988,7 @@ class MemberSets:
             centre_scale=self.centre_scale.to(device),
             centre_rhat=self.centre_rhat.to(device),
             centre_self=self.centre_self.to(device),
+            centre_host=self.centre_host.to(device),
             ref={k: v.to(device) for k, v in self.ref.items()},
         )
 
@@ -678,7 +1029,8 @@ def _gather_one(pos: torch.Tensor, vel: torch.Tensor, sets: MemberSets, s: int,
 
 #: The six terms, in the order they are weighted. Used by the budget
 #: normalisation so a caller cannot pass a scale for a term that does not exist.
-TERM_NAMES = ("virial", "bound", "d6", "rrms", "sigmav", "centre")
+TERM_NAMES = ("virial", "bound", "d6", "rrms", "sigmav", "centre",
+              "radius", "shell", "isolation")
 
 
 def member_gather_loss(
@@ -688,7 +1040,8 @@ def member_gather_loss(
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     """``(loss, diagnostics)`` over every supervised set.
 
-    Five terms, each normalised to HR's own value on the same set:
+    Five moment terms, each normalised to HR's own value on the same set, and
+    two placement terms:
 
     ==========  ========  ================================================
     term        shape     rationale
@@ -698,6 +1051,10 @@ def member_gather_loss(
     d6          hinged    6-D contrast against real local non-members
     r_rms       2-sided   breaks the sigma_v^2 * r_rms degeneracy
     sigma_v     2-sided   likewise, and velocity is never safe to get wrong
+    centre      softened  WHERE the object is; `centre_mode` picks the offset
+    radius      softened  how far from the HOST it is; direction left free
+    shell       softened  the DISTRIBUTION of those distances; no addresses
+    isolation   hinged    non-member mass ON it; the only INTER-set term
     ==========  ========  ================================================
 
     Hinged terms are ``[1 - x/x_HR]_+^2`` (bound) or ``[x/x_HR - 1]_+^2`` (d6):
@@ -746,16 +1103,47 @@ def member_gather_loss(
     acc = {k: zero.clone() for k in TERM_NAMES}
     offsets: List[float] = []
     penalised: List[float] = []
+    radius_err: List[float] = []
+    radius_ratio: List[float] = []
+    # The shell's two sides. Floats always, for the diagnostic -- it is reported
+    # at ``w_shell=0`` too, exactly as ``radius_ratio`` is at ``w_radius=0``, so
+    # the finished arms can be re-read against this one. Live tensors only when
+    # the term is on, which is what keeps ``w_shell=0`` byte-identical to them.
+    shell_now: List[float] = []
+    shell_tgt: List[float] = []
+    shell_now_t: List[torch.Tensor] = []
+    shell_tgt_t: List[torch.Tensor] = []
+    shell_curves: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     rows: List[Dict[str, float]] = []
+    iso_ratio: List[float] = []
     n_d6 = 0
+    n_iso = 0
 
-    if cfg.centre_mode == "radial" and float(
+    if cfg.centre_mode in ("radial", "self_tan") and float(
             sets.centre_rhat.abs().sum()) == 0.0:
         raise ValueError(
-            "centre_mode='radial' projects the offset onto the clustercentric "
-            "direction, but every centre_rhat is zero -- build_member_sets was "
-            "called without host_pos. Pass it, or the term would be identically "
-            "zero and the run would silently be a w_centre=0 run.")
+            f"centre_mode={cfg.centre_mode!r} splits the offset along the "
+            "clustercentric direction, but every centre_rhat is zero -- "
+            "build_member_sets was called without host_pos. Pass it, or the "
+            "term would silently charge for something other than what it "
+            "names (for 'radial', identically zero -- a w_centre=0 run under "
+            "another name; for 'self_tan', the full self offset).")
+    has_host = float(sets.centre_host.abs().sum()) != 0.0
+    if float(cfg.w_radius) > 0.0 and not has_host:
+        raise ValueError(
+            "w_radius > 0 charges for the set's distance from its HOST, but "
+            "every centre_host is zero -- build_member_sets was called without "
+            "host_pos. Pass it, or the term would measure distance from the "
+            "origin of the box. Host preservation sets are built host_pos=None "
+            "by design (a host IS the centre) and must run w_radius=0.")
+    if float(cfg.w_shell) > 0.0 and not has_host:
+        raise ValueError(
+            "w_shell > 0 matches the DISTRIBUTION of the sets' distances from "
+            "their HOST, but every centre_host is zero -- build_member_sets "
+            "was called without host_pos. Pass it, or the term would match a "
+            "distribution of distances from the origin of the box. Host "
+            "preservation sets are built host_pos=None by design and must run "
+            "w_shell=0.")
 
     idx = (list(range(sets.n_sets)) if set_indices is None
            else [int(i) for i in set_indices])
@@ -776,7 +1164,13 @@ def member_gather_loss(
         st = set_statistics_torch(
             p, v, particle_mass_msun_h=sets.particle_mass_msun_h, cfg=cfg,
             bound_scale=scale, bg_pos=bp, bg_vel=bv,
-            pot_mass_factor=pot_factor)
+            pot_mass_factor=pot_factor,
+            # ALWAYS measured, whatever is being penalised. The count is a
+            # sum over <=bg_k particles against a step dominated by O(N^2)
+            # pair blocks, so the diagnostic is free -- and an arm run at
+            # w_isolation=0 that cannot report its pedestal is exactly the
+            # blind spot the four velocity-guard arms had.
+            iso_radius=float(sets.iso_radius[s]))
 
         acc["virial"] = acc["virial"] + _log2(st.virial, sets.ref["virial"][s])
         acc["rrms"] = acc["rrms"] + _log2(st.r_rms, sets.ref["r_rms"][s])
@@ -800,30 +1194,129 @@ def member_gather_loss(
                             @ sets.centre_rhat[s])
         elif cfg.centre_mode == "self":
             pen = torch.linalg.vector_norm(cbar - sets.centre_self[s])
+        elif cfg.centre_mode == "self_tan":
+            # The self offset with its radial component projected out, so the
+            # anchor holds the two coordinates `w_radius` says nothing about and
+            # leaves the one it owns free. `centre_rhat` is taken at the TARGET
+            # and is a constant, so this is a fixed plane, not a projection onto
+            # a direction that moves with the optimisation variable.
+            doff = cbar - sets.centre_self[s]
+            pen = torch.linalg.vector_norm(
+                doff - (doff @ sets.centre_rhat[s]) * sets.centre_rhat[s])
         else:
             pen = off
         acc["centre"] = acc["centre"] + _centre_cost(pen / sets.centre_scale[s],
                                                      cfg)
+        # The SHELL: right distance from the host, direction free. Charged on
+        # the radius error rather than on a vector, so a set is free to sit
+        # anywhere on the sphere its truth defines -- the transverse direction
+        # is the 37% of the offset that no input predicts (`w_radius`), and a
+        # term that demanded it would be asking for realisation noise.
+        if has_host:
+            r_now = torch.linalg.vector_norm(cbar - sets.centre_host[s])
+            r_true = torch.linalg.vector_norm(sets.centre_target[s]
+                                              - sets.centre_host[s])
+            dr = r_now - r_true
+            if float(cfg.w_radius) > 0.0:
+                acc["radius"] = acc["radius"] + _radius_cost(
+                    dr.abs() / sets.centre_scale[s], cfg)
+            radius_err.append(float(dr.detach()))
+            radius_ratio.append(float((r_now / r_true.clamp_min(1e-12)).detach()))
+            # The shell's candidate radius is a SOFTENED norm, not `r_now`
+            # clamped: `sqrt(|d|^2 + eps^2)` has no plateau, and a plateau at
+            # small radius is a zero gradient exactly where this term's whole
+            # purpose is to push back (see `shell_eps_mpc_h`).
+            eps2 = float(cfg.shell_eps_mpc_h) ** 2
+            r_soft = torch.sqrt(((cbar - sets.centre_host[s]) ** 2).sum() + eps2)
+            r_tgt = r_true.clamp_min(float(cfg.shell_eps_mpc_h))
+            shell_now.append(float(r_soft.detach()))
+            shell_tgt.append(float(r_tgt.detach()))
+            if float(cfg.w_shell) > 0.0:
+                shell_now_t.append(r_soft)
+                shell_tgt_t.append(r_tgt)
+        else:
+            # Host preservation sets, and the unit tests that pass no host. NaN
+            # rather than a number measured from the box origin: a plotted zero
+            # would read as "the shell is already right".
+            radius_err.append(float("nan"))
+            radius_ratio.append(float("nan"))
         offsets.append(float(off.detach()))
         penalised.append(float(pen.detach()))
         if st.d6 is not None and torch.isfinite(sets.ref["d6"][s]):
             acc["d6"] = acc["d6"] + _hinge_above(st.d6, sets.ref["d6"][s])
             n_d6 += 1
+        # ISOLATION. Hinged above HR's own count on the SAME background ids,
+        # so the subsample fraction cancels and "as clean as HR" costs zero.
+        # Sets whose HR reference is too sparse to be a ratio are skipped
+        # rather than charged, and `n_iso` says how many survived -- an arm
+        # whose `n_iso` is a fraction of `n_sets` is not running this term
+        # on the pool it thinks it is.
+        iso_ref = sets.ref["bg_occ"][s]
+        iso_r = float("nan")
+        if (st.bg_occ is not None and torch.isfinite(iso_ref)
+                and float(iso_ref) >= float(cfg.iso_min_count)):
+            acc["isolation"] = acc["isolation"] + _hinge_above(st.bg_occ,
+                                                              iso_ref)
+            iso_r = float((st.bg_occ / iso_ref).detach())
+            n_iso += 1
+        # NaN, not skipped: the list stays aligned with `rows`, which is what
+        # lets the by-population and by-environment splits below be taken on
+        # the same objects the per-set table reports.
+        iso_ratio.append(iso_r)
 
         r = st.detached()
         r["halo_id"] = int(sets.halo_id[s])
         r["num_p"] = int(sets.num_p[s])
         r["n_live"] = int(sets.n_live[s])
+        # Population and environment on every row, so an aggregate can be
+        # SPLIT rather than only pooled. `MemberSets.parent_id` existed for
+        # exactly this and nothing read it, which is why the small-halo arm
+        # could not say whether its TOP-LEVEL sets -- the whole point of it
+        # -- had improved, and had to wait ten hours for a Rockstar gate to
+        # find out that they had not.
+        r["parent_id"] = int(sets.parent_id[s])
+        r["env"] = int(sets.env[s])
+        r["iso_ratio"] = iso_r
+        r["centre_offset_radii"] = float(off.detach()
+                                         / sets.centre_scale[s].detach())
         rows.append(r)
 
+    # THE SOFT SHELL. One sort per call, over this host's sets in this step:
+    # pair the sorted candidate radii with the sorted target radii by RANK --
+    # the 1-D optimal transport map, exact and O(N log N) -- and charge the log
+    # ratio. No set is ever named against its OWN target, so the term asks for
+    # the radius distribution and stays silent about the address `w_radius`
+    # could not predict (out-of-sample R^2 0.022; see `w_shell`).
+    #
+    # Pooling the sets of one host is safe because they are ID-GATHERED: the
+    # candidate set `i` and target set `i` hold the same particle rows and so
+    # the same `num_p`. The mass distribution is identical on both sides by
+    # construction, and a rank pairing cannot put the wrong masses at the wrong
+    # radii the way it could on two independently selected populations.
+    if shell_now_t:
+        lc, lt = shell_reduce(torch.stack(shell_now_t),
+                              torch.stack(shell_tgt_t), cfg)
+        acc["shell"] = shell_charge(lc, lt, cfg)
+        # The candidate side of the reduction, kept live for the caller. A
+        # noise-AVERAGED shell (`--shell-noise-draws`) must charge the mean of
+        # these curves over the draws, which is a different quantity from the
+        # mean of the per-draw charges and is the one that cannot be satisfied
+        # by any single realisation -- so the caller needs the curve, not the
+        # scalar. `lt` rides along because it is the same target either way.
+        shell_curves = (lc, lt)
+
     ns = float(len(idx))
-    for k in ("virial", "bound", "rrms", "sigmav", "centre"):
+    # `shell` is absent: it is already a mean over the sorted pairs.
+    for k in ("virial", "bound", "rrms", "sigmav", "centre", "radius"):
         acc[k] = acc[k] / ns
     acc["d6"] = acc["d6"] / max(n_d6, 1)
+    acc["isolation"] = acc["isolation"] / max(n_iso, 1)
 
     weight = {"virial": float(cfg.w_virial), "bound": float(cfg.w_bound),
               "d6": float(cfg.w_d6), "rrms": float(cfg.w_rrms),
-              "sigmav": float(cfg.w_sigmav), "centre": float(cfg.w_centre)}
+              "sigmav": float(cfg.w_sigmav), "centre": float(cfg.w_centre),
+              "radius": float(cfg.w_radius), "shell": float(cfg.w_shell),
+              "isolation": float(cfg.w_isolation)}
     # A term already at zero would divide by ~0 and dominate everything after
     # it, so the scale is floored. Reaching the floor means the term was already
     # satisfied on the frozen field and has nothing to contribute either way.
@@ -833,8 +1326,29 @@ def member_gather_loss(
     for k in TERM_NAMES:
         loss = loss + weight[k] * acc[k] / scale[k]
 
+    # The live (differentiable) reduced shell curve, for a caller that wants to
+    # average it over noise draws before charging. None when the term is off.
+    # Not a float: this is the one diag entry that is deliberately a tensor.
+    diag_curves = shell_curves
     diag: Dict[str, object] = {"n_sets": len(idx), "n_sets_total": sets.n_sets,
-                               "n_d6": n_d6, "rows": rows}
+                               "n_d6": n_d6, "n_iso": n_iso,
+                               "rows": rows}
+    # The isolation ratio, reported at w_isolation=0 too: it is the number
+    # that says whether the pedestal is there, and an arm that cannot see
+    # it cannot be read against one that can. > 1 is "more non-member mass
+    # sitting on this object than HR has", which is the state that makes
+    # Rockstar file it as somebody's subhalo.
+    _iso = np.asarray(iso_ratio, dtype=np.float64)
+    _isog = _iso[np.isfinite(_iso)]
+    diag["median_iso_ratio"] = float(np.median(_isog)) if _isog.size else float("nan")
+    diag["frac_iso_above_hr"] = (float(np.mean(_isog > 1.0)) if _isog.size
+                                 else float("nan"))
+    diag["by_population"] = _split_rows(rows, "parent_id",
+                                        {"sub": lambda v: v >= 0,
+                                         "top": lambda v: v < 0})
+    diag["by_env"] = _split_rows(
+        rows, "env",
+        {lab: (lambda v, i=i: v == i) for i, lab in enumerate(ENV_LABELS)})
     # `term_*` stays the RAW unweighted term in every run, normalised or not:
     # it is the quantity the scales are derived from and the only one comparable
     # across runs. `term_eff_*` is what actually entered the loss, so
@@ -863,7 +1377,81 @@ def member_gather_loss(
         np.median(np.asarray(penalised) / scl))
     diag["frac_centre_within_1_radius"] = float(
         np.mean(np.asarray(offsets) / scl < 1.0))
+    # Reported at w_radius=0 too: it is the number that says whether the radial
+    # collapse is happening, and a run that cannot see it cannot be read. Signed
+    # median, so "too close" (negative, 58.3% of frozen sets) stays visible
+    # after the absolute value the term charges on.
+    rerr = np.asarray(radius_err)
+    nan = float("nan")
+    diag["has_host"] = bool(has_host)
+    diag["median_radius_err_mpc_h"] = float(np.median(rerr)) if has_host else nan
+    diag["median_radius_err_radii"] = (
+        float(np.median(np.abs(rerr) / scl)) if has_host else nan)
+    diag["median_radius_ratio"] = (
+        float(np.median(radius_ratio)) if has_host else nan)
+    diag["frac_radius_too_close"] = float(np.mean(rerr < 0.0)) if has_host else nan
+    # The SHELL's own diagnostic, and the one to read for it: a perfect
+    # distribution match still leaves 79% (train) / 85% (holdout) of the per-set
+    # address error standing, so `median_radius_err_radii` above barely moves
+    # even on total success. This is the residual the term actually charges --
+    # the sorted pairing's log ratio -- and it goes to zero when it wins.
+    if has_host and shell_now:
+        _rc = np.sort(np.asarray(shell_now, dtype=np.float64))
+        _rt = np.sort(np.asarray(shell_tgt, dtype=np.float64))
+        _u = np.log(_rc / _rt)
+        diag["median_shell_resid"] = float(np.median(np.abs(_u)))
+        # Signed, so the inward bias the term exists to close stays visible.
+        diag["median_shell_resid_signed"] = float(np.median(_u))
+        diag["frac_shell_outside_dead_zone"] = float(
+            np.mean(np.abs(_u) > float(np.log1p(float(cfg.shell_dead_zone)))))
+    else:
+        diag["median_shell_resid"] = nan
+        diag["median_shell_resid_signed"] = nan
+        diag["frac_shell_outside_dead_zone"] = nan
+    diag["frac_radius_within_1_radius"] = (
+        float(np.mean(np.abs(rerr) / scl < 1.0)) if has_host else nan)
+    # Under `_shell_curves` rather than a plain name: it is a live tensor pair,
+    # not a float, and every other consumer of `diag` serialises it to JSON. The
+    # leading underscore is the marker that it must be popped, not logged.
+    diag["_shell_curves"] = diag_curves
     return loss, diag
+
+
+#: What a by-population / by-environment split reports. Deliberately short: the
+#: point of the split is to say WHICH population moved, and four medians plus a
+#: count do that. The full per-set table is in ``rows`` for anything more.
+_SPLIT_KEYS = ("bound_hard", "virial", "centre_offset_radii", "iso_ratio")
+
+
+def _split_rows(rows: List[Dict[str, float]], key: str,
+                tests: Mapping[str, object]) -> Dict[str, Dict[str, float]]:
+    """Median :data:`_SPLIT_KEYS` over the rows each test accepts, plus ``n``.
+
+    Why this exists. ``MemberSets.parent_id`` was added so an eval could say
+    whether the run built the TOP-LEVEL sets specifically, and nothing ever read
+    it -- so ``all_blocks_smallhalo`` ran 8,000 steps and 6.9 GPU-hours whose
+    entire hypothesis was about top-level halos, and reported one number pooled
+    over both populations. The held-out Rockstar gate then said the top-level
+    count had gone DOWN. A pooled median cannot distinguish "the objective is
+    wrong" from "the objective never got any budget", and those need different
+    next runs.
+
+    ``nanmedian`` throughout: ``iso_ratio`` is legitimately NaN for a set whose
+    HR background is too sparse to be a ratio (``iso_min_count``), and an empty
+    split reports ``n = 0`` with NaN medians rather than vanishing from the
+    artifact -- a missing key reads as a bug, a zero reads as a fact.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    for name, test in tests.items():
+        sel = [r for r in rows if test(r.get(key, -1))]
+        d: Dict[str, float] = {"n": float(len(sel))}
+        for k in _SPLIT_KEYS:
+            v = np.asarray([r.get(k, float("nan")) for r in sel],
+                           dtype=np.float64)
+            v = v[np.isfinite(v)]
+            d[k] = float(np.median(v)) if v.size else float("nan")
+        out[name] = d
+    return out
 
 
 def _log2(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -895,6 +1483,119 @@ def _hinge_above(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x / ref.clamp_min(1e-12) - 1.0, min=0.0) ** 2
 
 
+def shell_reduce(rc: torch.Tensor, rt: torch.Tensor,
+                 cfg: MemberGatherConfig,
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sorted (and optionally quantile-binned) log radii, candidate and target.
+
+    One sort per side, paired by RANK -- the 1-D optimal transport map, exact
+    and O(N log N). No set is ever named against its OWN target, so what comes
+    back describes the radius DISTRIBUTION and stays silent about the address
+    ``w_radius`` could not predict (out-of-sample R^2 0.022).
+
+    ``cfg.shell_quantiles`` then reduces both sorted arrays to Q equal-COUNT
+    bins and returns the bins' MEAN LOG radius. Why: the full pairing hands the
+    loss one degree of freedom per set (~134 for a big host), and MEASURED on
+    2026-09-08 the ``w_shell=30`` arm drove the train residual 7.3x while
+    holdout moved only 1.4x -- it was fitting per-host detail that did not
+    transfer. The low-order shape is the part a shared operator can plausibly
+    carry; the rank-by-rank wiggle is the part it can only memorise. Q is the
+    dial between them. Q >= N is the full pairing again (one set per bin), so a
+    small host is never charged on emptier bins than it has sets.
+
+    Split in LOG space because that is the space the residual is charged in: a
+    bin's target is then the same quantity as the residual it feeds.
+    """
+    lc = torch.log(torch.sort(rc).values)
+    lt = torch.log(torch.sort(rt).values)
+    n = int(lc.shape[0])
+    q = int(cfg.shell_quantiles)
+    if q <= 0 or q >= n:
+        return lc, lt
+    # Equal-count bins. The split points are a pure function of n and q, so
+    # this is a segment mean with no data-dependent control flow, and it stays
+    # differentiable through the candidate side.
+    edges = torch.linspace(0.0, float(n), q + 1, device=lc.device,
+                           dtype=lc.dtype)
+    pos = torch.arange(n, device=lc.device, dtype=lc.dtype)
+    idx = torch.clamp((pos.unsqueeze(0) >= edges[:-1].unsqueeze(1)).sum(dim=0)
+                      - 1, 0, q - 1)
+    cnt = torch.zeros(q, device=lc.device, dtype=lc.dtype).index_add_(
+        0, idx, torch.ones_like(lc)).clamp_min(1.0)
+    bc = torch.zeros(q, device=lc.device, dtype=lc.dtype).index_add_(0, idx, lc)
+    bt = torch.zeros(q, device=lt.device, dtype=lt.dtype).index_add_(0, idx, lt)
+    return bc / cnt, bt / cnt
+
+
+def shell_charge(lc: torch.Tensor, lt: torch.Tensor,
+                 cfg: MemberGatherConfig) -> torch.Tensor:
+    """The soft-shell cost of one reduced curve against its target."""
+    return _soft_quadratic(
+        (lc - lt).abs(), float(np.log1p(float(cfg.shell_dead_zone))),
+        0.0).mean()
+
+
+def shell_radii(pos: torch.Tensor, sets: MemberSets, cfg: MemberGatherConfig,
+                set_indices: Optional[Sequence[int]] = None,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Candidate and target host-centric radii only -- no set statistics.
+
+    The cheap path for ``--shell-noise-draws``. A noise-averaged shell needs the
+    candidate radii under several realisations, and a full
+    :func:`member_gather_loss` per draw would pay the O(N^2) pair sums for terms
+    the average never uses. Everything here is a centroid and a norm, so an
+    extra draw costs a forward pass and a gather.
+
+    Returns ``(r_soft, r_tgt)`` in the SAME order and with the same softening as
+    the in-loop shell, so the two are interchangeable: the caller sorts.
+    """
+    idx = (list(range(sets.n_sets)) if set_indices is None
+           else [int(i) for i in set_indices])
+    eps = float(cfg.shell_eps_mpc_h)
+    now, tgt = [], []
+    for s in idx:
+        # `pos` stands in for the velocity argument: only the position half of
+        # the return is read, and _gather_one applies the same cap subsample to
+        # both. The draw is fresh per call exactly as it is in the main loop.
+        p, _v, _f = _gather_one(pos, pos, sets, s,
+                                cap=int(cfg.max_set_particles))
+        cbar = p.mean(dim=0)
+        now.append(torch.sqrt(((cbar - sets.centre_host[s]) ** 2).sum()
+                              + eps ** 2))
+        tgt.append(torch.linalg.vector_norm(
+            sets.centre_target[s] - sets.centre_host[s]).clamp_min(eps))
+    if not now:
+        z = torch.zeros((0,), device=pos.device, dtype=pos.dtype)
+        return z, z
+    return torch.stack(now), torch.stack(tgt)
+
+
+def _soft_quadratic(u: torch.Tensor, dead: float, huber: float) -> torch.Tensor:
+    """``u^2``, with an optional free zone below ``dead`` and a linear arm above
+    ``huber``. Continuous in value and slope at both joins.
+
+    Shared by the centre and radius terms so "softened" means one thing in this
+    module: two numbers, in gate search radii, with the same meaning in both.
+    """
+    x = torch.clamp(u - dead, min=0.0) if dead > 0.0 else u
+    if huber <= 0.0:
+        return x ** 2
+    a = huber - dead                # where the linear arm starts, in x
+    return torch.where(x <= a, x ** 2, a * (2.0 * x - a))
+
+
+def _radius_cost(u: torch.Tensor, cfg: MemberGatherConfig) -> torch.Tensor:
+    """Cost of a host-centric RADIUS error ``u``, in gate search radii.
+
+    Softer than the centre term by default (``radius_dead_zone`` 1.0): the ask
+    is a shell, and one search radius of slack on a median 2.80-radii error
+    still charges 79% of sets while spending nothing on the last fraction the
+    gate cannot resolve anyway.
+    """
+    return _soft_quadratic(u, float(cfg.radius_dead_zone),
+                           float(cfg.radius_huber_radii))
+
+
 def _centre_cost(u: torch.Tensor, cfg: MemberGatherConfig) -> torch.Tensor:
     """Cost of a centroid offset ``u``, in gate search radii.
 
@@ -913,18 +1614,81 @@ def _centre_cost(u: torch.Tensor, cfg: MemberGatherConfig) -> torch.Tensor:
     hopeless sets own the batch gradient. Linear there keeps the pull without
     letting the tail set the scale.
     """
-    d = float(cfg.centre_dead_zone)
-    h = float(cfg.centre_huber_radii)
-    x = torch.clamp(u - d, min=0.0) if d > 0.0 else u
-    if h <= 0.0:
-        return x ** 2
-    a = h - d                       # where the linear arm starts, in x
-    return torch.where(x <= a, x ** 2, a * (2.0 * x - a))
+    return _soft_quadratic(u, float(cfg.centre_dead_zone),
+                           float(cfg.centre_huber_radii))
 
 
 # --------------------------------------------------------------------------- #
 # Building the sets
 # --------------------------------------------------------------------------- #
+def _apply_cap(keep_rows: np.ndarray, n_sites: np.ndarray, max_sets: int,
+               how: str, seed: int, *,
+               env: Optional[np.ndarray] = None) -> np.ndarray:
+    """Thin ``keep_rows`` to ``max_sets`` under one of three policies.
+
+    Returns rows in ascending order in every case, so the cap changes *which*
+    sets are supervised and never their order -- a reordering alone would move
+    every ``--sets-per-step`` sample and make two runs incomparable for a reason
+    that has nothing to do with the selection.
+
+    ``env`` adds a SECOND stratification axis to ``stratified``: bins become
+    ``(log2(n_sites), environment)`` and drain round-robin over both. Mass
+    alone is not enough once the pool spans environments, and for the same
+    reason ``largest`` is not enough once it spans masses -- a cluster
+    region's pool is dominated by field halos, so a mass-stratified cap
+    still hands the budget to the field. *Measured*: the small-halo arm
+    overshot HR in ``field`` (subhalos 3,316 against 2,466) while closing
+    3.8% of the ``near`` deficit that holds 56% of the region's missing
+    objects. ``None`` reproduces the mass-only bins exactly.
+
+    ``largest`` is the historical behaviour and is kept as the default, but it is
+    a trap for a mass-window run: the pool of a 4-tile cluster region is a mass
+    function, so "keep the 256 biggest" keeps the top of it and drops exactly the
+    small halos a small-halo arm exists to build. ``stratified`` bins by
+    ``log2(n_sites)`` and drains the bins round-robin, which caps the total
+    without truncating the range; ``random`` is a uniform draw.
+    """
+    if how == "largest":
+        order = np.argsort(-np.asarray(n_sites))[:max_sets]
+        return np.sort(np.asarray(keep_rows)[order])
+    rng = np.random.default_rng(int(seed))
+    if how == "random":
+        pick = rng.choice(keep_rows.size, size=max_sets, replace=False)
+        return np.sort(np.asarray(keep_rows)[pick])
+    if how != "stratified":
+        raise ValueError(f"set_select {how!r} is not 'largest', 'random' or "
+                         "'stratified'")
+    n = np.maximum(np.asarray(n_sites, dtype=np.float64), 1.0)
+    b = np.floor(np.log2(n)).astype(np.int64)
+    if env is not None:
+        # A composite key, not a nested loop: the round-robin below already
+        # drains whatever bins exist, and an empty (mass, env) cell simply
+        # never appears. Offsetting by the mass-bin span keeps the two axes
+        # from colliding without assuming either's range.
+        e = np.asarray(env, dtype=np.int64)
+        b = b * (int(e.max()) + 1 if e.size else 1) + np.maximum(e, 0)
+    picked: List[int] = []
+    # Shuffle inside each bin so the choice within a mass decade is not "whatever
+    # order the catalog happened to be in", then take one from each non-empty bin
+    # per round. Small bins empty out and the remaining budget flows to the bins
+    # that still have members, so a range with one 100k-particle set does not
+    # spend 1/nbins of the budget on it.
+    queues = {}
+    for k in np.unique(b):
+        idx = np.flatnonzero(b == k)
+        rng.shuffle(idx)
+        queues[int(k)] = list(idx)
+    keys = sorted(queues)
+    while len(picked) < max_sets and any(queues[k] for k in keys):
+        for k in keys:
+            if not queues[k]:
+                continue
+            picked.append(queues[k].pop())
+            if len(picked) >= max_sets:
+                break
+    return np.sort(np.asarray(keep_rows)[np.asarray(picked, dtype=np.int64)])
+
+
 def build_member_sets(
     cat, owner_index, tiles: Sequence[int],
     hr_field: torch.Tensor, frozen_field: torch.Tensor,
@@ -936,6 +1700,7 @@ def build_member_sets(
     frozen_box=None,
     host_pos: Optional[np.ndarray] = None,
     top_level: bool = False,
+    env: Optional[np.ndarray] = None,
     report: Optional[Dict] = None,
 ) -> MemberSets:
     """Select the supervised sets and measure the reference this run can reach.
@@ -962,6 +1727,14 @@ def build_member_sets(
     evaluated per set. The pure-HR value is recorded in ``report`` alongside, so
     the cost of partial tile coverage is visible rather than assumed.
 
+    ``env`` is the per-catalog-row environment label from
+    :func:`subhalo_gather.halo_environment`, computed **once per box** by the
+    caller because it costs a KD-tree over the whole catalog and this function
+    is called once per host site. ``None`` disables ``cfg.env_select``, which
+    then must be ``"any"`` -- a selection silently not applied is the failure
+    mode this refuses, having already been paid for once by ``--set-select
+    largest`` under ``--population all``.
+
     ``frozen_box`` is the cached full-box frozen SR2 field (a memmap is fine). It
     is what supplies those outside members. Passing ``None`` drops them, which
     computes the potential of a fraction of an object and **overstates how bound
@@ -969,18 +1742,26 @@ def build_member_sets(
     records ``outside_dropped`` in ``report`` and callers running the real
     experiment should pass the box.
     """
-    from .subhalo_gather import subhalo_home_tiles
+    from .subhalo_gather import env_mask, subhalo_home_tiles
 
     dev = hr_field.device
     rep: Dict = report if report is not None else {}
     tiles = [int(t) for t in tiles]
 
+    # `top_level=True` is the host-preservation path's older spelling and still
+    # decides on its own; otherwise the population is the config's. One
+    # resolution, recorded, so no artifact is ambiguous about what it supervised.
+    pop = "top" if top_level else str(cfg.population)
     if home is None:
         home = subhalo_home_tiles(cat, owner_index, ng_hr=int(ng_hr),
                                   tile_hr=int(tile_hr),
                                   min_num_p=int(cfg.min_num_p),
-                                  top_level=bool(top_level))
+                                  max_num_p=int(cfg.max_num_p),
+                                  population=pop)
     rep["top_level"] = bool(top_level)
+    rep["population"] = pop
+    rep["min_num_p"] = int(cfg.min_num_p)
+    rep["max_num_p"] = int(cfg.max_num_p)
 
     trained = np.isin(home["tile"], np.asarray(tiles, dtype=np.int64))
     keep_rows = np.flatnonzero(trained & (home["purity"] >= float(cfg.min_purity)))
@@ -988,17 +1769,42 @@ def build_member_sets(
     rep["n_home_tile_trained"] = int(trained.sum())
     rep["n_after_purity"] = int(keep_rows.size)
 
+    # --- the environment cut, BEFORE the cap ----------------------------
+    # Order matters and is not arbitrary: capping first and then filtering
+    # would spend the whole --max-sets budget on the pool as it stands --
+    # which a cluster region's field halos dominate -- and hand back a
+    # handful of `near` sets, i.e. the exact miss this axis exists to fix.
+    home_env = (np.full(home["tile"].size, -1, dtype=np.int64) if env is None
+                else np.asarray(env, dtype=np.int64)[home["row"]])
+    rep["env_select"] = str(cfg.env_select)
+    rep["env_supplied"] = env is not None
+    if str(cfg.env_select).strip() not in ("", "any", "all"):
+        if env is None:
+            raise ValueError(
+                f"env_select={cfg.env_select!r} selects on environment but no "
+                "`env` array was passed -- build_member_sets cannot label "
+                "halos on its own (it costs a KD-tree over the whole "
+                "catalog, so the caller computes it once per box). Pass "
+                "subhalo_gather.halo_environment(cat), or the run would be "
+                "an env_select='any' run under another name.")
+        keep_rows = keep_rows[env_mask(home_env[keep_rows], str(cfg.env_select))]
+    rep["n_after_env"] = int(keep_rows.size)
+
     # The cap keeps the LARGEST sets, and it is silent by default -- which was
     # fine while it never bound (154 sets at four tiles) and is not once the
     # tiling widens: at sixteen tiles the selection is 625 and the cap keeps 256,
     # so a run that does not report it looks like the live-fraction cut removed
     # 369 objects. It is recorded, and the caller is expected to say so.
     rep["max_sets"] = int(cfg.max_sets)
+    rep["set_select"] = str(cfg.set_select)
     rep["n_dropped_by_cap"] = int(max(0, keep_rows.size - int(cfg.max_sets)))
     rep["cap_binds"] = bool(keep_rows.size > int(cfg.max_sets))
     if keep_rows.size > int(cfg.max_sets):
-        order = np.argsort(-home["n_sites"][keep_rows])[: int(cfg.max_sets)]
-        keep_rows = np.sort(keep_rows[order])
+        keep_rows = _apply_cap(keep_rows, home["n_sites"][keep_rows],
+                               int(cfg.max_sets), str(cfg.set_select),
+                               int(cfg.bg_seed),
+                               env=(None if env is None
+                                    else home_env[keep_rows]))
 
     kw = dict(ng_hr=int(ng_hr), tile_hr=int(tile_hr),
               boxsize_mpc_h=float(boxsize_mpc_h),
@@ -1013,12 +1819,16 @@ def build_member_sets(
     halo_id, num_p, n_live_l = [], [], []
     live_rows, fixed_pos, fixed_vel, bg_rows, centres = [], [], [], [], []
     centre_tgt, centre_scl, centre_rh, centre_slf = [], [], [], []
+    centre_hst = []
     # The host on the same periodic branch as the set it owns, or `rhat` is a
     # box-length artifact for any cluster near a face. Deferred into the loop:
     # the branch is per set, since `ctr` is that set's own unwrap centre.
     host_t = (None if host_pos is None else
               torch.as_tensor(np.asarray(host_pos, dtype=np.float64),
                               device=dev, dtype=hr_pos.dtype))
+    parent_id: List[int] = []
+    env_l: List[int] = []
+    iso_r: List[float] = []
     ref_rows: List[SetTerms] = []
     pure_rows: List[Dict[str, float]] = []
     n_dropped_live = 0
@@ -1077,6 +1887,14 @@ def build_member_sets(
                 near = rng.choice(near, size=int(cfg.bg_k), replace=False)
             if near.size > 1:
                 bg_t = torch.as_tensor(np.sort(near), device=dev, dtype=torch.long)
+        # The isolation counting radius: a fixed fraction of the sphere the
+        # background was sampled from, so the count is never counting the
+        # sampling edge. Derived from `r_ref`, HR's own rms radius for this
+        # set, which is a constant of the data -- deriving it from the
+        # CANDIDATE's radius would let the run shrink the sphere instead of
+        # clearing it, which is the whole failure mode this term is for.
+        iso_radius = (float(cfg.iso_radius_frac) * float(cfg.bg_radius_factor)
+                      * r_ref) if bg_t is not None else 0.0
 
         bp = bv = None
         if bg_t is not None:
@@ -1084,7 +1902,7 @@ def build_member_sets(
             bv = hr_vel[bg_t]
         ref_rows.append(set_statistics_torch(
             hp, hv, particle_mass_msun_h=particle_mass_msun_h, cfg=cfg,
-            bg_pos=bp, bg_vel=bv))
+            bg_pos=bp, bg_vel=bv, iso_radius=iso_radius))
 
         # Pure HR, for the report only: how much does partial coverage cost?
         if fp is not None:
@@ -1118,10 +1936,14 @@ def build_member_sets(
         # not at the frozen centroid -- the direction is a property of where the
         # object belongs, and taking it at the moving centroid would make the
         # projection axis a function of the optimisation variable.
+        # `w_radius` keeps the host POINT as well: the direction is enough to
+        # split an offset, but a distance needs something to measure from.
         if host_t is None:
             centre_rh.append(torch.zeros(3, device=dev, dtype=hr_pos.dtype))
+            centre_hst.append(torch.zeros(3, device=dev, dtype=hr_pos.dtype))
         else:
             hc = unwrap_about(host_t[None, :], ctr, float(boxsize_mpc_h))[0]
+            centre_hst.append(hc.detach())
             radial = centre_tgt[-1] - hc
             dn = torch.linalg.vector_norm(radial)
             centre_rh.append(radial / dn if float(dn) > 1e-9
@@ -1129,6 +1951,9 @@ def build_member_sets(
 
         halo_id.append(hid)
         num_p.append(int(cat.num_p[crow]))
+        parent_id.append(int(cat.parent_ids[crow]))
+        env_l.append(int(home_env[r]))
+        iso_r.append(float(iso_radius))
         n_live_l.append(int(keep.size))
         live_rows.append(rows_t)
         fixed_pos.append(fp)
@@ -1138,6 +1963,32 @@ def build_member_sets(
 
     rep["n_dropped_live_frac"] = int(n_dropped_live)
     rep["n_sets"] = len(halo_id)
+    # The population mix and the mass range of what was ACTUALLY selected, after
+    # every cut and the cap. Reported unconditionally rather than only for
+    # `population="all"`: a `"sub"` run's row reading `n_top_level 0` is what
+    # makes the `"all"` run's row readable as a change.
+    if halo_id:
+        _pid = np.asarray(parent_id, dtype=np.int64)
+        _np_ = np.asarray(num_p, dtype=np.int64)
+        rep["n_top_level"] = int(np.sum(_pid < 0))
+        rep["n_sub"] = int(np.sum(_pid >= 0))
+        # The environment mix of what was ACTUALLY selected. Reported
+        # unconditionally: an `env_select="any"` run's row is what makes a
+        # targeted run's row readable as a change, and a run that asked for
+        # `near` and got 4 sets needs to say so in the shakeout, not in the
+        # Rockstar gate ten hours later.
+        _env = np.asarray(env_l, dtype=np.int64)
+        rep["n_by_env"] = {lab: int(np.sum(_env == i))
+                           for i, lab in enumerate(ENV_LABELS)}
+        rep["n_env_unlabelled"] = int(np.sum(_env < 0))
+        _iso = np.asarray(iso_r, dtype=np.float64)
+        rep["median_iso_radius_mpc_h"] = float(np.median(_iso)) if _iso.size else 0.0
+        rep["num_p_min"] = int(_np_.min())
+        rep["num_p_median"] = float(np.median(_np_))
+        rep["num_p_max"] = int(_np_.max())
+        # sum N^2 over the selection: the pair bill this pool commits a step to,
+        # available before the first step rather than as a wall-clock surprise.
+        rep["sum_num_p_squared"] = float(np.sum(_np_.astype(np.float64) ** 2))
     rep["outside_dropped"] = int(outside_dropped)
     if outside_dropped:
         rep["outside_dropped_warning"] = (
@@ -1148,7 +1999,8 @@ def build_member_sets(
     if not halo_id:
         raise ValueError(
             f"no supervised sets survived: {rep['n_resolved']} resolved "
-            f"{'hosts' if top_level else 'subhalos'}, "
+            f"{ {'sub': 'subhalos', 'top': 'hosts', 'all': 'halos'}[pop] } in "
+            f"num_p [{cfg.min_num_p}, {cfg.max_num_p or 'inf'}), "
             f"{rep['n_home_tile_trained']} homed in tiles {tiles}, "
             f"{rep['n_after_purity']} past purity >= {cfg.min_purity}, "
             f"{n_dropped_live} past live fraction >= {cfg.min_live_frac}")
@@ -1160,7 +2012,7 @@ def build_member_sets(
                             for t in ref_rows]).detach()
 
     ref = {k: col(k) for k in ("r_rms", "sigma_v", "virial", "bound_soft",
-                               "bound_hard", "d6")}
+                               "bound_hard", "d6", "bg_occ")}
     # The "hr" temperature option needs HR's own energy scale per set; derive it
     # from the monopole binding energy of the reference configuration, which is
     # a constant of the data and does not move with the optimisation.
@@ -1189,12 +2041,27 @@ def build_member_sets(
          for t, f, sc in zip(centre_tgt, centre_slf, centre_scl)]))
     rep["median_centre_scale_mpc_h"] = float(np.median(
         [float(x) for x in centre_scl]))
+    # What `w_radius` would have to work with, measured at pool-build time on
+    # the frozen field: the signed radius error of every set, and how many sit
+    # too close. A run whose pool reports ~0 here has nothing for the term to do.
+    if host_pos is not None:
+        _dr = np.array([float(torch.linalg.vector_norm(f - h)
+                              - torch.linalg.vector_norm(t - h))
+                        for t, f, h in zip(centre_tgt, centre_slf, centre_hst)])
+        _sc = np.array([float(x) for x in centre_scl])
+        rep["median_frozen_radius_err_mpc_h"] = float(np.median(_dr))
+        rep["median_frozen_radius_err_radii"] = float(
+            np.median(np.abs(_dr) / _sc))
+        rep["frac_frozen_radius_too_close"] = float(np.mean(_dr < 0.0))
     rep["median_live_frac"] = float(np.median(
         [nl / max(int(np_), 1) for nl, np_ in zip(n_live_l, num_p)]))
 
     return MemberSets(
         halo_id=np.asarray(halo_id, dtype=np.int64),
         num_p=np.asarray(num_p, dtype=np.int64),
+        parent_id=np.asarray(parent_id, dtype=np.int64),
+        env=np.asarray(env_l, dtype=np.int64),
+        iso_radius=np.asarray(iso_r, dtype=np.float64),
         n_live=np.asarray(n_live_l, dtype=np.int64),
         live_rows=live_rows, fixed_pos=fixed_pos, fixed_vel=fixed_vel,
         bg_rows=bg_rows, centre_ref=torch.stack(centres),
@@ -1202,5 +2069,6 @@ def build_member_sets(
         centre_scale=torch.stack(centre_scl),
         centre_rhat=torch.stack(centre_rh),
         centre_self=torch.stack(centre_slf),
+        centre_host=torch.stack(centre_hst),
         ref=ref, particle_mass_msun_h=float(particle_mass_msun_h),
         boxsize_mpc_h=float(boxsize_mpc_h))

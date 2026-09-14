@@ -103,6 +103,9 @@ def member_config_of(args) -> MemberGatherConfig:
     """
     return MemberGatherConfig(
         min_num_p=int(args.min_num_p),
+        max_num_p=int(getattr(args, "max_num_p", 0)),
+        population=str(getattr(args, "population", "sub")),
+        set_select=str(getattr(args, "set_select", "largest")),
         min_purity=float(args.min_purity),
         min_live_frac=float(args.min_live_frac),
         max_sets=int(args.max_sets),
@@ -126,6 +129,19 @@ def member_config_of(args) -> MemberGatherConfig:
         centre_dead_zone=float(getattr(args, "centre_dead_zone", 0.0)),
         centre_huber_radii=float(getattr(args, "centre_huber_radii", 0.0)),
         centre_mode=str(getattr(args, "centre_mode", "full")),
+        w_radius=float(getattr(args, "w_radius", 0.0)),
+        radius_dead_zone=float(getattr(args, "radius_dead_zone", 1.0)),
+        radius_huber_radii=float(getattr(args, "radius_huber_radii", 0.0)),
+        w_shell=float(getattr(args, "w_shell", 0.0)),
+        shell_dead_zone=float(getattr(args, "shell_dead_zone", 0.02)),
+        shell_eps_mpc_h=float(getattr(args, "shell_eps_mpc_h", 1e-2)),
+        shell_quantiles=int(getattr(args, "shell_quantiles", 0)),
+        env_select=str(getattr(args, "env_select", "any")),
+        env_host_floor=int(getattr(args, "env_host_floor", 200)),
+        w_isolation=float(getattr(args, "w_isolation", 0.0)),
+        iso_radius_frac=float(getattr(args, "iso_radius_frac", 0.5)),
+        iso_softness=float(getattr(args, "iso_softness", 0.15)),
+        iso_min_count=float(getattr(args, "iso_min_count", 8.0)),
     )
 
 
@@ -344,6 +360,11 @@ def run(args) -> dict:
                 # the second is what Rockstar will be asked about.
                 "centre_penalised_radii": d["median_centre_penalised_radii"],
                 "frac_centre_within_1_radius": d["frac_centre_within_1_radius"],
+                # The shell, reported at --w-radius 0 as well: signed, so the
+                # 58% of sets that start too CLOSE stay visible.
+                "radius_err_radii": d["median_radius_err_radii"],
+                "radius_ratio": d["median_radius_ratio"],
+                "frac_radius_too_close": d["frac_radius_too_close"],
                 "r_rms_over_hr": d["median_r_rms_over_hr"],
                 "sigma_v_over_hr": d["median_sigma_v_over_hr"],
                 "low_k": g["low"], "low_k_dis": g["low_dis"],
@@ -537,14 +558,17 @@ def main(argv=None) -> int:
                     help="hinge is [1-x/ref]_+^2, capped at 1 by construction; "
                          "log is [log(ref/x)]_+^2, unbounded as x -> 0 and "
                          "still exactly zero for meeting or beating HR.")
-    ap.add_argument("--centre-mode", choices=("full", "radial", "self"),
+    ap.add_argument("--centre-mode",
+                    choices=("full", "radial", "self", "self_tan"),
                     default="full",
                     help="full: the whole offset to the reachable HR centroid "
                          "(the 72/154 term). radial: only its projection on the "
                          "clustercentric direction, dropping the transverse "
                          "part no input determines. self: re-anchor to the "
                          "set's own frozen centroid -- zero at step 0, and no "
-                         "address at all.")
+                         "address at all. self_tan: that anchor with the radial "
+                         "direction projected out, to be paired with "
+                         "--w-radius.")
     ap.add_argument("--centre-dead-zone", type=float, default=0.0,
                     help="radii inside which the centre term costs nothing. "
                          "The gate is a threshold at ONE search radius, so "
@@ -555,6 +579,20 @@ def main(argv=None) -> int:
                          "quadratic charges 31 with gradient 11; linear there "
                          "is a ~10x cut that hands the budget to the five "
                          "concentration terms.")
+    ap.add_argument("--w-radius", type=float, default=0.0,
+                    help="weight on the set's host-centric RADIUS matching the "
+                         "truth, direction free. 0 = off, which is every run "
+                         "recorded in docs/sr2_member_gather.md. In the free "
+                         "field this is the ORACLE for the shell objective: it "
+                         "says what a field that sees the answer can do with a "
+                         "radius-only ask, which is the bound the generator arm "
+                         "is measured against.")
+    ap.add_argument("--radius-dead-zone", type=float, default=1.0,
+                    help="radii of slack before the radius term charges "
+                         "anything. The ask is a shell, and the gate is a "
+                         "threshold at one radius.")
+    ap.add_argument("--radius-huber-radii", type=float, default=0.0,
+                    help="radii beyond which the radius term is linear.")
     ap.add_argument("--w-low", type=float, default=100.0)
     # --- selection ---------------------------------------------------------
     ap.add_argument("--min-num-p", type=int, default=200)

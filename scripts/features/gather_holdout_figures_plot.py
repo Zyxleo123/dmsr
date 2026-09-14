@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Circle, Rectangle  # noqa: E402
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from gather_holdout_add_density import stem_path, with_ext  # noqa: E402
 
 C = {"hr": "#111111", "base": "#888888", "frozen": "#1f77b4",
      "self": "#d62728", "tuned": "#d62728", "nocentre": "#2ca02c",
@@ -36,6 +43,21 @@ C = {"hr": "#111111", "base": "#888888", "frozen": "#1f77b4",
 def marker_sizes(num_p: np.ndarray) -> np.ndarray:
     """Marker area scaled by log particle count, floored so 50p is visible."""
     return 6.0 + 22.0 * (np.log10(np.maximum(num_p, 1)) - np.log10(50))
+
+
+def first_key(z, *names):
+    """The first of ``names`` present in the npz, else None.
+
+    Stage-1 files written before the box-slab panels name the host window
+    ``<arm>_density`` / ``density_xr``; the current ones say ``_host_density`` /
+    ``host_density_xr``. Both are read so an older data file still renders.
+    """
+    return next((n for n in names if n in z.files), None)
+
+
+def host_density(z, key):
+    k = first_key(z, f"{key}_host_density", f"{key}_density")
+    return z[k] if k else None
 
 
 def fig_host_density(z, S, out: Path, zoom_rvir: float = 2.6):
@@ -51,18 +73,27 @@ def fig_host_density(z, S, out: Path, zoom_rvir: float = 2.6):
     half = zoom_rvir * rvir
     xlim = (cen[0] - half, cen[0] + half)
     zlim = (cen[2] - half, cen[2] + half)
-    hxr, hzr = z["host_density_xr"], z["host_density_zr"]
+    hxr = z[first_key(z, "host_density_xr", "density_xr")]
+    hzr = z[first_key(z, "host_density_zr", "density_zr")]
     ext = [hxr[0], hxr[1], hzr[0], hzr[1]]
-    dens = {k: (z[f"{k}_host_density"] if f"{k}_host_density" in z.files else None)
-            for k in ("frozen", "self", "hr")}
+    dens = {k: host_density(z, k) for k in ("frozen", "self", "hr")}
+    # ONE colour scale across the panels, taken from HR when it is there: a
+    # per-panel vmax renormalises each arm to its own peak, so a real deficit
+    # would read as an identical picture.
+    ref = dens["hr"] if dens["hr"] is not None else dens["self"]
+    vmax = (np.log10(np.nanmax(ref) + 1.0) if ref is not None else None)
+    dens_shape = ref.shape[1] if ref is not None else 0
 
-    fig, ax = plt.subplots(1, 3, figsize=(16.5, 6.0), constrained_layout=True)
+    # 7.2 not 6.0: three aspect="equal" panels 16.5/3 wide are ~5.4 tall, and
+    # the titles, x-labels and suptitle need the rest. At 6.0 the suptitle sits
+    # on the panel titles and the x-labels are clipped off the canvas -- which
+    # only appeared once HR stopped being an empty, free-aspect panel.
+    fig, ax = plt.subplots(1, 3, figsize=(16.5, 7.2), constrained_layout=True)
 
     def panel(a, key, title, color):
         if dens[key] is not None:
             a.imshow(np.log10(dens[key] + 1.0), origin="lower", extent=ext,
-                     cmap="magma", aspect="equal",
-                     vmax=np.log10(np.nanmax(dens[key]) + 1.0))
+                     cmap="magma", aspect="equal", vmax=vmax)
         else:
             a.set_facecolor("#f4f0ea")
         pos = z[f"overlay_{key}_pos"]; npart = z[f"overlay_{key}_np"]
@@ -80,10 +111,16 @@ def fig_host_density(z, S, out: Path, zoom_rvir: float = 2.6):
     panel(ax[1], "self", "tuned (self)", C["self"])
     panel(ax[2], "hr", "HR (truth)", C["hr"])
     ax[0].set_ylabel("z  [Mpc/h]")
+    px = (hxr[1] - hxr[0]) / dens_shape * 1000.0 if dens_shape else 0.0
+    extra = (f", {float(z['zoom_depth_mpc'][0]):.2f} Mpc/h deep slab"
+             if "zoom_depth_mpc" in z.files
+             and float(z["zoom_depth_mpc"][0]) > 0 else "")
     fig.suptitle(f"Held-out host {S['host_id']} ({S['box']}), zoomed to "
-                 f"{2*zoom_rvir:.0f} $R_{{vir}}$: subhalos as circles "
+                 f"{2*zoom_rvir:g} $R_{{vir}}$: subhalos as circles "
                  f"(size ~ mass), cyan dashed = host $R_{{vir}}$ "
-                 f"{S['host_rvir_mpc']:.2f} Mpc/h", fontsize=13)
+                 f"{S['host_rvir_mpc']:.2f} Mpc/h"
+                 + (f"; {px:.0f} kpc/h per pixel{extra}" if px else ""),
+                 fontsize=13)
     fig.savefig(out, dpi=130)
     plt.close(fig)
     print(f"  wrote {out}")
@@ -174,12 +211,16 @@ def fig_cosmic_web(z, S, out: Path):
     frozen SR2 by construction, so the comparison is really "what changed in the
     outlined tiles" -- read it there.
     """
-    before = str(z["web_before"])
+    before = str(z["web_before"]) if "web_before" in z.files else "frozen"
     panels = [(before, f"{before} SR2 (before)"), ("self", "tuned (self)"),
               ("hr", "HR (truth)")]
     panels = [(k, t) for k, t in panels if f"{k}_box_density" in z.files]
+    if len(panels) < 2:
+        print(f"  skipped {out.name}: {len(panels)} box-slab panel(s) in the "
+              f"data file, need 2 to compare")
+        return
     n = len(panels)
-    slab = float(z["box_slab_mpc"][0])
+    slab = float(z["box_slab_mpc"][0]) if "box_slab_mpc" in z.files else 6.0
     cen = z["host_centre"]
     # a shared colour scale from the HR panel (or the last available) so damage
     # reads as a real deficit, not a per-panel renormalisation
@@ -216,20 +257,33 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="the .npz/.json stem")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--zoom-rvir", type=float, default=0.0,
+                    help="fig1 window half-width in R_vir (default: the data "
+                         "file's own zoom_rvir if it has one, else 2.6)")
+    ap.add_argument("--figures", default="",
+                    help="comma list of figures to draw (fig1..fig5); default "
+                         "all. A zoom stem shares every other array with the "
+                         "stem it came from, so figs 2-5 would be duplicates")
     args = ap.parse_args(argv)
 
-    stem = Path(args.data)
-    if stem.suffix in (".npz", ".json"):
-        stem = stem.with_suffix("")
-    z = np.load(stem.with_suffix(".npz"))
-    S = json.loads(stem.with_suffix(".json").read_text())
+    stem = stem_path(args.data)
+    z = np.load(with_ext(stem, ".npz"))
+    S = json.loads(with_ext(stem, ".json").read_text())
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
 
-    fig_host_density(z, S, out / "fig1_host_density.png")
-    fig_mass_function(S, out / "fig2_mass_function.png")
-    fig_local_excess(S, out / "fig3_local_excess.png")
-    fig_cosmic_web(z, S, out / "fig4_cosmic_web.png")
-    fig_box_damage(z, S, out / "fig5_host_scatter.png")
+    zoom = args.zoom_rvir or (float(z["zoom_rvir"][0])
+                              if "zoom_rvir" in z.files else 2.6)
+    want = {f.strip() for f in args.figures.split(",") if f.strip()}
+    todo = [("fig1", lambda: fig_host_density(z, S, out / "fig1_host_density.png",
+                                              zoom_rvir=zoom)),
+            ("fig2", lambda: fig_mass_function(S, out / "fig2_mass_function.png")),
+            ("fig3", lambda: fig_local_excess(S, out / "fig3_local_excess.png")),
+            ("fig4", lambda: fig_cosmic_web(z, S, out / "fig4_cosmic_web.png")),
+            ("fig5", lambda: fig_box_damage(z, S, out / "fig5_host_scatter.png"))]
+    for name, draw in todo:
+        if want and name not in want:
+            continue
+        draw()
     print(f"\nfigures under {out}")
     return 0
 

@@ -39,14 +39,21 @@ set -euo pipefail
 : "${HG_BOX:=set9}"
 : "${HG_RUN_DIR:?HG_RUN_DIR must name the export directory}"
 : "${HG_MAX_HOSTS:=0}"
+# Which checkpoint to export. `tuned.pt` is the live one, rewritten every
+# eval; a `tuned_step<N>.pt` snapshot is immutable, which is what makes an
+# EARLY gate safe to run while the trainer is still going (the export spends
+# ~138 s reading this file).
+: "${HG_CHECKPOINT:=tuned.pt}"
 
-require_input "$HG_TRAIN_DIR/tuned.pt" "scripts/slurm/submit_member_gather_train.sh"
+require_input "$HG_TRAIN_DIR/$HG_CHECKPOINT" \
+    "scripts/slurm/submit_member_gather_train.sh (MG_GATE_AT_STEPS for a snapshot)"
 
-echo "=== export: train_dir=$HG_TRAIN_DIR box=$HG_BOX -> $HG_RUN_DIR"
+echo "=== export: train_dir=$HG_TRAIN_DIR ckpt=$HG_CHECKPOINT box=$HG_BOX -> $HG_RUN_DIR"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 python -u scripts/features/export_gather_tiles.py \
     --run-dir "$HG_TRAIN_DIR" \
+    --checkpoint "$HG_CHECKPOINT" \
     --box "$HG_BOX" \
     --out-dir "$HG_RUN_DIR" \
     --max-hosts "$HG_MAX_HOSTS"

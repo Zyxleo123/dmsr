@@ -47,7 +47,94 @@ from gather_holdout_figures_data import (  # noqa: E402
     MASS_BINS, catalog_path, counts, in_tile_region, load_rockstar_ascii,
     tile_boxes, within_radius_mass_function,
 )
+from subhalo_radial import RVIR_BINS  # noqa: E402  (one definition of the bins)
 from cosmo_sr.reward.tiles import TileGrid  # noqa: E402
+
+BOX_MPC = 100.0
+
+
+def region_mass_function(cat, mask) -> Dict[str, List[int]]:
+    """num_p-binned counts of the EDITED REGION, split top-level vs sub.
+
+    The per-host mass function is ~370 objects, so its per-bin ratios carry
+    ~5-10% Poisson noise and cannot separate a shape defect from noise. The
+    region holds ~12k, which is what a shape target needs. Same MASS_BINS and
+    the same sub/host split as ``counts``, so the two are directly comparable.
+    """
+    host = cat.parent_ids < 0
+    out: Dict[str, List[int]] = {"sub": [], "host": []}
+    for lo, hi in MASS_BINS:
+        inbin = mask & (cat.num_p >= lo) & (cat.num_p < hi)
+        out["sub"].append(int(np.sum(inbin & ~host)))
+        out["host"].append(int(np.sum(inbin & host)))
+    return out
+
+
+def radial_distribution(cat, boxes, dilate: float) -> Dict[str, object]:
+    """Host-centric distance distribution of the region's subhalos.
+
+    For every subhalo whose PARENT centre lies in the edited region, the
+    minimum-image distance to that parent divided by the parent's R_vir, binned
+    on ``RVIR_BINS`` (shared with subhalo_radial.py so there is one definition).
+    Each catalog uses its OWN parent assignments, which is the like-for-like
+    comparison: "where do this field's subhalos sit in their hosts".
+
+    This is the axis no gate scored. The whole shell family
+    (w_radius / w_shell) was built and killed on it while every verdict kept
+    reporting abundance only.
+    """
+    host = cat.parent_ids < 0
+    order = np.argsort(cat.ids)
+    sub = np.where(~host)[0]
+    if sub.size == 0:
+        return {"n": 0, "n_orphan": 0, "counts": [0] * (len(RVIR_BINS)), "frac":
+                [0.0] * (len(RVIR_BINS)), "median_r_over_rvir": float("nan")}
+    j = np.searchsorted(cat.ids, cat.parent_ids[sub], sorter=order)
+    j = np.clip(j, 0, order.size - 1)
+    hrow = order[j]
+    ok = cat.ids[hrow] == cat.parent_ids[sub]          # parent present in catalog
+    n_orphan = int(np.sum(~ok))
+    sub, hrow = sub[ok], hrow[ok]
+    keep = in_tile_region(cat.pos[hrow], boxes, dilate=dilate)
+    sub, hrow = sub[keep], hrow[keep]
+    d = cat.pos[sub] - cat.pos[hrow]
+    d -= BOX_MPC * np.round(d / BOX_MPC)               # minimum image
+    r = np.linalg.norm(d, axis=1)
+    rvir = cat.rvir[hrow] / 1000.0                     # kpc/h -> Mpc/h
+    good = rvir > 0
+    x = r[good] / rvir[good]
+    # len(RVIR_BINS) bins: the 8 intervals plus everything beyond the last edge.
+    idx = np.digitize(x, RVIR_BINS[1:], right=False)
+    counts = np.bincount(idx, minlength=len(RVIR_BINS))[:len(RVIR_BINS)]
+    n = int(counts.sum())
+    return {"n": n, "n_orphan": n_orphan,
+            "counts": [int(c) for c in counts],
+            "frac": [float(c) / n if n else 0.0 for c in counts],
+            "median_r_over_rvir": float(np.median(x)) if x.size else float("nan")}
+
+
+def radial_score(new_frac: List[float], hr_frac: List[float],
+                 eps: float = 1e-3) -> float:
+    """Mean |log(new/HR)| over the radial bins, on FRACTIONS not counts.
+
+    Fractions, so this scores WHERE the subhalos sit independently of how many
+    there are -- an arm that is 10% short everywhere scores 0 here and pays in
+    the abundance columns instead. ``eps`` keeps an empty bin finite.
+    """
+    v = [abs(np.log((f + eps) / (h + eps))) for f, h in zip(new_frac, hr_frac)]
+    return float(np.mean(v)) if v else float("nan")
+
+
+def shape_score(new: List[int], hr: List[int]) -> float:
+    """Mean |log(new/HR)| over the bins -- 0 is HR's own mass function.
+
+    The count total can be right while the SHAPE is wrong (measured: every
+    no-d6 arm sits at ~0.95 of HR's subhalo count and 1.5-1.8x HR above 200p),
+    so this is the number a shape arm is optimised against. +1 in each bin
+    keeps an empty bin finite.
+    """
+    v = [abs(np.log((n + 1.0) / (h + 1.0))) for n, h in zip(new, hr)]
+    return float(np.mean(v)) if v else float("nan")
 
 
 def _load(reward_root: Path, box: str, kind: str, tag: str = ""):
@@ -123,6 +210,64 @@ def main(argv=None) -> int:
         it = region[k]["in_tiles"]
         print(f"{k:<10} {it['hosts_ge_200p']:>12} {it['subs_ge_50p']:>11} "
               f"{it['n_halos']:>8}")
+
+    # --- the region-wide binned mass function, and the shape score ----------
+    labels_all = [f"{lo}-{'inf' if hi == np.inf else hi}p" for lo, hi in MASS_BINS]
+    rmf: Dict[str, Dict[str, List[int]]] = {}
+    for k, c in cats.items():
+        if c is None:
+            continue
+        rmf[k] = region_mass_function(c, in_tile_region(c.pos, boxes, dilate=a.dilate))
+    print(f"\n=== region mass function, SUBS (bins of num_p)")
+    print(f"{'':<10} " + " ".join(f"{b:>10}" for b in labels_all) + f" {'total':>8}")
+    for k in ("base", a.baseline_name, "new", "hr"):
+        if k in rmf:
+            print(f"{k:<10} " + " ".join(f"{v:>10}" for v in rmf[k]["sub"])
+                  + f" {sum(rmf[k]['sub']):>8}")
+    shape = {}
+    if "hr" in rmf:
+        for k in rmf:
+            if k == "hr":
+                continue
+            shape[k] = {"sub": shape_score(rmf[k]["sub"], rmf["hr"]["sub"]),
+                        "host": shape_score(rmf[k]["host"], rmf["hr"]["host"])}
+        print(f"\n=== shape score, mean |log(new/HR)| over the bins "
+              f"(0 = HR's own mass function)")
+        for k in ("base", a.baseline_name, "new"):
+            if k in shape:
+                print(f"  {k:<10} subs {shape[k]['sub']:.3f}   "
+                      f"top-level {shape[k]['host']:.3f}")
+        print("  ratio new/HR per sub bin: "
+              + " ".join(f"{(n + 1) / (h + 1):.2f}"
+                         for n, h in zip(rmf["new"]["sub"], rmf["hr"]["sub"])))
+    rmf = {k: {w: dict(zip(labels_all, v), total=int(sum(v)))
+               for w, v in d.items()} for k, d in rmf.items()}
+
+    # --- the radial distribution, EVERY gate ---------------------------------
+    rad = {k: radial_distribution(c, boxes, a.dilate)
+           for k, c in cats.items() if c is not None}
+    rad_score = {}
+    if "hr" in rad:
+        for k in rad:
+            if k != "hr":
+                rad_score[k] = radial_score(rad[k]["frac"], rad["hr"]["frac"])
+    rlabels = [f"{lo:g}-{hi:g}" for lo, hi in zip(RVIR_BINS[:-1], RVIR_BINS[1:])]
+    rlabels.append(f">{RVIR_BINS[-1]:g}")
+    print(f"\n=== subhalo distance from host centre, r / R_vir "
+          f"(fraction of the region's subhalos)")
+    print(f"{'':<10} " + " ".join(f"{b:>8}" for b in rlabels)
+          + f" {'median':>8} {'n':>8}")
+    for k in ("base", a.baseline_name, "new", "hr"):
+        if k in rad:
+            print(f"{k:<10} " + " ".join(f"{f:>8.3f}" for f in rad[k]["frac"])
+                  + f" {rad[k]['median_r_over_rvir']:>8.2f} {rad[k]['n']:>8}")
+    if rad_score:
+        print("  radial score, mean |log(new/HR)| over the bins "
+              "(0 = HR's own radial distribution):")
+        for k in ("base", a.baseline_name, "new"):
+            if k in rad_score:
+                print(f"    {k:<10} {rad_score[k]:.3f}")
+    rad = {k: dict(v, bins=rlabels) for k, v in rad.items()}
 
     hr = cats["hr"]
     where = np.where(hr.ids == a.host_id)[0]
@@ -206,6 +351,8 @@ def main(argv=None) -> int:
         "arm_tag": a.arm_tag, "baseline_tag": a.baseline_tag,
         "n_tiles": len(tiles), "dilate": a.dilate,
         "region_counts": region, "mass_function": mf,
+        "region_mass_function": rmf, "shape_score": shape,
+        "radial_distribution": rad, "radial_score": rad_score,
         "q1_abundance_held": q1, "q2_hosts_recovered": q2,
         "verdict": verdict})
     print(f"\n=== wrote {Path(a.out).with_suffix('.json')}")

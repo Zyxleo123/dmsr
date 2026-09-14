@@ -259,6 +259,7 @@ def super_resolve_srs_seeded(
     tile_order: Optional[Sequence[Tuple[int, int, int]]] = None,
     out_dtype=np.float32,
     progress: bool = False,
+    cond_field=None,
 ) -> np.ndarray:
     """One full-box realisation, ``(6, Ng*scale, ...)`` in normalized units.
 
@@ -266,6 +267,12 @@ def super_resolve_srs_seeded(
     (periodic pad, centre-trim), but the noise is derived per tile from ``seed``
     rather than consumed from the global RNG, so ``tile_order`` cannot change the
     result -- only the order in which identical values are written.
+
+    ``cond_field`` is the whole-box ``(C, Ng, Ng, Ng)`` conditioning stack for a
+    ``cond_chan > 0`` generator (:mod:`cosmo_sr.features.lr_host_channel`). It is
+    cropped with the SAME ``periodic_crop`` call as the LR input, on the same
+    start and padding, so the whole-box path and the per-tile training path feed
+    the generator identical tensors.
     """
     lr_np = np.ascontiguousarray(np.asarray(lr_field), dtype=np.float32)
     if lr_np.ndim != 4 or not (lr_np.shape[1] == lr_np.shape[2] == lr_np.shape[3]):
@@ -281,6 +288,19 @@ def super_resolve_srs_seeded(
             "load one with load_controlled_generator()"
         )
     device = device or next(generator.parameters()).device
+    cond_np = None
+    if cond_field is not None:
+        cond_np = np.ascontiguousarray(np.asarray(cond_field), dtype=np.float32)
+        if cond_np.ndim != 4 or cond_np.shape[1:] != lr_np.shape[1:]:
+            raise ValueError(
+                f"cond_field must be (C, {ng}, {ng}, {ng}) to match the LR box; "
+                f"got {cond_np.shape}")
+    if (cond_np is None) != (int(getattr(generator, "cond_chan", 0)) == 0):
+        raise ValueError(
+            f"generator has cond_chan={getattr(generator, 'cond_chan', 0)} but "
+            f"cond_field was {'not ' if cond_np is None else ''}supplied; "
+            "running a conditioned generator without its channels (or the "
+            "reverse) silently produces a different field")
     chunk = ng // nsplit
     lr_size = chunk + 2 * pad
     tgt = chunk * scale_factor
@@ -295,7 +315,12 @@ def super_resolve_srs_seeded(
             seed, start, lr_size, scale_factor, device,
             pad=pad, mode=noise_mode, global_field=global_field,
         )
-        sr = generator(t, noise=noise).squeeze(0)
+        ct = None
+        if cond_np is not None:
+            ccrop = periodic_crop(cond_np, start, chunk, pad=pad)
+            ct = torch.from_numpy(np.ascontiguousarray(ccrop)).float() \
+                      .unsqueeze(0).to(device)
+        sr = generator(t, noise=noise, cond=ct).squeeze(0)
         sr = _narrow_like(sr, tgt).to("cpu").numpy().astype(out_dtype, copy=False)
         hs = tuple(s * scale_factor for s in start)
         out[:, hs[0]:hs[0] + tgt, hs[1]:hs[1] + tgt, hs[2]:hs[2] + tgt] = sr

@@ -62,13 +62,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import glob
+import os
 import random
 import sys
 import time
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -81,14 +83,15 @@ for _p in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts" / "reward",
 
 from _common import banner, paths, write_json  # noqa: E402
 from _sr2_direct import (  # noqa: E402
-    add_direct_args, geometry_of, load_direct_config, model_path_of,
+    add_direct_args, geometry_of, load_direct_config, load_hr, model_path_of,
     phase_space_config_of, soft_config_of,
 )
 # The oracle's own selection, tile builder and forward. A second definition of
 # "which tiles are this host's" or "how a tile is generated" would mean this run
 # is not working the problem docs/sr2_member_gather.md measured.
 from overfit_host_mse import (  # noqa: E402
-    BOXSIZE, DX, NG_HR, TILE, _catalog, _owner, build_tiles, forward_tiles,
+    BOXSIZE, DX, NG_HR, TILE, _catalog, _owner, build_tiles, cond_config_of,
+    forward_tiles, load_cond_field,
 )
 # The loss configuration and the LR-scale guard, unchanged from the free-field
 # run, for the same reason.
@@ -96,21 +99,34 @@ from free_field_gather import guards, member_config_of  # noqa: E402
 
 from cosmo_sr.dmsr.critic import HRCritic, LazyR1, hinge_d_loss, hinge_g_loss  # noqa: E402
 from cosmo_sr.eval.particle_identity import build_owner_index, child_map  # noqa: E402
+from cosmo_sr.eval.rockstar import load_rockstar_ascii  # noqa: E402
 from cosmo_sr.features.field_guards import (  # noqa: E402
     banded_highk_hinge, highk_hinge, highk_power_ratio_torch,
+)
+from cosmo_sr.features.knn_cdf import (  # noqa: E402
+    OWNER_CLASSES, KnnConfig, box_neighbours, box_phase, box_positions,
+    classify_owner, knn_tile_loss, tile_rows_flat,
 )
 from cosmo_sr.features.gather_critic import (  # noqa: E402
     GatherCriticNorm, gather_critic_input, highpass_field,
 )
+from cosmo_sr.features.lr_host_channel import (  # noqa: E402
+    channel_field_path, load_channel_field,
+)
 from cosmo_sr.features.member_gather import (  # noqa: E402
-    MemberSets, build_member_sets, member_gather_loss, tile_particles,
+    MemberSets, build_member_sets, member_gather_loss, shell_charge,
+    shell_radii, shell_reduce, tile_particles,
 )
 from cosmo_sr.features.member_pool import (  # noqa: E402
     HostSelection, select_hosts, split_pool, summarise_pool,
 )
+from cosmo_sr.features.subhalo_gather import (  # noqa: E402
+    ENV_LABELS, halo_environment,
+)
 from cosmo_sr.reward.base import find_base_field  # noqa: E402
 from cosmo_sr.train.common import finish_wandb, maybe_init_wandb  # noqa: E402
-from cosmo_sr.train.sr2_finetune_data import trim_to_tile  # noqa: E402
+from cosmo_sr.train.sr2_finetune_data import (  # noqa: E402
+    tile_noise_stack, trim_to_tile)
 from cosmo_sr.tts.srs_noise import load_controlled_generator  # noqa: E402
 from cosmo_sr.train.sr2_unfreeze import (  # noqa: E402
     assert_only_trainable_changed, parameter_groups, snapshot_parameters,
@@ -143,6 +159,41 @@ class HostTask:
     #: hinged terms start at ~0 and fire only when a host starts to come apart --
     #: a preservation guard, not a second objective competing for the budget.
     host_sets: Optional[MemberSets] = None
+    #: One :class:`MemberSets` per NOISE DRAW, index-aligned with
+    #: ``tile_data[t]["noise_draws"]``. Entry 0 is ``sets`` itself.
+    #:
+    #: Why per draw and not one shared table: ``centre_self`` -- the anchor
+    #: ``--centre-mode self``/``self_tan`` charges against -- is the FROZEN
+    #: field's own centroid, and the frozen field is a function of the noise
+    #: realisation. Rotating the noise while holding a draw-0 anchor would
+    #: charge the run for ordinary realisation scatter and fight the objective.
+    #: The reference statistics are measured on the same hybrid field and
+    #: inherit the same dependence. So a draw carries its own table or it is not
+    #: an honest draw. Length 1 (the default) is the single-seed behaviour every
+    #: arm through 2026-09-08 ran.
+    sets_by_draw: Optional[List[MemberSets]] = None
+    #: The host-preservation tables, one per draw, aligned with
+    #: ``sets_by_draw``. These are referenced against the FROZEN field's own
+    #: value, so they are draw-dependent in the strongest possible way -- a
+    #: draw-0 reference read under draw 3 would charge the guard for ordinary
+    #: realisation scatter and report host damage that never happened.
+    host_sets_by_draw: Optional[List[Optional[MemberSets]]] = None
+
+    def sets_at(self, draw: int) -> MemberSets:
+        """The draw's own set table; ``sets`` when the run has only one draw."""
+        if not self.sets_by_draw:
+            return self.sets
+        return self.sets_by_draw[int(draw) % len(self.sets_by_draw)]
+
+    def host_sets_at(self, draw: int) -> Optional[MemberSets]:
+        """The draw's own host-preservation table."""
+        if not self.host_sets_by_draw:
+            return self.host_sets
+        return self.host_sets_by_draw[int(draw) % len(self.host_sets_by_draw)]
+
+    @property
+    def n_draws(self) -> int:
+        return len(self.sets_by_draw) if self.sets_by_draw else 1
 
     @property
     def key(self) -> str:
@@ -160,7 +211,7 @@ def host_member_config(mcfg, args):
     subhalo config's -- the same physics keeps a host bound as keeps a subhalo
     bound, and the overall importance of the host guard is the single
     ``--w-host-sets`` multiplier applied where the term enters the loss, not a
-    second copy of six weights. Three fields differ:
+    second copy of six weights. Four fields differ:
 
     * ``min_num_p`` -> ``--host-min-num-p`` (200): the resolution floor for a
       *host*, independent of the subhalo floor.
@@ -171,18 +222,42 @@ def host_member_config(mcfg, args):
       preservation means "stay where the frozen field already put you", which is
       exactly what the self-anchored centre term charges for -- zero at step 0,
       rising only if the host's centroid drifts.
+    * ``w_radius`` and ``w_shell`` -> 0: a host has no host, so "the right
+      distance from the centre" and the distribution of those distances are
+      both undefined for it. Same mechanism as ``w_radius`` -> 0: a host has
+      no host, so "the right distance from the
+      centre" is undefined for it. ``build_host_sets`` passes ``host_pos=None``
+      for this population and the loss REFUSES a positive ``w_radius`` on an
+      all-zero ``centre_host``, so this is what keeps ``--w-radius`` from
+      turning the guard into an error rather than a silent zero.
     """
     return dataclasses.replace(
         mcfg,
         min_num_p=int(args.host_min_num_p),
+        # The guard's population is `top` unconditionally, whatever the
+        # supervised sets are doing. Under `--population all` the subhalo config
+        # already carries a `max_num_p` ceiling that exists to keep the cluster
+        # OUT of the supervised pool; inheriting it here would exclude the
+        # largest hosts from the preservation guard, which is precisely
+        # backwards -- the guard is the only term protecting them.
+        population="top",
+        max_num_p=0,
         max_sets=int(args.host_max_sets),
         centre_mode="self",
+        w_radius=0.0,
+        # ...and the same for the soft shell, for the same reason: a host has no
+        # host, so the DISTRIBUTION of its distance from one is undefined too.
+        w_shell=0.0,
+        # ...and `env_select` back to `any`, for the reason in the call
+        # site's comment: the guard protects every resolved host in the
+        # tiles, not only the ones sharing the objective's environment.
+        env_select="any",
     )
 
 
 def build_host_sets(
     sel: HostSelection, cat, oidx, cfg, geom, scfg, pscfg, mcfg, args,
-    frozen_model, device,
+    frozen_model, device, env=None,
 ) -> Optional[HostTask]:
     """Select one host's member sets and measure the reference it can reach.
 
@@ -190,8 +265,15 @@ def build_host_sets(
     cached full-box field: the two are produced by different generation paths and
     differ slightly, and every reference in the oracle was measured against the
     tile-wise one.
+
+    ``env`` is the box's per-catalog-row environment labels, computed once in
+    ``build_pool`` because it costs a KD-tree over the whole catalog. It is
+    what ``--env-select`` selects on, and it is recorded per set either way so
+    an ``any`` run and a targeted run are readable against each other.
     """
     data = build_tiles(sel.box, sel.tiles, cfg, geom, device, args)
+    seeds = draw_seeds(args)
+    add_noise_draws(data, sel.tiles, geom, device, seeds)
     hr = torch.stack([data[t]["hr"] for t in sel.tiles], dim=0).float()
     with torch.no_grad():
         base = forward_tiles(frozen_model, data, sel.tiles, geom).float()
@@ -217,7 +299,8 @@ def build_host_sets(
     sets = build_member_sets(
         cat, oidx, sel.tiles, hr, base, mcfg,
         particle_mass_msun_h=float(pscfg.particle_mass_msun_h),
-        frozen_box=frozen_box, host_pos=host_pos, report=report, **kw)
+        frozen_box=frozen_box, host_pos=host_pos, env=env,
+        report=report, **kw)
     if sets.n_sets == 0:
         return None
 
@@ -235,6 +318,19 @@ def build_host_sets(
     # (baked into host_member_config) is the only sound choice. A cluster region
     # with no resolved host homing in its tiles contributes no host term -- not
     # fatal, so the missing-sets ValueError is swallowed.
+    def _build_host_sets(field, into: Dict):
+        if float(getattr(args, "w_host_sets", 0.0)) <= 0.0:
+            return None
+        try:
+            return build_member_sets(
+                cat, oidx, sel.tiles, field, field,
+                host_member_config(mcfg, args),
+                particle_mass_msun_h=float(pscfg.particle_mass_msun_h),
+                frozen_box=frozen_box, host_pos=None, top_level=True,
+                env=env, report=into, **kw)
+        except ValueError:
+            return None
+
     host_sets = None
     if float(getattr(args, "w_host_sets", 0.0)) > 0.0:
         hrep: Dict = {}
@@ -243,18 +339,66 @@ def build_host_sets(
                 cat, oidx, sel.tiles, base, base, host_member_config(mcfg, args),
                 particle_mass_msun_h=float(pscfg.particle_mass_msun_h),
                 frozen_box=frozen_box, host_pos=None, top_level=True,
-                report=hrep, **kw)
+                # The guard's population is every resolved host in the
+                # tiles, whatever --env-select restricts the SUPERVISED
+                # sets to: a run that supervises only the infall region
+                # still damages the hosts it is not being asked to build,
+                # and narrowing the guard with the objective would remove
+                # the protection exactly where the new work is happening.
+                env=env, report=hrep, **kw)
         except ValueError:
             host_sets = None
         report["host_sets"] = hrep
 
     cpu = torch.device("cpu")
+    # --- one set table per extra noise draw (--noise-draws / --fresh-noise-eval)
+    # The frozen field is regenerated at each draw and the whole reference is
+    # remeasured against it, because `centre_self` and the hybrid reference
+    # statistics are functions of that field. Selection is NOT redone: which
+    # subhalos this host supervises is a property of the catalog and the tiles,
+    # so every draw carries the same objects in the same order and the rows of
+    # two draws' tables are directly comparable.
+    sets_by_draw = [sets.to(cpu)]
+    host_sets_by_draw: List[Optional[MemberSets]] = [
+        None if host_sets is None else host_sets.to(cpu)]
+    for d in range(1, len(seeds)):
+        with torch.no_grad():
+            base_d = forward_tiles_draw(frozen_model, data, sel.tiles, geom,
+                                        d).float()
+        rep_d: Dict = {}
+        sets_d = build_member_sets(
+            cat, oidx, sel.tiles, hr, base_d, mcfg,
+            particle_mass_msun_h=float(pscfg.particle_mass_msun_h),
+            frozen_box=frozen_box, host_pos=host_pos, env=env,
+            report=rep_d, **kw)
+        if sets_d.n_sets != sets.n_sets:
+            raise SystemExit(
+                f"{sel.key}: noise draw {d} selected {sets_d.n_sets} sets "
+                f"against draw 0's {sets.n_sets}. Selection must not depend on "
+                "the draw -- a rotating table with different objects in it "
+                "would make the per-draw losses incomparable.")
+        sets_by_draw.append(sets_d.to(cpu))
+        hrep_d: Dict = {}
+        hs_d = _build_host_sets(base_d, hrep_d)
+        host_sets_by_draw.append(None if hs_d is None else hs_d.to(cpu))
+        rep_d["host_sets"] = hrep_d
+        report[f"draw{d}"] = rep_d
     return HostTask(
         sel=sel, sets=sets.to(cpu), hr=hr.to(cpu), report=report,
         tile_data={t: {"lr": data[t]["lr"].to(cpu),
                        "noise": {s: v.to(cpu) for s, v in data[t]["noise"].items()},
-                       "hr": data[t]["hr"].to(cpu)}
+                       "noise_draws": [{s: v.to(cpu) for s, v in nd.items()}
+                                       for nd in data[t]["noise_draws"]],
+                       "hr": data[t]["hr"].to(cpu),
+                       # Absent on an unconditioned run, and every consumer
+                       # keys on that absence rather than on a flag: there is
+                       # no way to be holding a conditioning stack and not use
+                       # it, or to be missing one and think it is there.
+                       **({"cond": data[t]["cond"].to(cpu)}
+                          if "cond" in data[t] else {})}
                    for t in sel.tiles},
+        sets_by_draw=sets_by_draw,
+        host_sets_by_draw=host_sets_by_draw,
         host_sets=None if host_sets is None else host_sets.to(cpu))
 
 
@@ -322,6 +466,80 @@ def report_pair_cost(tasks: Sequence["HostTask"], args) -> None:
                   flush=True)
 
 
+def report_population(tasks: Sequence["HostTask"], args) -> None:
+    """What the pool actually supervises, by parent split and by mass.
+
+    The one line a `--population all` shakeout is read for. Two ways the run can
+    silently not be the run it was configured to be, and both show here:
+
+    * **the cap.** `--max-sets` with the default `largest` policy keeps the top
+      of a mass function, so widening the population to 50p halos and leaving
+      the cap alone can select the SAME sets as before with more of them thrown
+      away. `n_dropped_by_cap` and the `num_p` quantiles say so.
+    * **the live-fraction cut.** A field halo whose Lagrangian material is
+      mostly outside the cluster's four tiles is dropped at `min_live_frac`.
+      That is correct -- these tiles genuinely cannot build it -- but it means
+      the reachable field population can be far smaller than the catalog's, and
+      that is a fact about the TILING, answered by `--n-tiles`, not by the loss.
+    """
+    n_top = sum(int(t.report.get("n_top_level") or 0) for t in tasks)
+    n_sub = sum(int(t.report.get("n_sub") or 0) for t in tasks)
+    n_cap = sum(int(t.report.get("n_dropped_by_cap") or 0) for t in tasks)
+    n_live = sum(int(t.report.get("n_dropped_live_frac") or 0) for t in tasks)
+    tot = n_top + n_sub
+    npall = np.concatenate([t.sets.num_p for t in tasks]) if tasks else np.zeros(0)
+    print(f"\n  population: {args.population}, num_p window "
+          f"[{args.min_num_p}, {args.max_num_p or 'inf'}), "
+          f"cap {args.max_sets} by {args.set_select}")
+    print(f"    supervised sets  {tot}: {n_sub} subhalo, {n_top} top-level "
+          f"({(n_top / tot * 100.0) if tot else 0.0:.1f}% of the pool)")
+    if npall.size:
+        q = np.percentile(npall, [10, 50, 90])
+        print(f"    num_p            min {int(npall.min())}, "
+              f"p10 {q[0]:.0f}, median {q[1]:.0f}, p90 {q[2]:.0f}, "
+              f"max {int(npall.max())}")
+    print(f"    dropped          {n_cap} by the cap, {n_live} by live fraction")
+    # The THIRD axis. Printed unconditionally, including for an
+    # `--env-select any` run, because a targeted run's row is only readable
+    # against an untargeted one's -- and because the set9 census says this
+    # is the axis the deficit lives in: 6,557 of the region's 11,698
+    # missing objects are in `near`, and the small-halo arm, which selected
+    # on size alone, closed 3.8% of them.
+    env_n = {lab: sum(int((t.report.get("n_by_env") or {}).get(lab, 0))
+                      for t in tasks) for lab in ENV_LABELS}
+    print(f"    env_select       {args.env_select} (host floor "
+          f"{args.env_host_floor}p): "
+          + ", ".join(f"{lab} {env_n[lab]}" for lab in ENV_LABELS))
+    want = [w.strip() for w in str(args.env_select).split(",") if w.strip()]
+    if want and want[0] not in ("any", "all"):
+        got = sum(env_n[w] for w in want if w in env_n)
+        if got == 0:
+            print(">>> WARNING: --env-select "
+                  f"{args.env_select} selected ZERO sets. The environment "
+                  "cut runs BEFORE the cap, so this is the pool, not the "
+                  "budget: these tiles genuinely home no halo in that bin. "
+                  "Check --env-host-floor and --n-tiles.", flush=True)
+        elif got < 0.1 * max(tot, 1):
+            print(f">>> WARNING: --env-select {args.env_select} kept {got} "
+                  f"of {tot} sets ({got / max(tot, 1) * 100:.1f}%). A "
+                  "narrow pool is not the same experiment as a targeted "
+                  "one -- raise --n-tiles or widen the selection if this "
+                  "is smaller than intended. Continuing.", flush=True)
+    if args.population != "sub" and n_top == 0:
+        print(">>> WARNING: --population "
+              f"{args.population} selected ZERO top-level sets. The run is a "
+              "'sub' run with extra arguments. Check --max-num-p against the "
+              "num_p range above, and --min-live-frac: a field halo whose "
+              "material is mostly outside the cluster's tiles is dropped there.",
+              flush=True)
+    if args.population != "sub" and args.set_select == "largest" and n_cap:
+        print(">>> WARNING: the cap binds and --set-select is 'largest', which "
+              "keeps the top of the mass function and drops exactly the small "
+              "halos this population was widened to reach. Use "
+              "--set-select stratified unless truncation IS the experiment.",
+              flush=True)
+
+
 def _host_row(t: "HostTask") -> Dict:
     """One host's line in pool.json, including the reference it can reach.
 
@@ -337,6 +555,27 @@ def _host_row(t: "HostTask") -> Dict:
         "tiles": t.sel.tiles,
         "site_coverage": t.sel.site_coverage,
         "median_live_frac": t.report.get("median_live_frac"),
+        # What was actually selected, after every cut and the cap. Under
+        # --population all these are the only fields that say whether the run
+        # got the field halos it was reconfigured to get, or whether the cap and
+        # the live-fraction cut quietly handed back a subhalo-only pool.
+        "population": t.report.get("population"),
+        "n_top_level": t.report.get("n_top_level"),
+        "n_sub": t.report.get("n_sub"),
+        "num_p_min": t.report.get("num_p_min"),
+        "num_p_median": t.report.get("num_p_median"),
+        "num_p_max": t.report.get("num_p_max"),
+        "cap_binds": t.report.get("cap_binds"),
+        "n_dropped_by_cap": t.report.get("n_dropped_by_cap"),
+        "set_select": t.report.get("set_select"),
+        # The environment axis, per host. `n_after_env` against
+        # `n_after_purity` is how much the cut took BEFORE the cap, which is
+        # the distinction between "these tiles home no infall halos" (a
+        # tiling fact) and "the budget went elsewhere" (a cap fact).
+        "env_select": t.report.get("env_select"),
+        "n_after_env": t.report.get("n_after_env"),
+        "n_by_env": t.report.get("n_by_env"),
+        "median_iso_radius_mpc_h": t.report.get("median_iso_radius_mpc_h"),
         "reference_median": t.report.get("reference_median"),
         "pure_hr_median": t.report.get("pure_hr_median"),
         # The host preservation guard (present only when --w-host-sets > 0).
@@ -373,6 +612,13 @@ def build_pool(args, cfg, geom, scfg, pscfg, mcfg, frozen_model, device,
         cat = _catalog(box, "hr")
         oidx = build_owner_index(_owner(box, "hr"))
         children = child_map(cat)
+        # One KD-tree per box, not one per host site: the labelling is a
+        # property of the catalog and the eight sites share it. Always
+        # computed, even at --env-select any, because every run then
+        # RECORDS the environment mix it supervised and the arms become
+        # comparable on the axis the census says the deficit lives in.
+        env = halo_environment(cat, host_floor=int(args.env_host_floor),
+                               boxsize_mpc_h=BOXSIZE)
         sels = select_hosts(cat, oidx, box, n_tiles=int(args.n_tiles),
                             max_hosts=int(args.max_hosts_per_box),
                             min_log_mvir=float(args.min_log_mvir),
@@ -381,7 +627,7 @@ def build_pool(args, cfg, geom, scfg, pscfg, mcfg, frozen_model, device,
               f"[{time.time() - t0:.0f}s to load owner+catalog]", flush=True)
         for sel in sels:
             task = build_host_sets(sel, cat, oidx, cfg, geom, scfg, pscfg, mcfg,
-                                   args, frozen_model, device)
+                                   args, frozen_model, device, env=env)
             if task is None:
                 print(f"    {sel.key}: 0 supervised sets, skipped")
                 continue
@@ -394,7 +640,7 @@ def build_pool(args, cfg, geom, scfg, pscfg, mcfg, frozen_model, device,
                   f"{task.sets.n_sets:4d} sets{hn}, "
                   f"coverage {sel.site_coverage:.3f}, "
                   f"tiles {sel.tiles}", flush=True)
-        del cat, oidx, children
+        del cat, oidx, children, env
     return tasks
 
 
@@ -437,6 +683,7 @@ def build_tile_pool(boxes, per_box, cfg, geom, device, args, exclude, rng):
                 "lr": d["lr"].detach().cpu(),
                 "noise": {s: v.detach().cpu() for s, v in d["noise"].items()},
                 "hr": d["hr"].detach().cpu(),
+                **({"cond": d["cond"].detach().cpu()} if "cond" in d else {}),
             })
         del data
     print(f"  unsupervised-tile pool: {len(pool)} tiles over {len(boxes)} boxes "
@@ -454,7 +701,13 @@ def _forward_unsup(model, batch: Sequence[Dict], geom, device):
     sites = list(batch[0]["noise"].keys())
     noise = {s: torch.cat([b["noise"][s].to(device) for b in batch], dim=0)
              for s in sites}
-    cand = trim_to_tile(model(lr, noise=noise), geom).float()
+    # Same rule as `stack_cond`: whether the stack is consumed is the MODEL's
+    # property. This pool is also forwarded through the frozen reference, which
+    # has no conditioning columns.
+    cond = (torch.stack([b["cond"].to(device) for b in batch], dim=0)
+            if ("cond" in batch[0] and int(getattr(model, "cond_chan", 0)))
+            else None)
+    cand = trim_to_tile(model(lr, noise=noise, cond=cond), geom).float()
     hr = torch.stack([b["hr"].to(device) for b in batch], dim=0).float()
     return cand, hr
 
@@ -501,6 +754,226 @@ def eval_unsup_highk(model, pool: Sequence[Dict], geom, device, args,
 
 
 # --------------------------------------------------------------------------- #
+# The unsupervised-tile kNN-distance support (src/cosmo_sr/features/knn_cdf.py)
+# --------------------------------------------------------------------------- #
+# The high-k hinge above "only constrains the AMOUNT of small-scale power, never
+# its placement", and `density-power-cannot-see-subhalos` measured that the
+# objects this line builds are below the grid any spectrum is taken on. This is
+# the grid-free, real-space, catalog-free statistic charged on the SAME pool:
+# per tile, the distribution of distances to the k-th nearest particle, against
+# that tile's own HR. It is translation-invariant, so it is a support term and
+# never a substitute for the supervised centre term.
+def knn_config_from_args(args) -> KnnConfig:
+    return KnnConfig(ks=tuple(int(k) for k in args.knn_ks),
+                     n_queries=int(args.knn_queries),
+                     n_quantiles=int(args.knn_quantiles),
+                     one_sided=bool(args.knn_one_sided),
+                     dead_zone=float(args.knn_dead_zone),
+                     buffer_cells=float(args.knn_buffer_cells),
+                     phase_lambda=float(args.knn_phase_lambda))
+
+
+def knn_class_ids(args) -> Tuple[int, ...]:
+    """Indices into ``OWNER_CLASSES`` of the classes the term is charged on."""
+    names = [c for c in (args.knn_classes or []) if c]
+    bad = [c for c in names if c not in OWNER_CLASSES]
+    if bad:
+        raise SystemExit(f"--knn-classes {bad} not in {list(OWNER_CLASSES)}")
+    return tuple(OWNER_CLASSES.index(c) for c in names)
+
+
+def attach_knn_classes(pool: Sequence[Dict], args) -> None:
+    """Give each pool tile its rows' HR owner classes (`classify_owner`).
+
+    MEASURED, round 5b: the pooled statistic ranks the working arms backwards
+    because hosts dominate it, so the term is charged per class and only on the
+    classes named in ``--knn-classes``. The class vector is HR's, is the same
+    for both fields (Lagrangian ids), and is cached per box next to the
+    diagnostics.
+    """
+    if not knn_class_ids(args) or not pool:
+        return
+    root = Path(os.environ.get("DMSR_REWARD_ROOT", "")) if os.environ.get(
+        "DMSR_REWARD_ROOT") else None
+    boxes: Dict[str, List[Dict]] = {}
+    for it in pool:
+        boxes.setdefault(it["box"], []).append(it)
+    for box, items in boxes.items():
+        t0 = time.time()
+        cache = None if root is None else (
+            root / "member_gather" / "knn_cdf" / f"classes_{box}.npy")
+        if cache is not None and cache.exists():
+            cls = np.load(cache, mmap_mode="r")
+        else:
+            owner_p = (root / "halos_particles" / f"{box}__hr__hr"
+                       / f"{box}_hr_owner.npy") if root else None
+            cat_g = sorted(glob.glob(
+                f"{root}/halos/{box}__hr__hr/*_rockstar/halos_*.ascii")) if root else []
+            if owner_p is None or not owner_p.exists() or not cat_g:
+                raise SystemExit(
+                    f"--knn-classes needs {box}'s HR owner array and Rockstar "
+                    f"catalog under DMSR_REWARD_ROOT (looked for {owner_p})")
+            cat = load_rockstar_ascii(cat_g[0])
+            cls = classify_owner(np.load(str(owner_p), mmap_mode="r"),
+                                 cat.ids, cat.parent_ids, cat.num_p)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            np.save(cache, cls)
+        for it in items:
+            rows = tile_rows_flat(int(it["tile"]), ng=NG_HR, tile=TILE)
+            it["knn_classes"] = torch.from_numpy(
+                np.ascontiguousarray(np.asarray(cls[rows], dtype=np.int8)))
+        counts = {OWNER_CLASSES[i]: int(sum(int((it["knn_classes"] == i).sum())
+                                            for it in items))
+                  for i in knn_class_ids(args)}
+        print(f"  kNN classes for {len(items)} {box} tiles: {counts} "
+              f"[{time.time() - t0:.0f}s]", flush=True)
+
+
+def attach_knn_neighbours(pool: Sequence[Dict], cfg, args, kw,
+                          cfg_knn: Optional[KnnConfig] = None) -> None:
+    """Give each pool tile the OTHER tiles' particles around it, per field.
+
+    MEASURED, knn_cdf_set9.json (job 49259): a tile's own particles are not a
+    usable candidate set at z=0 -- displacements are a whole tile (median |Psi|
+    11.2 Mpc/h on the one HR tile checked), and the p95 overestimate of r_128 stayed at +62-80% at every
+    buffer. So every pool tile carries, as CPU float32 constants:
+
+    * ``knn_extra_frozen`` -- neighbours from the cached FROZEN SR2 box, for the
+      candidate. The generator is not run on neighbouring tiles (27x the forward),
+      so the candidate's surroundings are the frozen field's. Whether that
+      staleness matters is ``tuned_centroid_frozen`` vs ``tuned_centroid_nbr`` in
+      knn_cdf_split_diagnostic.py; read it before trusting this term.
+    * ``knn_extra_hr`` -- neighbours from the HR box, for the reference. Exact.
+
+    Selected once, about each field's own circular-mean centroid of the tile,
+    ``margin`` cells beyond the tile's half side. Two box loads per box.
+    """
+    margin = float(args.knn_nbr_margin_cells)
+    cfg_knn = cfg_knn if cfg_knn is not None else knn_config_from_args(args)
+    if margin <= 0 or not pool:
+        return
+    cell = BOXSIZE / NG_HR
+    half = 0.5 * TILE * cell + margin * cell
+    boxes: Dict[str, List[Dict]] = {}
+    for it in pool:
+        boxes.setdefault(it["box"], []).append(it)
+    for box, items in boxes.items():
+        t0 = time.time()
+        fpath = find_base_field(box, seed=int(args.seed))
+        if fpath is None:
+            raise SystemExit(
+                f"--knn-nbr-margin-cells > 0 needs the cached frozen SR2 box for "
+                f"{box} seed {args.seed} (the candidate's neighbours). Produce it "
+                "with scripts/reward/cache_sr2_base.py, or set the margin to 0.")
+        srcs = (("frozen", np.load(str(fpath), mmap_mode="r")),
+                ("hr", load_hr(cfg, box)))
+        n_extra = 0
+        for tag, field in srcs:
+            # 6D: the neighbour material must carry the same velocity columns as
+            # the live tile, or a neighbour would sit at v=0 in phase space.
+            bp = box_phase(field, ng=NG_HR, boxsize_mpc_h=BOXSIZE,
+                           dis_scale_mpc_h=float(kw["dis_scale_mpc_h"]),
+                           vel_scale_kms=float(kw["vel_scale_kms"])
+                           if cfg_knn.phase_lambda > 0 else 1.0,
+                           phase_lambda=float(cfg_knn.phase_lambda))
+            for it in items:
+                own = bp[tile_rows_flat(int(it["tile"]), ng=NG_HR, tile=TILE), :3]
+                ang = own.astype(np.float64) * (2 * np.pi / BOXSIZE)
+                c = np.mod(np.arctan2(np.sin(ang).mean(0), np.cos(ang).mean(0))
+                           * BOXSIZE / (2 * np.pi), BOXSIZE)
+                nb, _ = box_neighbours(bp[:, :3], int(it["tile"]), c, half,
+                                       ng=NG_HR, tile=TILE, boxsize_mpc_h=BOXSIZE)
+                xp = bp[nb]
+                it[f"knn_extra_{tag}"] = torch.from_numpy(np.ascontiguousarray(xp))
+                n_extra += int(xp.shape[0])
+            del bp
+        print(f"  kNN neighbours for {len(items)} {box} tiles: mean "
+              f"{n_extra / (2 * len(items)) / TILE ** 3:.2f}x a tile per field "
+              f"[{time.time() - t0:.0f}s]", flush=True)
+
+
+def _unsup_knn(model, batch: Sequence[Dict], geom, device, args, kw,
+               kcfg: KnnConfig, generator=None, cand=None, hr=None,
+               class_ids: Sequence[int] = ()):
+    """``(mean penalty, per-tile diagnostics)`` over a minibatch of pool tiles.
+
+    One particle table PER TILE, never one for the batch: pool tiles come from
+    different boxes, and a shared table would offer box A's particles as
+    neighbours to a query in box B wherever their coordinates overlap. Positions
+    go to float64 before the table is built -- a minimum-image difference of two
+    ~100 Mpc/h float32 coordinates carries ~1e-5 Mpc/h of rounding, which is not
+    small against the r_8 of a subhalo core.
+    """
+    if cand is None:
+        cand, hr = _forward_unsup(model, batch, geom, device)
+    pens, diags = [], []
+    for b, tile in enumerate(batch):
+        cp, cv = tile_particles(cand[b:b + 1].double(), [int(tile["tile"])], **kw)
+        with torch.no_grad():
+            hp, hv = tile_particles(hr[b:b + 1].double(), [int(tile["tile"])], **kw)
+        lam = float(kcfg.phase_lambda)
+        if lam > 0:
+            # (x, v/lambda): one metric, both halves differentiable, so the term
+            # constrains the velocity field as well as the positions.
+            cp = torch.cat([cp, cv / lam], dim=1)
+            hp = torch.cat([hp, hv / lam], dim=1)
+        ce, he = tile.get("knn_extra_frozen"), tile.get("knn_extra_hr")
+        kcls = tile.get("knn_classes")
+        pen, d = knn_tile_loss(cp, hp, torch.arange(cp.shape[0], device=cp.device),
+                               int(tile["tile"]), kcfg, ng_hr=NG_HR, tile_hr=TILE,
+                               boxsize_mpc_h=BOXSIZE, generator=generator,
+                               cand_extra=None if ce is None else ce.to(cp.device),
+                               hr_extra=None if he is None else he.to(cp.device),
+                               centre=str(getattr(args, "knn_centre", "lagrangian")),
+                               classes=None if kcls is None else kcls.to(cp.device),
+                               class_ids=class_ids or ())
+        d["box"] = tile["box"]
+        diags.append(d)
+        if not d.get("skipped"):
+            pens.append(pen)
+    if not pens:
+        return torch.zeros((), device=cand.device, dtype=torch.float64), diags
+    return torch.stack(pens).mean(), diags
+
+
+@torch.no_grad()
+def eval_unsup_knn(model, pool: Sequence[Dict], geom, device, args, kw,
+                   kcfg: KnnConfig, batch: int = 8,
+                   class_ids: Sequence[int] = ()) -> Optional[Dict]:
+    """Median over a pool of each tile's bottom-decile ``r_k`` ratio to HR.
+
+    ``ratio_q10`` and not the median ratio: `knn_cdf_loss`'s docstring records
+    that a 120-particle clump moves the loss 1500x while moving the MEDIAN ratio
+    by 0.2%. A fixed generator seed so an eval is the same number twice.
+    """
+    if not pool:
+        return None
+    gen = torch.Generator(device=device).manual_seed(int(kcfg.seed))
+    q10, med, loss, skipped = [], [], [], 0
+    for i in range(0, len(pool), batch):
+        _, diags = _unsup_knn(model, pool[i:i + batch], geom, device, args, kw,
+                              kcfg, generator=gen, class_ids=class_ids)
+        for d in diags:
+            if d.get("skipped"):
+                skipped += 1
+                continue
+            q10.append(d["ratio_q10"])
+            med.append(d["ratio_med"])
+            loss.append(d["loss"])
+    if not q10:
+        return {"ks": list(kcfg.ks), "n_tiles": 0, "n_skipped": skipped}
+    return {
+        "ks": list(kcfg.ks),
+        "phase_lambda": float(kcfg.phase_lambda),
+        "classes": [OWNER_CLASSES[i] for i in class_ids],
+        "n_tiles": len(q10), "n_skipped": skipped,
+        "ratio_q10": np.median(np.asarray(q10), axis=0).tolist(),
+        "ratio_med": np.median(np.asarray(med), axis=0).tolist(),
+        "loss": float(np.median(loss)),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # One host's contribution to a step
 # --------------------------------------------------------------------------- #
 def sample_sets(task: HostTask, n: int, rng: random.Random) -> Optional[List[int]]:
@@ -535,9 +1008,88 @@ def sample_host_sets(task: HostTask, n: int,
     return rng.sample(range(total), n)
 
 
+def report_rss(when: str) -> float:
+    """Print peak host RSS so far, in GB, and return it.
+
+    Why this exists: the job asks for `--mem=96G` and nothing has ever measured
+    what it actually uses, so the request could not be defended or reduced. On
+    2026-09-09 that mattered -- 96G did not fit any AVAILABLE node on `general`
+    (the only two with a free, unreserved GPU had 20G and 84G), so every arm sat
+    PENDING behind a number nobody had checked. `sacct` is not reachable from
+    here, so the job has to report it itself.
+
+    `ru_maxrss` is a high-water mark, not current usage: it only rises, and it
+    is in KiB on Linux. It does NOT include the mmap'd frozen box's page cache,
+    which Slurm may still charge -- so treat this as a floor on what to request.
+    """
+    import resource
+    gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 ** 2)
+    print(f"  [mem] peak host RSS {when}: {gb:.1f} GB", flush=True)
+    return gb
+
+
+def draw_seeds(args) -> List[int]:
+    """Root seeds for the noise realisations this run may use.
+
+    Index 0 is ``--seed`` itself, so a run with ``--noise-draws 1`` and no fresh
+    eval is byte-identical to every arm before 2026-09-09. The stride is 1000
+    rather than 1 only so a draw index is readable in a log line.
+
+    The list is ``--noise-draws`` training draws followed, when
+    ``--fresh-noise-eval`` is set, by ONE reserved draw that no step ever sees.
+    That reserved draw is the whole measurement: it turns the train/holdout
+    comparison into a 2x2 over (seen box, seen noise), which is what separates
+    "the LR field carries this" from "the fixed noise pattern was memorised".
+    """
+    n = max(1, int(getattr(args, "noise_draws", 1)))
+    if bool(getattr(args, "fresh_noise_eval", False)):
+        n += 1
+    return [int(args.seed) + 1000 * d for d in range(n)]
+
+
+def fresh_draw_index(args) -> Optional[int]:
+    """Index of the reserved never-trained draw, or ``None``."""
+    if not bool(getattr(args, "fresh_noise_eval", False)):
+        return None
+    return max(1, int(getattr(args, "noise_draws", 1)))
+
+
+def add_noise_draws(data: Dict[int, Dict], tiles: Sequence[int], geom,
+                    device, seeds: Sequence[int]) -> None:
+    """Attach ``noise_draws`` (one dict per seed) to each tile's data, in place.
+
+    ``build_tiles`` already produced the ``--seed`` draw as ``noise``; that
+    tensor is reused as entry 0 rather than regenerated, so entry 0 is the same
+    object the single-draw path uses and cannot drift from it.
+    """
+    for t in tiles:
+        draws = [data[t]["noise"]]
+        for sd in list(seeds)[1:]:
+            draws.append(tile_noise_stack([int(sd)], int(t), geom,
+                                          device=device))
+        data[t]["noise_draws"] = draws
+
+
+def forward_tiles_draw(model, data: Dict[int, Dict], tiles: Sequence[int],
+                       geom, draw: int = 0):
+    """:func:`forward_tiles` on one noise draw.
+
+    Falls straight through to ``forward_tiles`` for draw 0 with no
+    ``noise_draws`` present, which keeps the single-draw path untouched.
+    """
+    if int(draw) == 0 or "noise_draws" not in data[tiles[0]]:
+        return forward_tiles(model, data, tiles, geom)
+    sub = {t: {"lr": data[t]["lr"],
+               "noise": data[t]["noise_draws"][int(draw)],
+               "hr": data[t]["hr"],
+               **({"cond": data[t]["cond"]} if "cond" in data[t] else {})}
+           for t in tiles}
+    return forward_tiles(model, sub, tiles, geom)
+
+
 def host_forward(model, task: HostTask, geom, kw, mcfg, device,
                  frozen_model=None, set_indices=None, term_scale=None,
-                 host_set_indices=None):
+                 host_set_indices=None, draw: int = 0, shell_draws=()):
     """``(candidate, base, hr, gather_loss, diagnostics, host)`` for one host.
 
     ``base`` is recomputed under ``no_grad`` rather than cached on the GPU: it is
@@ -548,22 +1100,75 @@ def host_forward(model, task: HostTask, geom, kw, mcfg, device,
     it is ``(host_gather, host_diag)`` from the SAME particle table -- the host
     term never triggers a second forward or a second ``tile_particles``.
     """
+    nds = task.tile_data[task.tiles[0]].get("noise_draws")
     data = {t: {"lr": task.tile_data[t]["lr"].to(device),
                 "noise": {s: v.to(device)
                           for s, v in task.tile_data[t]["noise"].items()},
-                "hr": task.tile_data[t]["hr"].to(device)}
+                "hr": task.tile_data[t]["hr"].to(device),
+                **({"cond": task.tile_data[t]["cond"].to(device)}
+                   if "cond" in task.tile_data[t] else {})}
             for t in task.tiles}
-    cand = forward_tiles(model, data, task.tiles, geom).float()
+    if nds is not None:
+        for t in task.tiles:
+            data[t]["noise_draws"] = [{s: v.to(device) for s, v in nd.items()}
+                                      for nd in task.tile_data[t]["noise_draws"]]
+    cand = forward_tiles_draw(model, data, task.tiles, geom, draw).float()
     with torch.no_grad():
-        base = forward_tiles(frozen_model, data, task.tiles, geom).float()
+        base = forward_tiles_draw(frozen_model, data, task.tiles, geom,
+                                  draw).float()
     hr = task.hr.to(device)
-    sets = task.sets.to(device)
+    sets = task.sets_at(draw).to(device)
     pos, vel = tile_particles(cand, task.tiles, **kw)
     gather, diag = member_gather_loss(pos, vel, sets, mcfg, set_indices,
                                       term_scale=term_scale)
+    # --- the NOISE-AVERAGED shell (--shell-noise-draws) --------------------
+    # The term claims to be about a DISTRIBUTION but is evaluated on one
+    # stochastic realisation, which is exactly the freedom the 2026-09-08 sweep
+    # exploited: 7.3x on train, 1.4x held out. Averaging the reduced curve over
+    # several draws BEFORE charging asks for a distribution no single draw can
+    # fake. Note the order: mean-then-charge, not charge-then-mean -- the second
+    # is just a lower-variance version of the same per-realisation objective.
+    #
+    # Only the radii are recomputed on the extra draws (`shell_radii`), never
+    # the O(N^2) statistics: the other terms keep their primary-draw values and
+    # the extra cost is a forward pass and a gather.
+    curves = diag.pop("_shell_curves", None)
+    shell_avg = None
+    if curves is not None and shell_draws:
+        lc0, lt0 = curves
+        lcs = [lc0]
+        for d2 in shell_draws:
+            cand2 = forward_tiles_draw(model, data, task.tiles, geom, d2).float()
+            pos2, _v2 = tile_particles(cand2, task.tiles, **kw)
+            sets2 = task.sets_at(d2).to(device)
+            rc2, rt2 = shell_radii(pos2, sets2, mcfg, set_indices)
+            lc2, _lt2 = shell_reduce(rc2, rt2, mcfg)
+            # Shapes must agree or the mean would be of two different
+            # reductions. They do by construction -- selection is
+            # draw-independent, checked when the tables were built -- so a
+            # mismatch is a bug, not a case to paper over.
+            if lc2.shape != lc0.shape:
+                raise RuntimeError(
+                    f"{task.key}: shell curve on draw {d2} has shape "
+                    f"{tuple(lc2.shape)} against the primary draw's "
+                    f"{tuple(lc0.shape)}")
+            lcs.append(lc2)
+        if len(lcs) > 1:
+            lc_bar = torch.stack(lcs, dim=0).mean(dim=0)
+            w = float(mcfg.w_shell)
+            sc = max(float((term_scale or {}).get("shell", 1.0)), 1e-6)
+            # Swap the primary-draw charge out for the averaged one. Exact:
+            # `shell_charge(lc0, lt0)` recomputes the very term `gather`
+            # already carries, from the same live tensors.
+            gather = (gather - w * shell_charge(lc0, lt0, mcfg) / sc
+                      + w * shell_charge(lc_bar, lt0, mcfg) / sc)
+            shell_avg = float(shell_charge(lc_bar, lt0, mcfg).detach())
+    diag["shell_avg_raw"] = (float("nan") if shell_avg is None else shell_avg)
+    diag["n_shell_draws"] = 1 + len(shell_draws)
     host = None
-    if task.host_sets is not None and task.host_sets.n_sets > 0:
-        hsets = task.host_sets.to(device)
+    _hs = task.host_sets_at(draw)
+    if _hs is not None and _hs.n_sets > 0:
+        hsets = _hs.to(device)
         # Only selection and centre_mode distinguish the host config, and both
         # are already baked into `hsets` at build time; the estimator and the
         # per-term weights are mcfg's by design (same physics binds a host as a
@@ -575,13 +1180,15 @@ def host_forward(model, task: HostTask, geom, kw, mcfg, device,
         # describe the host ones.
         host = member_gather_loss(
             pos, vel, hsets,
-            dataclasses.replace(mcfg, centre_mode="self"), host_set_indices)
+            dataclasses.replace(mcfg, centre_mode="self", w_radius=0.0),
+            host_set_indices)
     return cand, base, hr, gather, diag, host
 
 
 def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
               set_indices=None, term_scale=None, critic=None, critic_norm=None,
-              w_adv=0.0, host_set_indices=None):
+              w_adv=0.0, host_set_indices=None, draw: int = 0,
+              shell_draws=()):
     """Total loss for one host, plus the row that gets logged.
 
     ``critic`` is the optional HR critic (:mod:`cosmo_sr.features.gather_critic`).
@@ -594,7 +1201,8 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
     """
     cand, base, hr, gather, diag, host = host_forward(
         model, task, geom, kw, mcfg, device, frozen_model, set_indices,
-        term_scale=term_scale, host_set_indices=host_set_indices)
+        term_scale=term_scale, host_set_indices=host_set_indices,
+        draw=draw, shell_draws=shell_draws)
     g = guards(cand, base, geom)
     # The REPORTED scalar is always the original one, whatever is being
     # penalised: `highk_ratio` is the number every run of this line has quoted
@@ -653,6 +1261,12 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
     if host_gather is not None:
         loss = loss + float(args.w_host_sets) * host_gather
     row = {
+        # WHICH noise realisation this row was measured under. Without it a
+        # rotating run's metrics.jsonl cannot be split by draw, and the whole
+        # point of the rotation is to compare seen-noise against fresh-noise.
+        "draw": int(draw),
+        "shell_avg_raw": float(diag["shell_avg_raw"]),
+        "n_shell_draws": int(diag["n_shell_draws"]),
         "gather": float(gather.detach()),
         "low_k": float(g["low"].detach()),
         "highk_ratio": float(hk_ratio.detach()),
@@ -667,10 +1281,34 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
         "bound_hard": diag["median_bound_hard"],
         "virial": diag["median_virial"],
         "centre_offset_radii": diag["median_centre_offset_radii"],
+        # Logged at --w-radius 0 too: it is the coordinate the `self` arm's
+        # radial collapse lives in (set9: median 0.35 host R_vir against HR's
+        # 1.13), and an arm that does not log it cannot be read against one
+        # that does. Signed, so "too close" stays distinguishable from "too far".
+        "radius_err_radii": diag["median_radius_err_radii"],
+        "radius_ratio": diag["median_radius_ratio"],
+        "radius_too_close": diag["frac_radius_too_close"],
+        # The SHELL's own residual, logged at --w-shell 0 too. Read THIS for
+        # that term and not `radius_err_radii`: a perfect distribution match
+        # still leaves 79%% (train) / 85%% (holdout) of the per-set address
+        # error standing, so the address diagnostic barely moves on a total win.
+        "shell_resid": diag["median_shell_resid"],
+        "shell_resid_signed": diag["median_shell_resid_signed"],
         "r_rms_over_hr": diag["median_r_rms_over_hr"],
         "sigma_v_over_hr": diag["median_sigma_v_over_hr"],
         "n_sets": int(diag["n_sets"]),
         "n_sets_total": int(task.sets.n_sets),
+        # The pedestal. > 1 is "more non-member mass sits on this object
+        # than HR has", which is the state that makes Rockstar file it as
+        # somebody's subhalo -- logged at --w-isolation 0 too, so an arm
+        # that does not charge for it can still be read against one that
+        # does. `n_iso` is how many sets the term could be taken on.
+        "iso_ratio": diag["median_iso_ratio"],
+        "iso_above_hr": diag["frac_iso_above_hr"],
+        "n_iso": int(diag["n_iso"]),
+        # WHICH population and WHICH environment moved, not just the pool.
+        "by_population": diag["by_population"],
+        "by_env": diag["by_env"],
     }
     # The host preservation guard, reported whether or not it is on so the frozen
     # start and every step carry the same keys. `host_gather` is the weighted
@@ -723,14 +1361,69 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
     return loss, row
 
 
+def save_atomic(obj, path) -> None:
+    """``torch.save`` through a temp file and one ``os.replace``.
+
+    A plain ``torch.save`` to a live path is a multi-second, non-atomic write,
+    and this run's ``tuned.pt`` is rewritten every eval so a gate can always load
+    the latest model. The moment a gate is allowed to fire WHILE training is
+    still going -- which is the whole point of the mid-run checkpoints -- those
+    two collide: the export spends ~138 s loading a file the trainer is
+    overwriting underneath it, and the failure is a torch unpickling error whose
+    message says nothing about a race. ``os.replace`` is atomic on POSIX, so a
+    reader sees either the old file or the new one, never half of one.
+
+    The temp file sits in the SAME directory on purpose: ``os.replace`` across
+    filesystems is not atomic and raises, and ``/tmp`` on a compute node is not
+    the shared filesystem the checkpoint lives on.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def gate_steps(args) -> List[int]:
+    """The steps at which to freeze an immutable checkpoint for an early gate.
+
+    Parsed once, up front, so a typo is a startup error rather than a step-2000
+    surprise. Out-of-range steps raise for the same reason: a gate chain queued
+    against a snapshot that will never be written strands four jobs on
+    `Dependency` with nothing to read.
+    """
+    raw = str(getattr(args, "gate_at_steps", "") or "").strip()
+    if not raw:
+        return []
+    try:
+        out = sorted({int(x) for x in raw.replace(",", " ").split()})
+    except ValueError:
+        raise SystemExit(
+            f"--gate-at-steps {raw!r} is not a list of integers "
+            "(e.g. '2000' or '1000,2000').")
+    bad = [x for x in out if not (0 < x < int(args.steps))]
+    if bad:
+        raise SystemExit(
+            f"--gate-at-steps {bad} outside (0, --steps {args.steps}). The "
+            "final checkpoint is already gated by the normal chain; a snapshot "
+            "at or past the last step would only duplicate it, and one past it "
+            "would never be written -- stranding the gate queued against it.")
+    return out
+
+
 def _TERM_WEIGHTS(mcfg) -> Dict[str, float]:
-    """The six ``member_gather_loss`` weights, keyed as its ``term_*`` diag."""
+    """The nine ``member_gather_loss`` weights, keyed as its ``term_*`` diag."""
     return {"virial": mcfg.w_virial, "bound": mcfg.w_bound, "d6": mcfg.w_d6,
             "rrms": mcfg.w_rrms, "sigmav": mcfg.w_sigmav,
-            "centre": mcfg.w_centre}
+            "centre": mcfg.w_centre, "radius": mcfg.w_radius,
+            "shell": mcfg.w_shell, "isolation": mcfg.w_isolation}
 
 
-_TERM_NAMES = ("virial", "bound", "d6", "rrms", "sigmav", "centre")
+_TERM_NAMES = ("virial", "bound", "d6", "rrms", "sigmav", "centre", "radius",
+               "shell", "isolation")
 
 
 def adv_weight_at(step: int, args) -> float:
@@ -755,8 +1448,11 @@ def adv_weight_at(step: int, args) -> float:
 
 
 _POOL_SCALARS = (("n_hosts", "n_sets_total", "gather", "bound_hard", "virial",
-                  "centre_offset_radii", "r_rms_over_hr", "sigma_v_over_hr",
-                  "low_k", "highk_ratio", "highk_ratio_max", "vel_rms_ratio")
+                  "centre_offset_radii", "radius_err_radii", "radius_ratio",
+                  "shell_resid", "shell_resid_signed",
+                  "r_rms_over_hr", "sigma_v_over_hr",
+                  "low_k", "highk_ratio", "highk_ratio_max", "vel_rms_ratio",
+                  "iso_ratio", "iso_above_hr")
                  + tuple(f"term_{k}" for k in _TERM_NAMES)
                  + tuple(f"term_raw_{k}" for k in _TERM_NAMES)
                  + tuple(f"term_eff_{k}" for k in _TERM_NAMES))
@@ -775,7 +1471,7 @@ def wandb_row(row: Dict) -> Dict:
     where 56 lines do not.
     """
     flat: Dict[str, object] = {"step": int(row["step"])}
-    for k in ("wall_s", "batch_gather", "batch_unsup_pen"):
+    for k in ("wall_s", "batch_gather", "batch_unsup_pen", "batch_unsup_knn"):
         if k in row:
             flat[k] = float(row[k])
     # The box-wide guard's own number, per split -- the worst-band ratio is what
@@ -783,11 +1479,24 @@ def wandb_row(row: Dict) -> Dict:
     for side, block in (row.get("unsup") or {}).items():
         if block and block.get("ratio_max") is not None:
             flat[f"unsup/{side}/highk_ratio_max"] = float(block["ratio_max"])
+        knn = (block or {}).get("knn") or {}
+        for k, r in zip(knn.get("ks", []), knn.get("ratio_q10", [])):
+            flat[f"unsup/{side}/knn_q10_k{k}"] = float(r)
     for side in ("train", "holdout"):
         pool = row.get(side) or {}
         for k in _POOL_SCALARS:
             if k in pool and pool[k] is not None:
                 flat[f"{side}/{k}"] = pool[k]
+        # The splits, one series per (split, bin, field). This is the chart
+        # `all_blocks_smallhalo` needed and did not have: a pooled median
+        # over both populations could not say whether its top-level sets --
+        # its entire hypothesis -- were moving, and the answer only arrived
+        # from a Rockstar gate ten hours later.
+        for split in ("by_population", "by_env"):
+            for name, blk in (pool.get(split) or {}).items():
+                for f, v in (blk or {}).items():
+                    if v is not None and np.isfinite(v):
+                        flat[f"{side}/{name}/{f}"] = float(v)
         per_host = pool.get("per_host") or []
         if per_host:
             try:
@@ -815,7 +1524,8 @@ def log_wandb(row: Dict, enabled: bool) -> None:
 
 @torch.no_grad()
 def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
-                  device, frozen_model, label: str, term_scale=None) -> Dict:
+                  device, frozen_model, label: str, term_scale=None,
+                  draw: int = 0) -> Dict:
     """Median statistics over a pool. NOT a verdict -- see the module docstring.
 
     Reported per host as well as pooled: a mean over hosts hides the case this
@@ -829,7 +1539,7 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
     with torch.no_grad():
         for task in tasks:
             _, row = host_loss(model, task, geom, kw, mcfg, args, device,
-                               frozen_model, term_scale=term_scale)
+                               frozen_model, term_scale=term_scale, draw=draw)
             row["key"] = task.key
             row["log_mvir"] = task.sel.log_mvir
             rows.append(row)
@@ -841,6 +1551,7 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
 
     out = {
         "label": label,
+        "draw": int(draw),
         "n_hosts": len(rows),
         "n_sets_total": int(sum(r["n_sets"] for r in rows)),
         # The objective itself, per split. Without it the only loss curve in the
@@ -851,6 +1562,20 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
         "bound_hard": med("bound_hard"),
         "virial": med("virial"),
         "centre_offset_radii": med("centre_offset_radii"),
+        # The shell, pooled. `radius_ratio` is the one to read against the set9
+        # radial profile: HR's subhalos sit at a median 1.13 host R_vir and the
+        # `self` arm's at 0.35, so a ratio drifting below 1 here is that
+        # collapse happening on the supervised sets themselves.
+        "radius_err_radii": med("radius_err_radii"),
+        "radius_ratio": med("radius_ratio"),
+        # ...and the SOFT shell's residual, which is a different question from
+        # both of the above: how far the set radii are from HR's radius
+        # DISTRIBUTION, once the addresses are set aside. `--w-shell` drives
+        # this one; `radius_err_radii` stays near where it started even when it
+        # wins, because a perfect distribution match still leaves 79%/85% of the
+        # per-set address error standing.
+        "shell_resid": med("shell_resid"),
+        "shell_resid_signed": med("shell_resid_signed"),
         "r_rms_over_hr": med("r_rms_over_hr"),
         "sigma_v_over_hr": med("sigma_v_over_hr"),
         "low_k": med("low_k"),
@@ -860,6 +1585,14 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
         # the excess and not only its size. None when --highk-bins is 0.
         "highk_bands": _median_bands(rows),
         "vel_rms_ratio": med("vel_rms_ratio"),
+        "iso_ratio": med("iso_ratio"),
+        "iso_above_hr": med("iso_above_hr"),
+        # Pooled over hosts by SUMMING the counts and taking the median of
+        # the medians -- a host with four `near` sets must not weigh the
+        # same as one with two hundred in the count, and must not be
+        # averaged away in the median either.
+        "by_population": _pool_splits(rows, "by_population"),
+        "by_env": _pool_splits(rows, "by_env"),
         "velhighk_ratio": med("velhighk_ratio"),
         "velhighk_ratio_min": float(np.min([r["velhighk_ratio"] for r in rows])),
         "per_host": rows,
@@ -868,6 +1601,34 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
         out[f"term_{k}"] = med(f"term_{k}")
         out[f"term_raw_{k}"] = med(f"term_raw_{k}")
         out[f"term_eff_{k}"] = med(f"term_eff_{k}")
+    return out
+
+
+def _pool_splits(rows: List[Dict], key: str) -> Dict[str, Dict[str, float]]:
+    """Pool per-host ``by_population`` / ``by_env`` blocks over the hosts.
+
+    ``n`` sums; every other field is a median over the hosts that HAVE that
+    split non-empty. A host contributing zero sets to a split must not drag its
+    medians toward NaN, and must not silently vanish from the count either --
+    which is the distinction that makes "the near bin got 4 sets" readable as a
+    selection failure rather than as a learning one.
+    """
+    names: List[str] = []
+    for r in rows:
+        for k in (r.get(key) or {}):
+            if k not in names:
+                names.append(k)
+    out: Dict[str, Dict[str, float]] = {}
+    for name in names:
+        blocks = [(r.get(key) or {}).get(name) for r in rows]
+        blocks = [b for b in blocks if b]
+        d: Dict[str, float] = {"n": float(sum(b.get("n", 0.0) for b in blocks))}
+        for f in ("bound_hard", "virial", "centre_offset_radii", "iso_ratio"):
+            v = np.asarray([b.get(f, np.nan) for b in blocks
+                            if b.get("n", 0.0) > 0], dtype=np.float64)
+            v = v[np.isfinite(v)]
+            d[f] = float(np.median(v)) if v.size else float("nan")
+        out[name] = d
     return out
 
 
@@ -901,16 +1662,74 @@ def run(args) -> Dict:
     random.seed(int(args.seed))
     banner(f"member-gather fine-tune: rung={args.rung}")
 
+    # --- the noise-realisation flags, checked before a pool is built --------
+    # Each of these costs a full reference build per host per draw, so a
+    # contradiction must fail here and not after twenty minutes of pool work.
+    n_draws = max(1, int(args.noise_draws))
+    if int(args.noise_draws) < 1:
+        raise SystemExit(f"--noise-draws {args.noise_draws} is below 1")
+    if str(args.noise_mode) == "rotate" and n_draws < 2:
+        raise SystemExit(
+            "--noise-mode rotate with --noise-draws 1 rotates over a single "
+            "realisation, which is --noise-mode fixed under another name. Pass "
+            "--noise-draws 2 or more, or drop the flag.")
+    if int(args.shell_noise_draws) > 0:
+        if float(args.w_shell) <= 0.0:
+            raise SystemExit(
+                "--shell-noise-draws averages the SHELL curve over draws, but "
+                "--w-shell is 0 so there is no shell term to average.")
+        if n_draws < 2:
+            raise SystemExit(
+                f"--shell-noise-draws {args.shell_noise_draws} needs more than "
+                "one realisation to average over; pass --noise-draws 2 or more.")
+        if int(args.shell_noise_draws) > n_draws - 1:
+            raise SystemExit(
+                f"--shell-noise-draws {args.shell_noise_draws} exceeds the "
+                f"{n_draws - 1} other training draws available at "
+                f"--noise-draws {n_draws}.")
+    _seeds = draw_seeds(args)
+    _fresh = fresh_draw_index(args)
+    print(f"  noise: {n_draws} training draw(s) (mode {args.noise_mode}), "
+          f"root seeds {_seeds[:n_draws]}"
+          + (f"; draw {_fresh} (seed {_seeds[_fresh]}) RESERVED for the fresh "
+             "eval and never trained on" if _fresh is not None else "")
+          + (f"; shell averaged over {1 + int(args.shell_noise_draws)} draws"
+             if int(args.shell_noise_draws) > 0 else ""), flush=True)
+    if int(args.shell_quantiles) > 0:
+        print(f"  shell reduced to {args.shell_quantiles} equal-count quantile "
+              "bins (full rank pairing is --shell-quantiles 0)", flush=True)
+
     train_boxes = [b for b in str(args.train_boxes).replace(",", " ").split() if b]
     hold_boxes = [b for b in str(args.holdout_boxes).replace(",", " ").split() if b]
     hold_keys = [k for k in str(args.holdout_hosts).replace(",", " ").split() if k]
 
+    # The frozen reference is built WITHOUT conditioning columns and is fed no
+    # channels. That is the definition of the control: it is the deployed SR2,
+    # and every reference in this pipeline (`base`, the guards, the gate's
+    # `frozen` field) is measured against it. Because `cond0` is zero-initialised
+    # the tuned model agrees with it bit-for-bit at step 0 anyway -- which is
+    # what `test_cond_zero_init_matches_frozen_bit_for_bit` pins.
     frozen = load_controlled_generator(
         model_path_of(cfg), in_chan=int(cfg.get("model", {}).get("in_chan", 6)),
         out_chan=int(cfg.get("model", {}).get("out_chan", 6)),
         scale_factor=geom.scale_factor, device=device, eval_mode=True)
     for p in frozen.parameters():
         p.requires_grad_(False)
+
+    # --- the conditioning channels, resolved and LOADED before the pool -----
+    # Loading here (rather than lazily inside the first `build_tiles`) means a
+    # missing or stale cached field fails in seconds, not after the twenty-odd
+    # minutes a pool build costs.
+    ccfg = cond_config_of(args)
+    if ccfg is not None:
+        print(f"\nconditioning: {ccfg.n_chan} channel(s) {list(ccfg.channels)}, "
+              f"mode {ccfg.mode}, gate >={ccfg.min_hr_num_p} HR particles, "
+              f"r_max {ccfg.r_max_rvir} R_vir", flush=True)
+        for _b in train_boxes + hold_boxes:
+            load_cond_field(_b, ccfg, args)
+    else:
+        print("\nconditioning: none (--cond-channels empty); this is the "
+              "unconditioned control", flush=True)
 
     print("building the host pool (one owner-array load per box)", flush=True)
     all_tasks = build_pool(args, cfg, geom, scfg, pscfg, mcfg, frozen, device,
@@ -939,6 +1758,7 @@ def run(args) -> Dict:
     print(f"  hold:   {ho_sum.get('n_hosts', 0)} hosts over "
           f"{ho_sum.get('n_boxes', 0)} boxes, "
           f"{sum(t.sets.n_sets for t in hold_tasks)} supervised sets", flush=True)
+    report_population(all_tasks, args)
     report_pair_cost(train_tasks + hold_tasks, args)
 
     out_dir = paths.subdir("member_gather",
@@ -951,6 +1771,12 @@ def run(args) -> Dict:
     }
     write_json(out_dir / "pool.json", pool_summary)
     print(f"  wrote {out_dir / 'pool.json'}", flush=True)
+    # The pool is the memory-heavy stage (every host's tiles and set tables are
+    # held on the CPU, one set per NOISE DRAW), so this is the number that sizes
+    # --mem. A pool-only shakeout exists to produce exactly this.
+    rss_pool = report_rss(f"after the pool build ({len(all_tasks)} hosts, "
+                          f"{len(draw_seeds(args))} draw(s))")
+    pool_summary["peak_rss_gb_after_pool"] = rss_pool
 
     if args.pool_only:
         # No wandb run for a shakeout: it trains nothing, and an empty run per
@@ -976,6 +1802,30 @@ def run(args) -> Dict:
                                   supervised, tile_rng)
     unsup_hold = build_tile_pool(hold_boxes, per_box, cfg, geom, device, args,
                                  supervised, tile_rng)
+    if float(args.w_knn_unsup) > 0 and not unsup_train:
+        raise SystemExit(
+            "--w-knn-unsup > 0 charges the kNN term on the unsupervised tile pool, "
+            "which is empty -- set --unsup-tiles-per-box. Without it the flag "
+            "would silently train nothing.")
+    knn_cfg = knn_config_from_args(args)
+    knn_cls = knn_class_ids(args)
+    if float(args.w_knn_unsup) > 0 and knn_cfg.phase_lambda <= 0:
+        # Round 5b: the position-only statistic ranks the working arms at
+        # rho -0.23 (p 0.32). Training on it optimises a statistic with no
+        # measured ranking power in the regime a fine-tune operates in.
+        print("WARNING: --w-knn-unsup > 0 with --knn-phase-lambda 0 trains on "
+              "the POSITION-only statistic, which round 5b measured as unable "
+              "to rank the working arms. 4000 is the measured pass.", flush=True)
+    if float(args.w_knn_unsup) > 0 and not knn_cls:
+        print("WARNING: --w-knn-unsup > 0 with no --knn-classes charges the "
+              "POOLED form, which round 5b measured as ranking the working arms "
+              "BACKWARDS (hosts dominate it).", flush=True)
+    if float(args.w_knn_unsup) > 0 and max(knn_cfg.ks) < 64:
+        # Not refused -- the user may be testing exactly this -- but never silent.
+        print(f"WARNING: --knn-ks max {max(knn_cfg.ks)} < 64. knn_cdf's measured "
+              "rule: ranks below the object's particle count reach zero loss by "
+              "FRAGMENTING (largest FOF 13 of 150 at k<=8). The deficit is at "
+              "50-200p.", flush=True)
 
     # ---- wandb ------------------------------------------------------------
     # Grouped by "member_gather" and named by rung, so the rung ladder (fine /
@@ -1011,9 +1861,11 @@ def run(args) -> Dict:
     model = load_controlled_generator(
         model_path_of(cfg), in_chan=int(cfg.get("model", {}).get("in_chan", 6)),
         out_chan=int(cfg.get("model", {}).get("out_chan", 6)),
-        scale_factor=geom.scale_factor, device=device, eval_mode=False)
+        scale_factor=geom.scale_factor, device=device, eval_mode=False,
+        cond_chan=(ccfg.n_chan if ccfg is not None else 0))
     lrs = {g: v * args.lr_scale for g, v in
-           {"proj_noise": 1e-5, "fine": 3e-6, "middle": 1e-6, "coarse": 3e-7}.items()}
+           {"proj_noise": 1e-5, "fine": 3e-6, "middle": 1e-6, "coarse": 3e-7,
+            "cond": float(args.cond_lr)}.items()}
     groups = parameter_groups(model, args.rung, lrs)
     names = trainable_names(model)
     theta0 = snapshot_parameters(model)
@@ -1030,6 +1882,10 @@ def run(args) -> Dict:
     kw = dict(ng_hr=NG_HR, tile_hr=TILE, boxsize_mpc_h=BOXSIZE,
               dis_scale_mpc_h=float(scfg.dis_norm_kpc_h) * 1e-3,
               vel_scale_kms=float(pscfg.vel_norm_km_s))
+    if float(args.w_knn_unsup) > 0 or (bool(args.knn_measure) and unsup_train):
+        attach_knn_neighbours(list(unsup_train) + list(unsup_hold), cfg, args, kw,
+                              knn_cfg)
+        attach_knn_classes(list(unsup_train) + list(unsup_hold), args)
 
     # --- the optional HR critic (docs/sr2_gather_critic.md) -----------------
     # Default OFF (--w-adv 0): an unset run is byte-identical to the four arms.
@@ -1107,9 +1963,47 @@ def run(args) -> Dict:
               "--bound-penalty log are the two levers.", flush=True)
 
     def unsup_block() -> Dict:
-        """High-k on the unsupervised pools, the box-wide guard's own measure."""
-        return {"train": eval_unsup_highk(model, unsup_train, geom, device, args),
-                "holdout": eval_unsup_highk(model, unsup_hold, geom, device, args)}
+        """High-k on the unsupervised pools, the box-wide guard's own measure.
+
+        Plus the kNN-distance ratios under ``knn`` whenever the term is on or
+        ``--knn-measure`` asks for them, so an arm run WITHOUT the term can still
+        be read on the statistic an arm with it is trying to move.
+        """
+        out = {}
+        for side, pool in (("train", unsup_train), ("holdout", unsup_hold)):
+            block = eval_unsup_highk(model, pool, geom, device, args)
+            if block is not None and (float(args.w_knn_unsup) > 0
+                                      or bool(args.knn_measure)):
+                block["knn"] = eval_unsup_knn(model, pool, geom, device, args,
+                                              kw, knn_cfg,
+                                              class_ids=knn_cls)
+            out[side] = block
+        return out
+
+    # --- the fresh-noise eval (--fresh-noise-eval) --------------------------
+    # The 2x2. `train` and `holdout` are measured on the draw the run trains on;
+    # these two are the SAME pools under a reserved draw no step has ever seen.
+    #
+    # Reading it: if `train_fresh` falls back to `holdout`, the train/holdout gap
+    # was the fixed noise pattern being memorised, and the objective carries no
+    # more transferable signal than the holdout curve already shows. If
+    # `train_fresh` tracks `train`, the model learned something from the LR
+    # field and the gap is about boxes and hosts instead -- a completely
+    # different problem with a completely different fix.
+    fresh = fresh_draw_index(args)
+
+    def fresh_block(tag_hist=None):
+        if fresh is None:
+            return None
+        return {
+            "train_fresh": evaluate_pool(model, train_tasks, geom, kw, mcfg,
+                                         args, device, frozen, "train_fresh",
+                                         term_scale, draw=fresh),
+            "holdout_fresh": evaluate_pool(model, hold_tasks, geom, kw, mcfg,
+                                           args, device, frozen,
+                                           "holdout_fresh", term_scale,
+                                           draw=fresh),
+        }
 
     row0 = {
         "step": 0,
@@ -1123,6 +2017,7 @@ def run(args) -> Dict:
                                  device, frozen, "holdout", term_scale),
         "unsup": unsup_block(),
     }
+    row0.update(fresh_block() or {})
     hist.append(row0)
     metrics_p.write_text(json.dumps(row0) + "\n")
     log_wandb(row0, use_wandb)
@@ -1130,11 +2025,46 @@ def run(args) -> Dict:
           f"2T/|W| {row0['train']['virial']:.0f}, "
           f"high-k {row0['train']['highk_ratio']:.2f}x HR", flush=True)
 
+    # The starting pedestal, and the splits, BEFORE a single step. An arm that
+    # begins with the supervised sets already sitting in more non-member mass
+    # than HR has is starting inside the failure the isolation term is for, and
+    # that is worth knowing at step 0 rather than from a gate ten hours later.
+    for side in ("train", "holdout"):
+        blk = row0[side]
+        print(f"  {side:<8} iso {blk.get('iso_ratio', float('nan')):.2f}x HR "
+              f"({100 * blk.get('iso_above_hr', float('nan')):.0f}% of sets "
+              f"above it)")
+        for split in ("by_population", "by_env"):
+            parts = [f"{k} n={int(v['n'])} bound {v['bound_hard']:.3f} "
+                     f"iso {v['iso_ratio']:.2f}x"
+                     for k, v in (blk.get(split) or {}).items()
+                     if v.get("n", 0) > 0]
+            if parts:
+                print(f"    {split:<14} " + " | ".join(parts))
+    print(flush=True)
+
     order = list(range(len(train_tasks)))
+    gate_at = set(gate_steps(args))
     hps = max(1, int(args.hosts_per_step))
     sps = int(args.sets_per_step)
     hsps = int(args.host_sets_per_step)
     set_rng = random.Random(int(args.seed) + 1)
+    draw_rng = random.Random(int(args.seed) + 3)
+    n_train_draws = max(1, int(args.noise_draws))
+    n_shell = max(0, int(args.shell_noise_draws))
+
+    def shell_draws_for(primary: int) -> Tuple[int, ...]:
+        """The EXTRA draws the noise-averaged shell charges alongside ``primary``.
+
+        Drawn from the training draws only -- averaging over the reserved fresh
+        draw would train on the very realisation the fresh eval exists to hold
+        out, and the 2x2 would say nothing.
+        """
+        if n_shell <= 0 or n_train_draws <= 1:
+            return ()
+        others = [d for d in range(n_train_draws) if d != int(primary)]
+        return tuple(others[:n_shell])
+
     cursor = len(order)
     t0 = time.time()
 
@@ -1149,12 +2079,21 @@ def run(args) -> Dict:
                 cursor = 0
             task = train_tasks[order[cursor]]
             cursor += 1
+            # WHICH noise realisation this host sees this step. Rotating means
+            # a pattern that only fits one draw buys nothing on average, so the
+            # only way left to lower the loss is through the LR field -- which
+            # is the whole point (see `draw_seeds`). `fixed` keeps every arm
+            # before 2026-09-09 byte-identical.
+            draw = (draw_rng.randrange(n_train_draws)
+                    if str(args.noise_mode) == "rotate" else 0)
             loss, row = host_loss(model, task, geom, kw, mcfg, args, device,
                                   frozen, sample_sets(task, sps, set_rng),
                                   term_scale=term_scale, critic=critic,
                                   critic_norm=critic_norm, w_adv=w_adv,
                                   host_set_indices=sample_host_sets(
-                                      task, hsps, set_rng))
+                                      task, hsps, set_rng),
+                                  draw=draw,
+                                  shell_draws=shell_draws_for(draw))
             # Mean over the hosts in the step, so the gradient scale does not
             # depend on --hosts-per-step and the learning rate stays comparable.
             (loss / hps).backward()
@@ -1174,6 +2113,17 @@ def run(args) -> Dict:
             pen, _, _ = _unsup_bands(model, batch, geom, device, args)
             (float(args.w_highk_unsup) * pen).backward()
             unsup_pen = float(pen.detach())
+        # The box-wide kNN-distance support. Its own minibatch and its own
+        # backward, for the same reason as the hinge: the tape is freed before
+        # the next piece, and Adam sees the sum.
+        knn_pen = 0.0
+        if unsup_train and float(args.w_knn_unsup) > 0:
+            m = min(int(args.unsup_tiles_per_step), len(unsup_train))
+            batch = set_rng.sample(unsup_train, m) if m > 0 else unsup_train
+            pen, _ = _unsup_knn(model, batch, geom, device, args, kw, knn_cfg,
+                                class_ids=knn_cls)
+            (float(args.w_knn_unsup) * pen).backward()
+            knn_pen = float(pen.detach())
         if args.clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 [p for g in groups for p in g["params"]], float(args.clip))
@@ -1212,18 +2162,51 @@ def run(args) -> Dict:
                 "loss_R1": float(np.mean(r1_vals)) if r1_vals else None,
             }
 
+        # --- the early-gate snapshot -------------------------------------
+        # An IMMUTABLE copy, written at the requested step and never touched
+        # again, so a Rockstar gate can run CONCURRENTLY with the rest of
+        # training instead of waiting for it. `tuned.pt` cannot serve this:
+        # it is rewritten every eval, and a gate reading it would be racing
+        # the trainer for ~138 s of export.
+        #
+        # Why this is not a shortcut that costs anything: MEASURED on the
+        # three finished arms, the held-out objective is essentially done by
+        # step 2000 -- smallhalo bound_frac 0.0874 there against 0.0877 at
+        # 8000 (99.7%), selfhostguard 0.0950 against 0.0976 (97%), self
+        # 0.1202 against 0.1395 (86%). What keeps moving after 2000 is the
+        # high-k EXCESS -- smallhalo 1.52x -> 3.15x, self 1.92 -> 3.87,
+        # selfhostguard 2.02 -> 4.79 -- which is damage accumulating, not
+        # the objective improving. Training still runs to --steps; this only
+        # buys a read at hour ~2.7 instead of hour ~10.3.
+        if step in gate_at:
+            snap = out_dir / f"tuned_step{step}.pt"
+            save_atomic({
+                "model": {n: p.detach().cpu()
+                          for n, p in model.state_dict().items()},
+                "rung": args.rung,
+                "trained_names": names,
+                "cond": (ccfg.to_dict() if ccfg is not None else None),
+                "step": int(step),
+                "partial": True,
+                "snapshot": True,
+            }, snap)
+            print(f"  step {step:6d}  early-gate snapshot -> {snap.name} "
+                  "(training continues)", flush=True)
+
         if step % int(args.eval_every) == 0 or step == int(args.steps):
             row = {
                 "step": step,
                 "wall_s": time.time() - t0,
                 "batch_gather": float(np.mean([r["gather"] for r in acc])),
                 "batch_unsup_pen": unsup_pen,
+                "batch_unsup_knn": knn_pen,
                 "train": evaluate_pool(model, train_tasks, geom, kw, mcfg, args,
                                        device, frozen, "train", term_scale),
                 "holdout": evaluate_pool(model, hold_tasks, geom, kw, mcfg, args,
                                          device, frozen, "holdout", term_scale),
                 "unsup": unsup_block(),
             }
+            row.update(fresh_block() or {})
             if d_stat is not None:
                 row["adv"] = d_stat
             hist.append(row)
@@ -1238,18 +2221,19 @@ def run(args) -> Dict:
             # the final layout every eval so the gate can always load the latest
             # model; the post-loop write still adds param_drift and the summary.
             if step != int(args.steps):
-                torch.save({
+                save_atomic({
                     "model": {n: p.detach().cpu()
                               for n, p in model.state_dict().items()},
                     "rung": args.rung,
                     "trained_names": names,
+                    "cond": (ccfg.to_dict() if ccfg is not None else None),
                     "step": int(step),
                     "partial": True,
                 }, out_dir / "tuned.pt")
                 if critic is not None:
-                    torch.save({"critic": critic.state_dict(),
-                                "norm": critic_norm.to_dict(),
-                                "step": int(step)}, out_dir / "critic.pt")
+                    save_atomic({"critic": critic.state_dict(),
+                                 "norm": critic_norm.to_dict(),
+                                 "step": int(step)}, out_dir / "critic.pt")
 
             tr, ho = row["train"], row["holdout"]
             un = row.get("unsup") or {}
@@ -1262,11 +2246,16 @@ def run(args) -> Dict:
                   f" | D {d_stat['loss_D']:.3f} G_adv {d_stat['loss_G_adv']:.3f} "
                   f"(w {d_stat['w_adv']:.3g}, real {d_stat['critic_real_score']:.2f} "
                   f"fake {d_stat['critic_fake_score']:.2f})")
+            # The pedestal, held out. The one number that says whether the
+            # objects being built are being built INTO a pile -- the state
+            # that makes Rockstar file them as somebody's subhalos, and the
+            # thing no arm before this could see mid-run.
+            iso = f" iso {ho.get('iso_ratio', float('nan')):.2f}x"
             print(f"  step {step:6d}  loss {row['batch_gather']:.4f}  "
                   f"| train bound {tr['bound_hard']:.3f} "
                   f"2T/|W| {tr['virial']:.1f} dx {tr['centre_offset_radii']:.2f}r "
                   f"| hold bound {ho.get('bound_hard', float('nan')):.3f} "
-                  f"dx {ho.get('centre_offset_radii', float('nan')):.2f}r "
+                  f"dx {ho.get('centre_offset_radii', float('nan')):.2f}r{iso} "
                   f"| low_k {tr['low_k']:.4f} high-k {tr['highk_ratio']:.2f}x "
                   f"(max {tr['highk_ratio_max']:.2f}){us}{av}  [{row['wall_s']:.0f}s]",
                   flush=True)
@@ -1281,10 +2270,16 @@ def run(args) -> Dict:
     # gate, which regenerates whole boxes through that same loader; the rung
     # metadata rides alongside so what moved is still recoverable from the file.
     ckpt = out_dir / "tuned.pt"
-    torch.save({
+    save_atomic({
         "model": {n: p.detach().cpu() for n, p in model.state_dict().items()},
         "rung": args.rung,
         "trained_names": names,
+        # The conditioning config travels IN the checkpoint, not only in
+        # summary.json: a loader has to size `cond_chan` before it can load the
+        # state dict at all, so a checkpoint that cannot say how wide it is is
+        # one that gets loaded at the wrong width -- or, with `cond0` simply
+        # absent, silently loaded as the unconditioned control.
+        "cond": (ccfg.to_dict() if ccfg is not None else None),
         "step": int(args.steps),
         "param_drift_l2": drift,
     }, ckpt)
@@ -1373,6 +2368,11 @@ def log_result_wandb(summary: Dict, hist: List[Dict], train_tasks, hold_tasks,
 
         cols = ["key", "side", "log_mvir", "n_sets", "bound_hard_frozen",
                 "bound_hard_final", "bound_hard_delta", "centre_offset_radii",
+                # Per host, because the shell is a per-host question: a cluster
+                # whose sets all sit at 0.4 of their true radius is a different
+                # failure from one where the median hides two populations.
+                "radius_ratio_frozen", "radius_ratio_final",
+                "shell_resid_frozen", "shell_resid_final",
                 "highk_ratio", "low_k"]
         rows = []
         for side in ("train", "holdout"):
@@ -1386,8 +2386,10 @@ def log_result_wandb(summary: Dict, hist: List[Dict], train_tasks, hold_tasks,
                     (h["bound_hard"] - b0) if (b0 is not None
                                                and h.get("bound_hard") is not None)
                     else None,
-                    h.get("centre_offset_radii"), h.get("highk_ratio"),
-                    h.get("low_k"),
+                    h.get("centre_offset_radii"),
+                    z.get("radius_ratio"), h.get("radius_ratio"),
+                    z.get("shell_resid"), h.get("shell_resid"),
+                    h.get("highk_ratio"), h.get("low_k"),
                 ])
         if rows:
             wandb.log({"result/per_host": wandb.Table(columns=cols, data=rows)})
@@ -1405,6 +2407,7 @@ def verdict(first: Dict, last: Dict, args) -> Dict:
     The only question answered here is whether the run is worth gating.
     """
     tr0, tr1 = first["train"], last["train"]
+    report_rss("at the end of the run")
     ho1 = last["holdout"]
     # The high-k guard is OPTIMISED on the train pool, so a train-only verdict
     # asks whether the optimiser reached its own constraint -- not whether the
@@ -1495,6 +2498,46 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-log-mvir", type=float, default=13.5)
     ap.add_argument("--pool-only", action="store_true",
                     help="the shakeout: select, report and stop")
+    # --- the LR-host conditioning channel ------------------------------------
+    # Default EMPTY, which is the unconditioned control and is byte-identical to
+    # every run recorded before this option existed. See
+    # `cosmo_sr.features.lr_host_channel` for what the channels are and
+    # `radial-profile-is-flat-in-host-mass` for why a local operator needs them.
+    ap.add_argument(
+        "--cond-channels", default="",
+        help="comma list of LR-host conditioning channels to feed the "
+             "generator, e.g. 'r_over_rvir,log_mhost,valid'. EMPTY (default) "
+             "is the unconditioned control. The stack is built by "
+             "scripts/features/build_lr_host_channel.py and must already exist "
+             "for every box in --train-boxes and --holdout-boxes. Order is "
+             "significant and round-trips into the Rockstar gate's replay.")
+    ap.add_argument("--cond-mode", default="derived",
+                    choices=("derived", "membership"),
+                    help="how a Lagrangian site is assigned to an LR host. "
+                         "'derived' minimises r/R_vir and is defined "
+                         "everywhere; 'membership' uses the Rockstar "
+                         ".particles table, MEASURED as covered out to 2 R_vir "
+                         "(0.79-0.81 correct at 1-1.5 R_vir) and partial "
+                         "beyond. The two are close; this is a real A/B.")
+    ap.add_argument("--cond-min-hr-num-p", type=int, default=20000,
+                    help="LR hosts below this many HR-equivalent particles are "
+                         "not conditioned on. 20000 is where "
+                         "lr_host_fidelity measured the LR catalog channel "
+                         "stops working (57%% of region subhalos survive it).")
+    ap.add_argument("--cond-r-max-rvir", type=float, default=3.0,
+                    help="sites beyond this many R_vir of every gated host are "
+                         "marked invalid (the `valid` channel goes to 0)")
+    ap.add_argument("--cond-log-mhost-ref", type=float, default=13.0)
+    ap.add_argument("--cond-log-mhost-scale", type=float, default=1.0)
+    ap.add_argument("--cond-root", default="",
+                    help="directory holding <box>.npz conditioning fields; "
+                         "empty means $DMSR_REWARD_ROOT/lr_host_channel")
+    ap.add_argument(
+        "--cond-lr", type=float, default=1e-5,
+        help="learning rate for the conditioning columns, before --lr-scale. "
+             "Deliberately the largest group: cond0 starts at exactly ZERO and "
+             "has no pretrained function to protect, so a coarse-sized 3e-7 "
+             "would leave the channel wired in and inert for the whole run.")
     # --- the objective (mirrors free_field_gather.py) ------------------------
     ap.add_argument("--w-virial", type=float, default=1.0)
     ap.add_argument("--w-bound", type=float, default=1.0)
@@ -1547,14 +2590,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "same fact: it starts ~11x above its reference and "
                          "collapses 32x in the first 250 steps -- the steps "
                          "`bound` most needs.")
-    ap.add_argument("--centre-mode", choices=("full", "radial", "self"),
+    ap.add_argument("--centre-mode",
+                    choices=("full", "radial", "self", "self_tan"),
                     default="full",
                     help="what the centre term charges for. full: the whole "
                          "offset to the reachable HR centroid. radial: only its "
                          "clustercentric projection -- the 62.9%% of the offset "
                          "variance that is a signed infall deficit, dropping "
                          "the transverse part LR does not determine. self: "
-                         "re-anchor to the set's own frozen centroid.")
+                         "re-anchor to the set's own frozen centroid. self_tan: "
+                         "the same anchor with the radial direction projected "
+                         "OUT, which is what --w-radius should be paired with "
+                         "-- `self` pins the very radius the shell term is "
+                         "trying to move, and at equal weights the two settle "
+                         "at exactly half the correction.")
     ap.add_argument("--centre-dead-zone", type=float, default=0.0,
                     help="search radii inside which the centre term costs "
                          "nothing. The gate is a threshold at 1 radius, so cost "
@@ -1563,7 +2612,142 @@ def build_parser() -> argparse.ArgumentParser:
                     help="search radii beyond which the centre term is linear. "
                          "Frozen sets sit a median 5.6 radii out, where a "
                          "quadratic lets the hopeless sets own the gradient.")
+    # --- the shell: right distance from the host, any direction -------------
+    ap.add_argument("--w-radius", type=float, default=0.0,
+                    help="weight on the set's host-centric RADIUS matching the "
+                         "truth, with the direction left free. 0 = off, which "
+                         "is every arm so far. Targets the `self` arm's radial "
+                         "collapse: on held-out set9 its subhalos sit at a "
+                         "median 0.35 host R_vir against HR's 1.13, 6496 inside "
+                         "0.25 R_vir where HR has 593. The radius is 60%% of "
+                         "the frozen centre offset by magnitude and the half "
+                         "that is a rule (58%% of sets too close); the "
+                         "transverse half is noise no input predicts. Pair with "
+                         "--centre-mode self_tan.")
+    ap.add_argument(
+        "--w-isolation", type=float, default=0.0,
+        help="weight on the local background OCCUPANCY, hinged above HR: the "
+             "non-member mass sitting ON the object, counted on the SAME "
+             "particle ids in the candidate and in HR. 0 is off and is every "
+             "arm so far. It is the only INTER-set term in the loss, and the "
+             "reason it exists is that 'top-level' is an inter-set property: "
+             "Rockstar files a halo as a subhalo when some bigger halo's R_vir "
+             "contains its centre, which is not a property of its members at "
+             "all. Every other term is a moment about the set's own centroid, "
+             "so an intra-set loss pointed at top-level HR halos scores full "
+             "marks on an object that a pedestal then swallows -- measured, "
+             "set9: --population all built 3,374 net objects and Rockstar "
+             "filed every one as a subhalo (subs +4,260, top-level -886). "
+             "d6 does not close this: it normalises by the background's "
+             "DISPERSION, not its density.")
+    ap.add_argument("--iso-radius-frac", type=float, default=0.5,
+                    help="counting radius as a fraction of the background "
+                         "sphere (--bg-radius * the set's HR rms radius). Keep "
+                         "it below 1: the background ids are chosen once on the "
+                         "frozen field within --bg-radius, so a radius at the "
+                         "sampling edge counts an edge. Widen --bg-radius "
+                         "rather than this.")
+    ap.add_argument("--iso-softness", type=float, default=0.15,
+                    help="sigmoid width of the soft count, as a fraction of the "
+                         "counting radius.")
+    ap.add_argument("--iso-min-count", type=float, default=8.0,
+                    help="minimum HR soft count for a set to be CHARGED. Below "
+                         "it the ratio is shot noise and the term would be "
+                         "charging the run for the background sampler's seed; "
+                         "such sets are skipped and counted in n_iso.")
+    ap.add_argument(
+        "--w-shell", type=float, default=0.0,
+        help="weight on the DISTRIBUTION of the sets' host-centric radii: sort "
+             "the candidate and target radii of one host, pair by rank (the "
+             "1-D optimal transport map) and charge the log ratio. 0 is off. "
+             "It is --w-radius's post-mortem: that term charges each set "
+             "against ITS OWN target radius, and that address has an "
+             "out-of-sample R^2 of 0.022 on the 7,560-set pool, so the "
+             "selfshell run memorised it (train err 2.86 -> 1.32, held out "
+             "2.68 -> 2.81) and paid 55%% of the abundance for it (host "
+             "subhalos 367 -> 167 against HR's 374). Only the multiplicative "
+             "part transferred (held-out ratio 0.974 -> 0.987) and this term "
+             "asks for that and nothing else: the sort keeps the signed inward "
+             "bias intact while halving the magnitude. Pair with --centre-mode "
+             "self_tan, and read `shell_resid`, not `radius_err_radii`.")
+    ap.add_argument(
+        "--shell-dead-zone", type=float, default=0.02,
+        help="FRACTIONAL radius error the shell term treats as free, applied "
+             "as log1p(x) in log space. 0.02 charges 81%% / 78%% of sets "
+             "(train / holdout) against a sorted median residual of 0.079 / "
+             "0.064. Do not carry over --radius-dead-zone's reasoning: 0.05 "
+             "charges only 61%% / 55%% and eats most of a signal that is half "
+             "the size of the one that number was set against.")
+    ap.add_argument(
+        "--shell-quantiles", type=int, default=0,
+        help="reduce the sorted pairing to this many equal-COUNT quantile bins "
+             "and charge the bins' mean log radius. 0 (default) is the full "
+             "rank-by-rank pairing. Why the dial exists: the full pairing hands "
+             "the loss one degree of freedom per set (~134 for a big host), and "
+             "MEASURED 2026-09-08 the w_shell=30 arm drove its train residual "
+             "7.3x while holdout moved 1.4x. The low-order shape is what a "
+             "shared operator can carry; the rank-by-rank wiggle is what it can "
+             "only memorise. Try 3-5.")
+    ap.add_argument(
+        "--shell-eps-mpc-h", type=float, default=1e-2,
+        help="floor on both radii before the log, Mpc/h. On the candidate it "
+             "is a SOFTENED norm, sqrt(|d|^2 + eps^2), not a clamp: a clamp is "
+             "a gradient plateau below the floor and collapse toward the host "
+             "centre is the one place this term must not have one.")
+    ap.add_argument("--radius-dead-zone", type=float, default=1.0,
+                    help="search radii of slack: the radius term costs nothing "
+                         "this close to the truth. The ask is a SHELL, not an "
+                         "address, and the gate is a threshold at 1 radius. At "
+                         "the default 1.0, 79%% of frozen sets are still "
+                         "charged (median error 2.80 radii).")
+    ap.add_argument("--radius-huber-radii", type=float, default=0.0,
+                    help="search radii beyond which the radius term is linear. "
+                         "The p90 set is 8.2 radii out, where a quadratic "
+                         "charges 67 and the tail owns the batch gradient.")
     ap.add_argument("--min-num-p", type=int, default=200)
+    ap.add_argument(
+        "--population", choices=("sub", "top", "all"), default="sub",
+        help="WHICH halos the member loss is responsible for. 'sub' "
+             "(parent_ids >= 0) is every arm recorded so far and encodes an "
+             "assumption the held-out gate contradicts: in the edited region HR "
+             "resolves 3,775 top-level halos >=200p against base's 3,028, a "
+             "747-halo deficit OUTSIDE hosts that no supervised set has ever "
+             "pointed at. 'all' selects on size alone and lets the parent split "
+             "fall where it falls. Requires --max-num-p (see there).")
+    ap.add_argument(
+        "--max-num-p", type=int, default=0,
+        help="exclusive upper edge of the supervised num_p window; 0 is no "
+             "ceiling. REQUIRED with --population top/all: without it the "
+             "selection includes the cluster host itself, whose O(N^2) pair sum "
+             "is ~100k particles (1e10 pairs against a 200p set's 2e4) and whose "
+             "HR reference asks the generator to concentrate a 1e14 halo -- a "
+             "different objective, and one --w-host-sets already handles against "
+             "the FROZEN reference.")
+    ap.add_argument(
+        "--env-select", default="any",
+        help="WHICH environment the supervised sets come from: 'any' (every arm "
+             "so far), or a comma list of inside/near/field -- distance to the "
+             "nearest bigger resolved host, in its R_vir. This is the third "
+             "selection axis after population and mass, and the set9 census "
+             "says it is the one that was missing: of the region's 11,698 "
+             "missing objects 6,557 sit in 'near' (the infall region) and the "
+             "small-halo arm closed 249 of them, 3.8%%, while OVERSHOOTING HR "
+             "in 'field' (subhalos 3,316 against HR's 2,466). 'near' is inside "
+             "a cluster's own Lagrangian tiles, so it is reachable by changing "
+             "the selection; 'field' would need a wider --n-tiles.")
+    ap.add_argument(
+        "--env-host-floor", type=int, default=200,
+        help="particle floor for a halo to count as a 'resolved host' when "
+             "labelling environments. 200 is the census's and the number every "
+             "host count quoted in this line uses.")
+    ap.add_argument(
+        "--set-select", choices=("largest", "random", "stratified"),
+        default="largest",
+        help="how --max-sets chooses when it binds. 'largest' is the historical "
+             "default and is a trap for a mass-window run: the pool is a mass "
+             "function, so it keeps the top of it and drops exactly the small "
+             "halos the run exists to build. 'stratified' fills log2(n_sites) "
+             "bins round-robin.")
     ap.add_argument("--min-purity", type=float, default=0.5)
     ap.add_argument("--min-live-frac", type=float, default=0.5)
     ap.add_argument("--max-sets", type=int, default=256)
@@ -1601,12 +2785,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "k >= --k-split into that many log bins and charges "
                          "each equally, so a 3x excess at the 4-8 h/Mpc "
                          "subhalo scale costs what a 3x excess at Nyquist "
-                         "costs. It does not on the scalar: that band is 5.7% "
+                         "costs. It does not on the scalar: that band is 5.7%% "
                          "of the modes and the mean is unweighted")
     ap.add_argument("--highk-k-max", type=float, default=0.0,
                     help="upper k for the bands; 0 (default) runs to the cube "
                          "corner, matching the scalar's mask. pi/dx = 16.08 "
-                         "drops the 48% of the guard's modes that sit ABOVE "
+                         "drops the 48%% of the guard's modes that sit ABOVE "
                          "Nyquist, where a shell is only the cube's corners")
     ap.add_argument("--highk-tol", type=float, default=0.0,
                     help="dead zone, as a factor either side of HR. The "
@@ -1667,6 +2851,52 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--w-highk-unsup", type=float, default=0.0,
                     help="weight on the box-wide high-k hinge. 0 (default) only "
                          "builds/measures the pool; >0 adds it to the loss")
+    # --- the kNN-distance support (src/cosmo_sr/features/knn_cdf.py) --------
+    # Default OFF (--w-knn-unsup 0). Grid-free, catalog-free, on the same
+    # unsupervised pool as the high-k hinge. Read the module docstring before
+    # changing --knn-ks: the largest rank decides halo vs fragments.
+    ap.add_argument("--w-knn-unsup", type=float, default=0.0,
+                    help="weight on the kNN log-distance distribution match on the "
+                         "unsupervised tiles. 0 (default) is off; requires "
+                         "--unsup-tiles-per-box > 0")
+    ap.add_argument("--knn-ks", type=int, nargs="+", default=[8, 32, 64, 128],
+                    help="neighbour ranks. Keep max >= the particle count of the "
+                         "smallest object to build (measured: k<=8 fragments)")
+    ap.add_argument("--knn-queries", type=int, default=1024,
+                    help="query particles per tile per evaluation")
+    ap.add_argument("--knn-quantiles", type=int, default=64,
+                    help="equal-count bins of the sorted pairing; 0 = full pairing")
+    ap.add_argument("--knn-dead-zone", type=float, default=0.02,
+                    help="fractional r_k error that costs nothing")
+    ap.add_argument("--knn-buffer-cells", type=float, default=0.0,
+                    help="Eulerian buffer inside the query cube. 0 by default "
+                         "because the neighbour margin below does that job; job "
+                         "49259 measured that a buffer ALONE cannot (p95 +62-80%% "
+                         "at every buffer to 16 cells)")
+    ap.add_argument("--knn-nbr-margin-cells", type=float, default=8.0,
+                    help="offer other tiles' particles within this many cells "
+                         "beyond the tile as constant candidates (frozen box for "
+                         "the candidate, HR box for the reference). 0 = own tile "
+                         "only. SET FROM knn_cdf_split_diagnostic.py")
+    ap.add_argument("--knn-centre", choices=("centroid", "lagrangian"),
+                    default="centroid",
+                    help="query cube on the tile particles' circular-mean centroid "
+                         "(default) or on the tile's Lagrangian centre (round 1)")
+    ap.add_argument("--knn-phase-lambda", type=float, default=0.0,
+                    help="km/s per Mpc/h; > 0 measures kNN in 6D on (x, v/lambda). "
+                         "MEASURED (round 5b): 4000 ranks the working set9 arms at "
+                         "rho -0.65 vs -0.23 for position only. 0 = rounds 1-4")
+    ap.add_argument("--knn-classes", nargs="*", default=[],
+                    help=f"HR owner classes to charge the term on, from "
+                         f"{list(OWNER_CLASSES)}; empty = the pooled form. "
+                         "MEASURED (round 5b): hosts belong in the MONITOR, not "
+                         "the loss -- the working arms gain subhalos by "
+                         "over-concentrating hosts in phase space (rho +0.91)")
+    ap.add_argument("--knn-one-sided", action="store_true",
+                    help="charge only under-clumping (default: two-sided)")
+    ap.add_argument("--knn-measure", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="report unsup kNN ratios at every eval even at weight 0")
     ap.add_argument("--unsup-highk-max", type=float, default=0.0,
                     help="verdict gate on the worst band over the HELD-OUT "
                          "unsupervised tiles -- the box-wide guard's own "
@@ -1731,9 +2961,54 @@ def build_parser() -> argparse.ArgumentParser:
                          "noisy estimate of a SHARED operator's gradient")
     ap.add_argument("--clip", type=float, default=1.0)
     ap.add_argument("--eval-every", type=int, default=250)
+    ap.add_argument(
+        "--gate-at-steps", default="",
+        help="comma list of steps at which to freeze an IMMUTABLE "
+             "tuned_step<N>.pt, so a Rockstar gate can run CONCURRENTLY with "
+             "the rest of training. Empty (default) writes none. It costs the "
+             "run nothing -- training still goes to --steps -- and it is not a "
+             "shortcut that gives up the arm's potential: MEASURED on three "
+             "finished arms, the held-out objective is ~97-100%% of its final "
+             "value by step 2000 (smallhalo bound_frac 0.0874 there vs 0.0877 "
+             "at 8000), and what keeps moving afterwards is the high-k EXCESS "
+             "(1.52x -> 3.15x), i.e. damage, not gain. The gate itself is ~19 "
+             "min, 3%% of a 10 h train.")
     ap.add_argument("--n-bins", type=int, default=24)
     ap.add_argument("--label", default="")
     ap.add_argument("--seed", type=int, default=0)
+    # --- the noise realisation (docs/sr2_member_gather_training.md) ----------
+    ap.add_argument(
+        "--noise-draws", type=int, default=1,
+        help="how many NOISE realisations per tile the run may train on. 1 "
+             "(default) is the single fixed draw every arm before 2026-09-09 "
+             "used. Each extra draw costs one frozen forward and one full "
+             "reference build per host at pool time, and holds its own set "
+             "table (centre_self and the hybrid reference are functions of the "
+             "frozen field, so a draw that borrowed draw 0's anchor would "
+             "charge the run for realisation scatter).")
+    ap.add_argument(
+        "--noise-mode", default="fixed", choices=("fixed", "rotate"),
+        help="'fixed' always uses draw 0. 'rotate' picks one of the "
+             "--noise-draws per host per step, which removes the fixed noise "
+             "pattern as a memorisable input channel: MEASURED 2026-09-08, the "
+             "w_shell=30 arm drove its train residual 7.3x while holdout moved "
+             "1.4x, and a constant (LR, noise) pair for 8000 steps is the "
+             "obvious way that happens.")
+    ap.add_argument(
+        "--fresh-noise-eval", action="store_true",
+        help="reserve ONE extra draw that no step ever trains on, and evaluate "
+             "both pools under it as 'train_fresh' / 'holdout_fresh'. This is "
+             "the 2x2 over (seen box, seen noise) that says whether the "
+             "train/holdout gap is memorised noise or a box/host gap.")
+    ap.add_argument(
+        "--shell-noise-draws", type=int, default=0,
+        help="charge the soft shell on the MEAN reduced radius curve over this "
+             "many extra draws instead of on the primary draw alone. "
+             "Mean-then-charge, not charge-then-mean: the first asks for a "
+             "distribution no single realisation can fake, the second is just a "
+             "lower-variance version of the same per-realisation objective. "
+             "Only the radii are recomputed on the extra draws, never the N^2 "
+             "statistics. Requires --noise-draws > 1.")
     ap.add_argument("--device", default="")
     ap.add_argument("--no-wandb", action="store_true",
                     help="disable Weights & Biases logging for this run "
@@ -1743,8 +3018,100 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def validate(args) -> None:
+    """Refusals that are always a configuration error, checked before the pool.
+
+    Building the pool is one 537 MB owner-array load and a CSR inversion per box
+    -- minutes of a GPU allocation -- so a config that cannot mean what it says
+    is refused here rather than discovered in an OOM or in a metrics file.
+    """
+    # --- the conditioning channel ------------------------------------------
+    # Parsing catches a typo'd channel name; the existence check catches the
+    # far more expensive case of a run that trains for ten hours against a
+    # stack built under different settings, or against no stack at all.
+    ccfg = cond_config_of(args)
+    if ccfg is not None:
+        boxes = [b for b in
+                 (str(args.train_boxes) + " " + str(args.holdout_boxes))
+                 .replace(",", " ").split() if b]
+        for b in boxes:
+            path = channel_field_path(b, str(args.cond_root) or None)
+            if not path.is_file():
+                raise SystemExit(
+                    f"--cond-channels is set but {path} does not exist. Build "
+                    f"the conditioning fields first:\n"
+                    f"    CH_BOXES='{' '.join(boxes)}' bash "
+                    f"scripts/slurm/submit_lr_host_channel.sh")
+            load_channel_field(path, ccfg)      # raises on a settings mismatch
+    if float(args.cond_lr) <= 0.0 and ccfg is not None:
+        raise SystemExit(
+            f"--cond-lr {args.cond_lr} freezes the conditioning columns at "
+            "their zero init, which makes this run the unconditioned control "
+            "under the conditioned arm's name. Drop --cond-channels instead.")
+
+    if args.population != "sub" and int(args.max_num_p) <= 0:
+        raise SystemExit(
+            f"--population {args.population} without --max-num-p selects the "
+            "cluster host itself as a supervised set. Its pair sum is ~100k "
+            "particles (1e10 pairs against a 200p set's 2e4) and its HR "
+            "reference asks the generator to CONCENTRATE a 1e14 halo -- a "
+            "different objective from this one, and one --w-host-sets already "
+            "handles against the frozen reference. Pass an explicit ceiling, "
+            "e.g. --max-num-p 2000.")
+    if int(args.max_num_p) and int(args.max_num_p) <= int(args.min_num_p):
+        raise SystemExit(
+            f"--max-num-p {args.max_num_p} is not above --min-num-p "
+            f"{args.min_num_p}; the window is empty.")
+    if args.population != "sub" and args.centre_mode in ("radial", "self_tan"):
+        # `radial` projects the centre offset onto the direction from the
+        # CLUSTER to the set. For a top-level halo far out in the same tiles
+        # that direction is still defined, but the term's whole justification --
+        # 62.9% of a SATELLITE's offset is radial about its host, measured over
+        # 7,560 sets in centre_offset/pool/offsets.json -- was measured on
+        # subhalos only and is not established for the field population.
+        print(f">>> WARNING: --centre-mode {args.centre_mode} with "
+              f"--population {args.population}. The radial decomposition that "
+              "motivates it was measured on SUBHALOS about their own host; for "
+              "a field halo the cluster is not its host and the direction "
+              "carries no such claim. Continuing.", flush=True)
+
+    # --- the environment axis -----------------------------------------------
+    sel = str(args.env_select).strip()
+    if sel not in ("", "any", "all"):
+        bad = [w.strip() for w in sel.split(",")
+               if w.strip() and w.strip() not in ENV_LABELS]
+        if bad:
+            raise SystemExit(
+                f"--env-select {args.env_select!r} names unknown environments "
+                f"{bad}; expected 'any' or a comma list of {list(ENV_LABELS)}.")
+        if args.population == "sub" and sel == "field":
+            # Not fatal, but it is almost certainly not the run that was meant:
+            # a `field` SUBHALO is a satellite of a host below --env-host-floor,
+            # a small and peculiar population, and the census's field deficit is
+            # a TOP-LEVEL one.
+            print(">>> WARNING: --env-select field with --population sub selects "
+                  "satellites of hosts below --env-host-floor, not the isolated "
+                  "field halos the census's `field` deficit is about (that "
+                  "deficit is top-level). Add --population all if the field "
+                  "halos themselves are the target. Continuing.", flush=True)
+    if float(args.w_isolation) > 0.0 and int(args.bg_k) <= 0:
+        raise SystemExit(
+            "--w-isolation > 0 with --bg-k 0: the isolation term counts LOCAL "
+            "NON-MEMBER particles and --bg-k 0 gathers none, so the term would "
+            "be identically zero and the run would be a --w-isolation 0 run "
+            "under another name. Pass --bg-k (default 4096).")
+    if not (0.0 < float(args.iso_radius_frac) < 1.0):
+        raise SystemExit(
+            f"--iso-radius-frac {args.iso_radius_frac} is not in (0, 1). The "
+            "background ids are chosen ONCE, on the frozen field, inside "
+            "--bg-radius; a counting radius at or beyond that edge counts the "
+            "sampling boundary rather than the neighbourhood. Widen --bg-radius "
+            "instead.")
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    validate(args)
 
     s = run(args)
     return 0 if s.get("ok") else 1

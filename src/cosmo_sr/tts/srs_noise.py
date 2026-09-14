@@ -57,6 +57,7 @@ __all__ = [
     "STAGE_NAMES",
     "STAGE_SITES",
     "flatten_noise",
+    "load_cond_state_dict",
     "load_controlled_generator",
     "noise_site_layout",
     "site_shapes",
@@ -195,7 +196,7 @@ class ControlledG(nn.Module):
 
     def __init__(self, in_chan: int, out_chan: int, scale_factor: int = 16,
                  chan_base: int = 512, chan_min: int = 64, chan_max: int = 512,
-                 cat_noise: bool = False):
+                 cat_noise: bool = False, cond_chan: int = 0):
         super().__init__()
         self.scale_factor = int(scale_factor)
         self.num_blocks = round(log2(self.scale_factor))
@@ -205,10 +206,64 @@ class ControlledG(nn.Module):
         def chan(b: int) -> int:
             return min(max(chan_base >> b, chan_min), chan_max)
 
+        self.in_chan = int(in_chan)
+        self.cond_chan = int(cond_chan)
+        if self.cond_chan < 0:
+            raise ValueError(f"cond_chan must be >= 0, got {cond_chan}")
+
         self.block0 = nn.Sequential(nn.Conv3d(in_chan, chan(0), 1), nn.LeakyReLU(0.2, True))
+        # The conditioning columns of the input embedding, held as a SEPARATE
+        # 1x1 conv rather than by widening `block0.0`. Algebraically identical
+        # -- a 1x1 conv on `cat([x, cond])` is conv(x) + conv(cond) -- and the
+        # separation buys the two things this line actually needs:
+        #
+        #   * the pretrained state dict still loads with every original key
+        #     matching exactly, so a mis-sized checkpoint still raises;
+        #   * the conditioning weights are their own parameter tensor, so they
+        #     can be unfrozen at every rung. Widening `block0.0.weight` would
+        #     have put them in `block0.`, which only rung `full` trains -- the
+        #     channel would have been wired in and then held at its zero init.
+        #
+        # Zero-init (and no bias) is load-bearing, not tidiness: at step 0 the
+        # conditioned generator is bit-identical to the frozen one, which every
+        # baseline comparison in this pipeline assumes.
+        self.cond0 = (nn.Conv3d(self.cond_chan, chan(0), 1, bias=False)
+                      if self.cond_chan else None)
+        if self.cond0 is not None:
+            nn.init.zeros_(self.cond0.weight)
+
         self.blocks = nn.ModuleList(
             SkipBlock(chan(b), chan(b + 1), out_chan, cat_noise) for b in range(self.num_blocks)
         )
+
+    # -- conditioning ------------------------------------------------------ #
+    def _embed(self, x: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+        """``block0`` with the conditioning columns folded in before the ReLU."""
+        if self.cond0 is None:
+            if cond is not None:
+                raise ValueError(
+                    "cond was supplied but this generator was built with "
+                    "cond_chan=0, so it has no conditioning columns and would "
+                    "have ignored it"
+                )
+            return self.block0(x)
+        if cond is None:
+            raise ValueError(
+                f"this generator was built with cond_chan={self.cond_chan} and "
+                "needs a conditioning stack; pass cond=..."
+            )
+        if cond.shape[1] != self.cond_chan:
+            raise ValueError(
+                f"cond has {cond.shape[1]} channels, expected {self.cond_chan}"
+            )
+        if tuple(cond.shape[2:]) != tuple(x.shape[2:]):
+            raise ValueError(
+                f"cond spatial shape {tuple(cond.shape[2:])} != input "
+                f"{tuple(x.shape[2:])}; the channel crop and the LR crop must "
+                "be the same tile, padding included"
+            )
+        h = self.block0[0](x) + self.cond0(cond.to(dtype=x.dtype))
+        return self.block0[1](h)
 
     # -- noise plumbing ---------------------------------------------------- #
     def _resolve(self, noise) -> List[Optional[torch.Tensor]]:
@@ -237,17 +292,23 @@ class ControlledG(nn.Module):
             raise ValueError(f"expected {n_sites} noise tensors, got {len(seq)}")
         return seq
 
-    def forward(self, x: torch.Tensor, noise=None, record: bool = False):
+    def forward(self, x: torch.Tensor, noise=None, record: bool = False,
+                cond: Optional[torch.Tensor] = None):
         """``y`` (and, if ``record``, the ``{site: z}`` dict actually used).
 
         ``noise`` may be ``None`` (sample internally), a length-6 sequence, a
         ``{'coarse': [z0, z1], 'middle': [...], 'fine': [...]}`` dict, or a
         ``{'z3': ...}`` dict naming individual sites. Sites left as ``None`` are
         sampled from ``torch.randn_like`` exactly as upstream does.
+
+        ``cond`` is the ``(B, cond_chan, *x.shape[2:])`` conditioning stack. It
+        is required when the model was built with ``cond_chan > 0`` and refused
+        when it was not: silently ignoring a channel stack would train the arm
+        as its own control and report it as the arm.
         """
         zs = self._resolve(noise)
         y = x
-        x = self.block0(x)
+        x = self._embed(x, cond)
         used: List[torch.Tensor] = []
         for b, block in enumerate(self.blocks):
             x, y, za, zb = block(x, y, zs[2 * b], zs[2 * b + 1])
@@ -348,6 +409,36 @@ def unflatten_noise(seq: Sequence[torch.Tensor]) -> Dict[str, torch.Tensor]:
 # --------------------------------------------------------------------------- #
 # Checkpoint loading
 # --------------------------------------------------------------------------- #
+def load_cond_state_dict(G: ControlledG, sd: Dict[str, torch.Tensor]) -> None:
+    """``G.load_state_dict`` that tolerates a MISSING ``cond0`` and nothing else.
+
+    The pretrained SR2 checkpoint predates the conditioning columns, so loading
+    it into a ``cond_chan > 0`` generator has exactly one missing key. Rather
+    than reach for ``strict=False`` -- which would also swallow a renamed block,
+    a wrong ``scale_factor`` or a checkpoint from a different architecture --
+    the missing set is checked to be precisely ``{cond0.weight}`` and the
+    unexpected set to be empty. Anything else raises, as ``strict=True`` would.
+
+    A checkpoint that DOES carry ``cond0.weight`` (a conditioned run's own
+    ``tuned.pt``) loads it, so a resumed or exported run keeps its trained
+    columns instead of silently restarting them at zero.
+    """
+    missing, unexpected = G.load_state_dict(sd, strict=False)
+    allowed = {"cond0.weight"} if G.cond0 is not None else set()
+    bad_missing = [k for k in missing if k not in allowed]
+    if bad_missing or unexpected:
+        raise RuntimeError(
+            f"checkpoint does not match this generator: missing {bad_missing}, "
+            f"unexpected {list(unexpected)}"
+        )
+    if missing and G.cond0 is not None:
+        # Say it out loud. A run that thinks it resumed trained conditioning
+        # weights, but actually got zeros, is a control wearing the arm's name.
+        print("  cond0 not in the checkpoint: conditioning columns start at "
+              "ZERO, so the model is bit-identical to frozen at step 0",
+              flush=True)
+
+
 def load_controlled_generator(
     model_path,
     in_chan: int = 6,
@@ -355,6 +446,7 @@ def load_controlled_generator(
     scale_factor: int = 8,
     device=None,
     eval_mode: bool = True,
+    cond_chan: int = 0,
     **chan_kwargs,
 ) -> ControlledG:
     """Load ``SRmodel/G_z0.pt`` (or ``G_z2.pt``) into a :class:`ControlledG`.
@@ -362,6 +454,10 @@ def load_controlled_generator(
     No dependency on ``external/SRS-map2map`` at all -- the checkpoint is a plain
     ``{'epoch', 'model'}`` dict and the key layout is reproduced here, so this
     avoids the ``sys.path`` juggling that :mod:`cosmo_sr.eval.baseline_srs` needs.
+
+    ``cond_chan > 0`` adds the zero-initialised conditioning columns; see
+    :func:`load_cond_state_dict` for what that does to the strictness of the
+    load, and :class:`ControlledG` for why they are a separate tensor.
     """
     import os
 
@@ -372,8 +468,9 @@ def load_controlled_generator(
         state = torch.load(os.fspath(model_path), map_location="cpu", weights_only=False)
     sd = state["model"] if isinstance(state, dict) and "model" in state else state
 
-    G = ControlledG(in_chan, out_chan, scale_factor, **chan_kwargs)
-    G.load_state_dict(sd, strict=True)   # raises on any key/shape mismatch
+    G = ControlledG(in_chan, out_chan, scale_factor, cond_chan=int(cond_chan),
+                    **chan_kwargs)
+    load_cond_state_dict(G, sd)          # raises on any key/shape mismatch
     G.to(device)
     if eval_mode:
         G.eval()

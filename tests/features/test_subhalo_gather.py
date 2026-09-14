@@ -327,6 +327,89 @@ def test_top_level_selects_hosts_and_default_selects_subhalos():
     assert int(host["tile"][0]) == 0
 
 
+def _pop_catalog_and_owner():
+    """One host (4000p), one satellite (200p) and one isolated field halo (300p).
+
+    The field halo is the object every arm so far has been blind to: top-level,
+    small, and homing in the same tiles as the cluster's material.
+    """
+    ng, tile = 16, 8
+    ids = np.array([10, 11, 12], dtype=np.int64)
+    cat = HaloCatalog(
+        ids=ids, parent_ids=np.array([-1, 10, -1], dtype=np.int64),
+        mvir=np.array([1e14, 1e12, 2e12]),
+        rvir=np.array([1000.0, 200.0, 250.0]), vmax=np.zeros(3),
+        pos=np.array([[10.0, 10.0, 10.0], [11.0, 11.0, 11.0], [12.0, 12.0, 12.0]]),
+        vel=np.zeros((3, 3)), num_p=np.array([4000, 200, 300], dtype=np.int64))
+    owner = np.full(ng ** 3, -1, dtype=np.int64)
+
+    def flat(x, y, z):
+        return (x * ng + y) * ng + z
+
+    for k in range(8):
+        owner[flat(0, 0, k)] = 10
+        owner[flat(1, 1, k)] = 11
+        owner[flat(2, 2, k)] = 12
+    return cat, build_owner_index(owner), ng, tile
+
+
+def test_population_all_selects_both_halves_of_the_catalog():
+    """The small-halo arm's one line: select on SIZE, not on the parent split.
+
+    ``sub`` and ``top`` are the two halves and neither of them is the small-halo
+    population -- an isolated 300p field halo and a 200p satellite are the same
+    object to the member loss, and only ``all`` sees both.
+    """
+    cat, oidx, ng, tile = _pop_catalog_and_owner()
+    kw = dict(ng_hr=ng, tile_hr=tile, min_num_p=50)
+    got = {p: set(subhalo_home_tiles(cat, oidx, population=p, **kw)["halo_id"]
+                  .tolist())
+           for p in ("sub", "top", "all")}
+    assert got["sub"] == {11}
+    assert got["top"] == {10, 12}
+    assert got["all"] == {10, 11, 12}
+
+
+def test_max_num_p_keeps_the_cluster_out_of_a_small_halo_selection():
+    """Without a ceiling ``all`` selects the 4000p host itself, whose O(N^2)
+    pair sum and whose HR reference are both a different objective."""
+    cat, oidx, ng, tile = _pop_catalog_and_owner()
+    kw = dict(ng_hr=ng, tile_hr=tile, min_num_p=50, population="all")
+    assert set(subhalo_home_tiles(cat, oidx, **kw)["halo_id"].tolist()) \
+        == {10, 11, 12}
+    windowed = subhalo_home_tiles(cat, oidx, max_num_p=1000, **kw)
+    assert set(windowed["halo_id"].tolist()) == {11, 12}   # the host is gone
+    # And the window is exclusive at the top: 300 < 301, 300 !< 300.
+    assert set(subhalo_home_tiles(cat, oidx, max_num_p=300, **kw)["halo_id"]
+               .tolist()) == {11}
+
+
+def test_home_tiles_carry_num_p_and_parent_id():
+    """A ``population='all'`` pool that does not report the mix is
+    indistinguishable from a subhalo-only pool in every downstream artifact."""
+    cat, oidx, ng, tile = _pop_catalog_and_owner()
+    home = subhalo_home_tiles(cat, oidx, ng_hr=ng, tile_hr=tile, min_num_p=50,
+                              population="all")
+    by_id = {int(h): i for i, h in enumerate(home["halo_id"])}
+    assert int(home["num_p"][by_id[12]]) == 300
+    assert int(home["parent_id"][by_id[12]]) == -1     # top-level
+    assert int(home["parent_id"][by_id[11]]) == 10     # a satellite of 10
+
+
+def test_top_level_and_population_may_not_disagree():
+    cat, oidx, ng, tile = _pop_catalog_and_owner()
+    with pytest.raises(ValueError, match="contradicts"):
+        subhalo_home_tiles(cat, oidx, ng_hr=ng, tile_hr=tile, min_num_p=50,
+                           top_level=True, population="sub")
+
+
+def test_an_empty_num_p_window_is_refused_rather_than_silently_empty():
+    cat, oidx, ng, tile = _pop_catalog_and_owner()
+    with pytest.raises(ValueError, match="window is empty"):
+        subhalo_home_tiles(cat, oidx, ng_hr=ng, tile_hr=tile, min_num_p=200,
+                           max_num_p=200, population="all")
+
+
 def test_home_tile_is_the_plurality_tile_and_purity_is_reported():
     cat, oidx = _toy_catalog_and_owner()
     home = subhalo_home_tiles(cat, oidx, ng_hr=16, tile_hr=8, min_num_p=50)

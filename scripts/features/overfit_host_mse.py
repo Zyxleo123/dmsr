@@ -86,6 +86,9 @@ from cosmo_sr.eval.rockstar import load_rockstar_ascii  # noqa: E402
 from cosmo_sr.features import (  # noqa: E402
     flat_to_sites, hann_window, radial_cross_spectra,
 )
+from cosmo_sr.features.lr_host_channel import (  # noqa: E402
+    LRHostChannelConfig, channel_field_path, load_channel_field, tile_cond_crop,
+)
 from cosmo_sr.reward.soft_structure import (  # noqa: E402
     density_from_disp, feature_names, soft_structure_features,
 )
@@ -196,9 +199,52 @@ def tile_hr_target(hr_field, tile_id: int, geom) -> np.ndarray:
                                iz * s:(iz + 1) * s], dtype=np.float32)
 
 
+def cond_config_of(args):
+    """``LRHostChannelConfig`` for a run, or ``None`` when unconditioned.
+
+    ``--cond-channels ""`` (the default) means no conditioning at all and every
+    caller of :func:`build_tiles` behaves exactly as it did before this option
+    existed. That is the control arm, and it has to stay byte-identical.
+    """
+    spec = str(getattr(args, "cond_channels", "") or "")
+    if not spec.strip():
+        return None
+    return LRHostChannelConfig(
+        channels=spec,
+        mode=str(getattr(args, "cond_mode", "derived")),
+        min_hr_num_p=int(getattr(args, "cond_min_hr_num_p", 20000)),
+        r_max_rvir=float(getattr(args, "cond_r_max_rvir", 3.0)),
+        log_mhost_ref=float(getattr(args, "cond_log_mhost_ref", 13.0)),
+        log_mhost_scale=float(getattr(args, "cond_log_mhost_scale", 1.0)),
+    )
+
+
+#: One in-process cache per (box, config) so a pool build over many hosts of the
+#: same box does not re-read and re-check the same 64^3 stack for every host.
+_COND_CACHE = {}
+
+
+def load_cond_field(box, ccfg, args):
+    """The box's whole-box conditioning stack, checked against ``ccfg``."""
+    if ccfg is None:
+        return None
+    root = str(getattr(args, "cond_root", "") or "")
+    key = (str(box), root, json.dumps(ccfg.to_dict(), sort_keys=True))
+    if key not in _COND_CACHE:
+        path = channel_field_path(box, root or None)
+        field, _stored, meta = load_channel_field(path, ccfg)
+        print(f"  conditioning field {path.name}: {field.shape[0]} channels, "
+              f"valid fraction {meta.get('valid_fraction', float('nan')):.3f}, "
+              f"{meta.get('n_hosts_gated', '?')} gated LR hosts", flush=True)
+        _COND_CACHE[key] = field
+    return _COND_CACHE[key]
+
+
 def build_tiles(box, tiles, cfg, geom, device, args):
     lr = load_lr(cfg, box)
     hr = load_hr(cfg, box)
+    ccfg = cond_config_of(args)
+    cond = load_cond_field(box, ccfg, args)
     out = {}
     for t in tiles:
         if t < 0:
@@ -209,7 +255,43 @@ def build_tiles(box, tiles, cfg, geom, device, args):
             "noise": tile_noise_stack([args.seed], t, geom, device=device),
             "hr": torch.from_numpy(tile_hr_target(hr, t, geom)).to(device),
         }
+        if cond is not None:
+            out[t]["cond"] = torch.from_numpy(np.ascontiguousarray(
+                tile_cond_crop(cond, t, geom))).float().to(device)
     return out
+
+
+def stack_cond(data, tiles, model=None):
+    """``(T, C, ...)`` conditioning for a tile list, or ``None``.
+
+    ``None`` in two cases, and the second one is the whole reason this takes a
+    model. ONE data dict is fed to BOTH generators on every step of a
+    conditioned run -- the tuned candidate and the frozen reference -- and the
+    frozen reference is deliberately built with ``cond_chan=0``, because it is
+    the deployed SR2 and every baseline in this pipeline is a difference against
+    it. So whether the stack is consumed is a property of the MODEL, not of the
+    tile data:
+
+      * no ``cond`` in the data  -> None (an unconditioned run)
+      * ``model.cond_chan == 0``  -> None (the frozen reference of a conditioned
+        run; feeding it channels it has no columns for is an error, and job
+        47460 died exactly there)
+
+    The safety property is kept, not traded away: a model WITH columns and data
+    WITHOUT a stack still returns None here and ``ControlledG._embed`` still
+    raises. Silently training a conditioned arm as its own control remains
+    impossible.
+
+    Note what is NOT here: a draw axis. The conditioning is a property of the
+    tile, not of the noise realisation, so every draw of a tile sees the same
+    stack -- which is also what makes the whole-box replay in
+    ``super_resolve_srs_seeded`` the same function as this one.
+    """
+    if "cond" not in data[tiles[0]]:
+        return None
+    if model is not None and int(getattr(model, "cond_chan", 0)) == 0:
+        return None
+    return torch.stack([data[t]["cond"] for t in tiles], dim=0)
 
 
 def forward_tiles(model, data, tiles, geom):
@@ -217,7 +299,8 @@ def forward_tiles(model, data, tiles, geom):
     sites = list(data[tiles[0]]["noise"].keys())
     noise = {s: torch.cat([data[t]["noise"][s] for t in tiles], dim=0)
              for s in sites}
-    return trim_to_tile(model(lr, noise=noise), geom)
+    cond = stack_cond(data, tiles, model)
+    return trim_to_tile(model(lr, noise=noise, cond=cond), geom)
 
 
 # --------------------------------------------------------------------------- #

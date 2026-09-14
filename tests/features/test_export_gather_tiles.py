@@ -52,6 +52,17 @@ POOL_KEYS = {
     "w_centre": 0.0,
     "rung": "middle_fine",
     "max_hosts_per_box": 3,
+    # The conditioning channel changes what the generator SEES, not just what
+    # it is charged for, so a replay that drops it scores a different model --
+    # and `main()` compares this rebuilt config against the checkpoint's own
+    # `cond` key precisely so that mismatch cannot pass silently.
+    "cond_channels": "r_over_rvir,log_mhost,valid",
+    "cond_mode": "membership",
+    "cond_min_hr_num_p": 5000,
+    "cond_r_max_rvir": 2.0,
+    "cond_log_mhost_ref": 12.5,
+    "cond_log_mhost_scale": 0.5,
+    "cond_lr": 3e-5,
 }
 
 
@@ -158,3 +169,36 @@ def test_the_exporter_unpacks_every_value_host_forward_returns():
     src = Path(export_gather_tiles.__file__)
     assert (_unpack_arity(src, "host_forward")
             == _return_arity(finetune_member_gather.host_forward))
+
+
+# --- the conditioning channel the gate must rebuild identically -------------
+def test_the_replayed_cond_config_is_what_the_trainer_would_build(tmp_path):
+    """``cond_config_of`` on the replayed namespace must equal the run's own.
+
+    This is the comparison ``main()`` makes against the checkpoint's ``cond``
+    key. A gate whose replay builds different channels scores a different model
+    and files the result under this arm's name, with nothing raising anywhere.
+    """
+    from overfit_host_mse import cond_config_of
+
+    run = _write_run(tmp_path, **POOL_KEYS)
+    got = export_gather_tiles.replay_args(run, "set9", [])
+    ccfg = cond_config_of(got)
+    assert ccfg is not None
+    assert ccfg.to_dict() == {
+        "channels": ["r_over_rvir", "log_mhost", "valid"],
+        "mode": "membership",
+        "min_hr_num_p": 5000,
+        "r_max_rvir": 2.0,
+        "log_mhost_ref": 12.5,
+        "log_mhost_scale": 0.5,
+    }
+
+
+def test_an_unconditioned_run_replays_as_unconditioned(tmp_path):
+    """The control must stay the control: empty channels means no stack at all,
+    not a default one."""
+    from overfit_host_mse import cond_config_of
+
+    run = _write_run(tmp_path, cond_channels="")
+    assert cond_config_of(export_gather_tiles.replay_args(run, "set9", [])) is None

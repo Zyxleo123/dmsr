@@ -110,6 +110,8 @@ __all__ = [
     "preserve_statistic",
     "gather_statistics",
     "region_coordinates",
+    "POPULATIONS",
+    "population_rows",
     "subhalo_home_tiles",
     "tile_subhalos",
     "velocity_statistics",
@@ -221,16 +223,160 @@ class GatherConfig:
 def _empty_home(return_occupancy: bool) -> Dict[str, np.ndarray]:
     z = np.zeros(0, dtype=np.int64)
     out = {"halo_id": z, "row": z, "tile": z,
-           "purity": np.zeros(0), "n_sites": z}
+           "purity": np.zeros(0), "n_sites": z, "num_p": z, "parent_id": z}
     if return_occupancy:
         out.update({"occ_row": z, "occ_tile": z, "occ_count": z})
     return out
 
 
+#: The three halo populations a member-set run can supervise. ``sub`` and
+#: ``top`` are the two halves of the catalog (``parent_ids >= 0`` and ``< 0``);
+#: ``all`` is their union and is what a *mass-window* run wants, because
+#: "small halo" is a statement about ``num_p`` and says nothing about whether
+#: Rockstar happened to file the object inside a bigger halo's radius. The
+#: distinction is not academic here: `host-damage-is-mostly-reparenting`
+#: measured that ~88% of the `self` arm's host loss was objects changing which
+#: side of this split they sit on, without any particle being lost.
+POPULATIONS = ("sub", "top", "all")
+
+#: The three environments a halo can sit in, as ``r / R_vir`` to the nearest
+#: **more massive** resolved host. One definition, shared by the census that
+#: measures the deficit (``scripts/features/halo_gap_census.py``) and by the
+#: selection that supervises it (``member_gather.build_member_sets``), so a
+#: diagnostic and a training run can never disagree about which bin a halo is
+#: in -- the same reason :func:`population_rows` is shared.
+#:
+#: Why the bins are where they are, *measured* on set9 (census, region scope,
+#: 32 tiles): of the region's 11,698 missing objects, **6,557 sit in ``near``**
+#: -- the infall region -- against 2,927 in ``field`` and 2,214 ``inside``. The
+#: `small-halo arm` widened the population by SIZE and closed 249 of the near
+#: deficit (3.8%) while overshooting HR in the field, because nothing in the
+#: selection had ever mentioned environment. `field` is the bin that would
+#: need a wider TILING; `near` is inside a cluster's own Lagrangian tiles and
+#: is therefore reachable by selection alone.
+ENV_EDGES = (0.0, 1.0, 3.0, float("inf"))
+ENV_LABELS = ("inside", "near", "field")
+
+
+def halo_environment(cat: HaloCatalog, *, host_floor: int = 200,
+                     boxsize_mpc_h: float = 100.0) -> np.ndarray:
+    """``(N,)`` index into :data:`ENV_LABELS` for every halo in ``cat``.
+
+    ``r / R_vir`` to the nearest **more massive** top-level halo of at least
+    ``host_floor`` particles. A halo with no such neighbour within 3 R_vir of
+    anything is ``field``; a resolved host is measured against hosts bigger than
+    itself, so the most massive halo in the box is always ``field`` and the
+    label is never self-referential.
+
+    Periodic, via ``cKDTree(boxsize=...)``. The loop is over resolved HOSTS
+    (thousands), not over halos (hundreds of thousands), and each iteration is
+    one ball query at that host's own radius -- so the cost tracks the number of
+    hosts, and the alternative (an all-pairs distance matrix) is 4e10 entries.
+
+    This is a **bin label, never a matched object**: two Rockstar catalogs of
+    two different fields share no halo ids, so "the same halo moved bins" is not
+    a statement this supports. ``scripts/features/host_forensics.py`` is the
+    matched-descendant tool and answers that question instead.
+    """
+    from scipy.spatial import cKDTree
+
+    box = float(boxsize_mpc_h)
+    # Rockstar positions can land exactly on the box edge; cKDTree(boxsize=)
+    # requires 0 <= x < L and rejects x == L, so wrap before building.
+    pos = np.mod(np.asarray(cat.pos, dtype=np.float64), box)
+    tree = cKDTree(pos, boxsize=box)
+
+    hosts = np.flatnonzero((cat.parent_ids < 0) & (cat.num_p >= int(host_floor)))
+    # Descending mass: a halo's label is set by the FIRST host that claims it
+    # only if we also keep the minimum ratio, so the ratio is tracked explicitly
+    # rather than inferred from the visit order.
+    hosts = hosts[np.argsort(-cat.num_p[hosts])]
+    best = np.full(int(cat.n), np.inf)
+    for j in hosts:
+        rv = float(cat.rvir[j]) / 1000.0          # kpc/h -> Mpc/h
+        if not np.isfinite(rv) or rv <= 0.0:
+            continue
+        reach = ENV_EDGES[-2] * rv                # only the bin edges matter
+        idx = np.asarray(tree.query_ball_point(pos[j], reach), dtype=np.int64)
+        if idx.size == 0:
+            continue
+        # Strictly less massive, and never the host itself. Ties broken by row
+        # so two equal-num_p halos cannot each claim the other and both end up
+        # labelled `inside` by a neighbour that is not bigger than them.
+        lighter = (cat.num_p[idx] < cat.num_p[j]) | (
+            (cat.num_p[idx] == cat.num_p[j]) & (idx > j))
+        idx = idx[lighter]
+        if idx.size == 0:
+            continue
+        d = pos[idx] - pos[j]
+        d -= box * np.round(d / box)
+        ratio = np.linalg.norm(d, axis=1) / rv
+        np.minimum.at(best, idx, ratio)
+    return np.clip(np.digitize(best, ENV_EDGES[1:-1], right=False), 0,
+                   len(ENV_LABELS) - 1).astype(np.int64)
+
+
+def env_mask(env: np.ndarray, select: str) -> np.ndarray:
+    """Boolean mask for ``select`` -- ``"any"``, or a comma list of labels.
+
+    ``"any"`` is the identity and is the default everywhere, so every arm
+    recorded before this existed is reproduced byte for byte by leaving it
+    alone. An unknown label raises rather than silently selecting nothing: a
+    typo that quietly emptied the pool would surface as the unrelated "no
+    supervised sets survived" error four steps later.
+    """
+    sel = str(select).strip()
+    if sel in ("", "any", "all"):
+        return np.ones(np.asarray(env).shape, dtype=bool)
+    want = [w.strip() for w in sel.split(",") if w.strip()]
+    bad = [w for w in want if w not in ENV_LABELS]
+    if bad:
+        raise ValueError(f"env_select {select!r} names unknown environments "
+                         f"{bad}; expected 'any' or a comma list of "
+                         f"{list(ENV_LABELS)}")
+    keep = np.zeros(np.asarray(env).shape, dtype=bool)
+    for w in want:
+        keep |= (np.asarray(env) == ENV_LABELS.index(w))
+    return keep
+
+
+def population_rows(cat: HaloCatalog, population: str, *, min_num_p: int,
+                    max_num_p: int = 0) -> np.ndarray:
+    """Catalog rows in ``population`` with ``num_p`` in ``[min, max)``.
+
+    One definition of "which halos is this run responsible for", used by
+    :func:`subhalo_home_tiles` and by the census that decides what to supervise,
+    so a diagnostic and a training run can never disagree about the population
+    they are talking about.
+
+    ``max_num_p = 0`` is no ceiling. A ceiling is what makes ``population="all"``
+    a *small-halo* selection rather than "every halo including the cluster":
+    the cluster host is ~100k particles, the pair sums are ``O(N^2)``, and its
+    HR reference is a different objective (concentrate a 1e14 halo) from the one
+    this line is about.
+    """
+    if population not in POPULATIONS:
+        raise ValueError(f"population {population!r} is not one of {POPULATIONS}")
+    if max_num_p and max_num_p <= int(min_num_p):
+        raise ValueError(
+            f"max_num_p {max_num_p} is not above min_num_p {min_num_p}; the "
+            "window is empty and the run would select nothing")
+    if population == "sub":
+        m = cat.parent_ids >= 0
+    elif population == "top":
+        m = cat.parent_ids < 0
+    else:
+        m = np.ones(int(cat.n), dtype=bool)
+    m = m & (cat.num_p >= int(min_num_p))
+    if max_num_p:
+        m = m & (cat.num_p < int(max_num_p))
+    return np.flatnonzero(m)
+
+
 def subhalo_home_tiles(
     cat: HaloCatalog, index, *, ng_hr: int = 512, tile_hr: int = 64,
     min_num_p: int = 50, return_occupancy: bool = False,
-    top_level: bool = False,
+    top_level: bool = False, population: str = "", max_num_p: int = 0,
 ) -> Dict[str, np.ndarray]:
     """``(halo_id, row, tile, purity, n_sites)`` for every resolved HR subhalo.
 
@@ -259,6 +405,19 @@ def subhalo_home_tiles(
     a box holds ~100k subhalos and a per-tile loop over all of them would repeat
     the same work 512 times.
 
+    ``population`` supersedes ``top_level`` and takes the third value the boolean
+    cannot express: ``"all"``, both halves of the catalog at once. That is what a
+    **small-halo** run wants, because "small" is a statement about ``num_p`` and
+    carries no information about which side of Rockstar's parent split the object
+    landed on -- an isolated 300p halo and a 300p satellite are the same object to
+    this loss, and the census in ``scripts/features/halo_gap_census.py`` is what
+    says whether the count deficit respects that split. ``max_num_p`` closes the
+    window from above; it is what keeps ``"all"`` from selecting the cluster host
+    itself, whose ``O(N^2)`` pair sum is ~100k particles and whose HR reference is
+    a different objective from this one. ``top_level`` is kept as the older
+    spelling of ``population="top"`` and still works; passing both disagreeing is
+    refused rather than silently resolved.
+
     ``return_occupancy`` additionally returns the full sparse occupancy the
     plurality is taken from -- ``(occ_row, occ_tile, occ_count)``, one entry per
     (subhalo, tile) pair it has sites in, with ``occ_row`` indexing the arrays
@@ -268,8 +427,13 @@ def subhalo_home_tiles(
     keeps. Asking for it here rather than regrouping elsewhere keeps one
     definition of which tile a subhalo's material is in.
     """
-    parent = (cat.parent_ids < 0) if top_level else (cat.parent_ids >= 0)
-    rows = np.flatnonzero(parent & (cat.num_p >= int(min_num_p)))
+    pop = str(population) if population else ("top" if top_level else "sub")
+    if population and top_level and pop != "top":
+        raise ValueError(
+            f"top_level=True contradicts population={population!r}; pass one. "
+            "top_level is the older spelling of population='top'.")
+    rows = population_rows(cat, pop, min_num_p=int(min_num_p),
+                           max_num_p=int(max_num_p))
     if rows.size == 0:
         return _empty_home(return_occupancy)
 
@@ -314,6 +478,12 @@ def subhalo_home_tiles(
         "tile": utile[first].astype(np.int64),
         "purity": counts[first] / np.maximum(tot[best_lab], 1),
         "n_sites": tot[best_lab].astype(np.int64),
+        # Carried so a caller can see the mass and the parent split of what it
+        # selected without a second pass over the catalog. A `population="all"`
+        # run that does not report the mix is indistinguishable from a `"sub"`
+        # run in every downstream artifact.
+        "num_p": cat.num_p[rows[best_lab]].astype(np.int64),
+        "parent_id": cat.parent_ids[rows[best_lab]].astype(np.int64),
     }
     if return_occupancy:
         # `best_lab` is np.unique's output, so it is sorted ascending and

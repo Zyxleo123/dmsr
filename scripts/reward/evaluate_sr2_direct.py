@@ -29,6 +29,9 @@ from _sr2_direct import (  # noqa: E402
     load_lr, model_path_of, run_dir, soft_config_of,
 )
 
+from cosmo_sr.features.lr_host_channel import (  # noqa: E402
+    LRHostChannelConfig, channel_field_path, load_channel_field,
+)
 from cosmo_sr.reward import fields as F  # noqa: E402
 from cosmo_sr.reward.soft_structure import structural_diversity  # noqa: E402
 from cosmo_sr.tts.sampling import super_resolve_srs_seeded  # noqa: E402
@@ -88,6 +91,12 @@ def main(argv=None) -> int:
     ap.add_argument("--keep-fields", action="store_true")
     ap.add_argument("--diversity-tile", type=int, default=0,
                     help="tile id used for the structural-diversity measurement")
+    ap.add_argument("--cond-root", default="",
+                    help="directory holding <box>.npz LR-host conditioning "
+                         "fields; empty means $DMSR_REWARD_ROOT/lr_host_channel. "
+                         "WHICH channels to feed is never a flag here -- it is "
+                         "read from the checkpoint, so a whole-box evaluation "
+                         "cannot disagree with the run that produced it.")
     args = ap.parse_args(argv)
 
     cfg = load_direct_config(args)
@@ -108,8 +117,25 @@ def main(argv=None) -> int:
     rows_path = run / f"field_metrics_{tag}.jsonl"
     banner(f"evaluating {tag} ({path.name}) on {boxes} x seeds {seeds}")
 
+    # --- conditioning, as the CHECKPOINT declares it ------------------------
+    # Not a flag. A whole-box evaluation that fed different channels than the
+    # run trained with would measure a different operator and label the rows
+    # with this checkpoint's name.
+    ccfg = None
+    if not is_frozen:
+        _ck = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(_ck, dict) and _ck.get("cond"):
+            ccfg = LRHostChannelConfig.from_dict(_ck["cond"])
+            print(f"  checkpoint declares {ccfg.n_chan} conditioning "
+                  f"channel(s) {list(ccfg.channels)} (mode {ccfg.mode})",
+                  flush=True)
+        del _ck
+
     gen = load_controlled_generator(path, scale_factor=geom.scale_factor,
-                                    device=device, eval_mode=True)
+                                    device=device, eval_mode=True,
+                                    cond_chan=(ccfg.n_chan if ccfg else 0))
+    # The frozen baseline stays UNconditioned: it is the deployed SR2, and it
+    # is what the low_k / lr_consistency guards are differences against.
     frozen_gen = gen if is_frozen else load_controlled_generator(
         model_path_of(cfg), scale_factor=geom.scale_factor, device=device,
         eval_mode=True)
@@ -122,6 +148,10 @@ def main(argv=None) -> int:
     for box in boxes:
         lr = np.asarray(load_lr(cfg, box), dtype=np.float32)
         hr = load_hr(cfg, box)
+        cond = None
+        if ccfg is not None:
+            cond, _c, _m = load_channel_field(
+                channel_field_path(box, args.cond_root or None), ccfg)
         for seed in seeds:
             if (box, seed) in done:
                 print(f"  {box}/seed{seed}: already measured, skipping", flush=True)
@@ -129,7 +159,8 @@ def main(argv=None) -> int:
             t0 = time.time()
             cand = super_resolve_srs_seeded(
                 gen, lr, seed, scale_factor=geom.scale_factor, nsplit=geom.nsplit,
-                pad=geom.pad, device=device, noise_mode="per_tile")
+                pad=geom.pad, device=device, noise_mode="per_tile",
+                cond_field=cond)
             frozen = cand if is_frozen else super_resolve_srs_seeded(
                 frozen_gen, lr, seed, scale_factor=geom.scale_factor,
                 nsplit=geom.nsplit, pad=geom.pad, device=device,
@@ -144,7 +175,7 @@ def main(argv=None) -> int:
             other = super_resolve_srs_seeded(
                 gen, lr, seed + 991, scale_factor=geom.scale_factor,
                 nsplit=geom.nsplit, pad=geom.pad, device=device,
-                noise_mode="per_tile")
+                noise_mode="per_tile", cond_field=cond)
             draws = torch.from_numpy(np.stack([
                 cand[:, sl[0], sl[1], sl[2]], other[:, sl[0], sl[1], sl[2]]
             ])[None]).float()
@@ -159,6 +190,7 @@ def main(argv=None) -> int:
             row = {"box": box, "seed": int(seed), "tag": tag,
                    "checkpoint": str(path), "checkpoint_sha": file_sha(path),
                    "frozen_baseline": bool(is_frozen), "lr_sha": array_sha(lr),
+                   "cond": (ccfg.to_dict() if ccfg else None),
                    "seconds": round(time.time() - t0, 1), **m}
             append_jsonl(rows_path, row)
             print(f"  {box}/seed{seed}: density_power_error={m['density_power_error']:.5f} "

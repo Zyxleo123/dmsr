@@ -30,8 +30,24 @@
 #SBATCH --partition=general
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
+#SBATCH --mem=32G
 #SBATCH --time=12:00:00
+# --mem was 96G from this job's first day and nothing had ever measured it. On
+# 2026-09-09 that cost real time: 96G did not fit ANY available node on
+# `general` (the only two with a free, unreserved GPU had 20G and 84G free), so
+# every arm of the shell-lever set sat PENDING behind a number nobody had
+# checked -- and it read as a fairshare problem, which it was not.
+#
+# MEASURED by the ss30_fresh pool-only shakeout (job 46659), which is what
+# `report_rss` in finetune_member_gather.py exists to print:
+#     peak host RSS after the pool build (56 hosts, 2 draws) = 10.1 GB
+# 32G covers that, the 3-draw arms, and the mmap'd frozen box (3.2 GB per box,
+# which ru_maxrss does NOT count but the cgroup may charge), with headroom.
+#
+# Both of these are plain sbatch CLI flags, so the submitter overrides them with
+# MG_MEM / MG_TIME on the command line. That is NOT `--export` and does not trip
+# SLURM_GET_USER_ENV -- a CLI --mem simply wins over the directive above.
+# Re-measure with SHAKEOUT_ONLY=1 before raising either.
 #SBATCH --output=/zfsauton/scratch/yixiz/DMSR/dmsr_reward/logs/slurm-mgtrain-%j.out
 
 set -euo pipefail
@@ -68,6 +84,69 @@ set -euo pipefail
 : "${MG_HOST_MAX_SETS:=256}"
 : "${MG_HOST_SETS_PER_STEP:=64}"
 : "${MG_MIN_NUM_P:=200}"
+# --- the LR-host conditioning channel ---------------------------------------
+# EMPTY = the unconditioned control, byte-identical to every arm before this
+# existed. Set it and the generator gains a zero-initialised input embedding for
+# the channels named, which is the only thing in this pipeline that gives a
+# local operator the host CENTRE and SCALE it needs to stop emitting a flat
+# radial profile (`radial-profile-is-flat-in-host-mass`).
+#
+# The fields must already be built -- the trainer refuses to start otherwise:
+#     bash scripts/slurm/submit_lr_host_channel.sh
+: "${MG_COND_CHANNELS:=}"
+: "${MG_COND_MODE:=derived}"
+: "${MG_COND_MIN_HR_NUM_P:=20000}"
+: "${MG_COND_R_MAX_RVIR:=3.0}"
+: "${MG_COND_LOG_MHOST_REF:=13.0}"
+: "${MG_COND_LOG_MHOST_SCALE:=1.0}"
+: "${MG_COND_ROOT:=}"
+# cond0 starts at exactly ZERO and has no pretrained function to protect, so it
+# is trained at the LARGEST rate of any group. A coarse-sized 3e-7 would leave
+# the channel wired in and inert for ten hours.
+: "${MG_COND_LR:=1e-5}"
+# --- WHICH halos the member loss is responsible for --------------------------
+# `sub` is every arm recorded so far. The held-out gate says the assumption
+# behind it is wrong: in the edited region HR resolves 3,775 top-level halos
+# >=200p against base's 3,028 -- a 747-halo deficit OUTSIDE hosts that no
+# supervised set has ever pointed at. `all` selects on SIZE alone. It REQUIRES
+# MG_MAX_NUM_P (the job refuses otherwise: without a ceiling the cluster host
+# enters the supervised pool at ~100k particles and 1e10 pairs), and it wants
+# MG_SET_SELECT=stratified, or the `largest` cap keeps the top of the mass
+# function and drops the small halos the arm exists to build.
+: "${MG_POPULATION:=sub}"
+: "${MG_MAX_NUM_P:=0}"
+: "${MG_SET_SELECT:=largest}"
+# --- the THIRD selection axis: WHICH ENVIRONMENT ----------------------------
+# `any` = every arm so far. The set9 census (region scope, 32 tiles) says this
+# is the axis that was missing: of the region's 11,698 missing objects 6,557
+# sit in `near` (1-3 R_vir of a bigger resolved host, the infall region) and
+# MG_POPULATION=all closed 249 of them -- 3.8% -- while OVERSHOOTING HR in
+# `field` (subhalos 3,316 against HR's 2,466, and 2-6x too many above 200p).
+# Selecting on size cannot reach `near`: a cluster region's pool is dominated
+# by field halos and `stratified` stratifies on MASS. `near` sits inside a
+# cluster's own Lagrangian tiles, so unlike `field` it is reachable by
+# selection rather than by a wider MG_N_TILES.
+: "${MG_ENV_SELECT:=any}"
+: "${MG_ENV_HOST_FLOOR:=200}"
+# --- isolation: how much NON-MEMBER mass sits on the object ------------------
+# 0 = off = every arm so far. This is the only INTER-set term in the loss, and
+# it exists because "top-level" is an inter-set property: Rockstar files a halo
+# as a subhalo when a bigger halo's R_vir contains its centre, which is not a
+# property of its members at all. Every other term is a moment about the set's
+# own centroid, so an intra-set loss pointed at top-level HR halos scores full
+# marks on an object that a pedestal then swallows -- MEASURED, set9:
+# MG_POPULATION=all built 3,374 net objects and Rockstar filed every one as a
+# subhalo (subs +4,260, top-level -886). `d6` does not close this: it
+# normalises by the background's DISPERSION, not its density.
+: "${MG_W_ISOLATION:=0.0}"
+: "${MG_ISO_RADIUS_FRAC:=0.5}"
+: "${MG_ISO_SOFTNESS:=0.15}"
+: "${MG_ISO_MIN_COUNT:=8.0}"
+# --- the EARLY gate ----------------------------------------------------------
+# Steps at which to freeze an IMMUTABLE tuned_step<N>.pt, so a Rockstar gate can
+# run CONCURRENTLY with the rest of training. Empty = none = every arm so far.
+# It costs the run nothing: training still goes to MG_STEPS.
+: "${MG_GATE_AT_STEPS:=}"
 : "${MG_MIN_PURITY:=0.5}"
 : "${MG_MIN_LIVE_FRAC:=0.5}"
 : "${MG_SOFTENING:=0.01}"
@@ -86,6 +165,20 @@ set -euo pipefail
 : "${MG_CENTRE_MODE:=full}"    # full = the term that scored 72/154
 : "${MG_CENTRE_DEAD_ZONE:=0.0}" # 0 = the term that scored 72/154
 : "${MG_CENTRE_HUBER:=0.0}"
+# --- the shell: right distance from the host, any direction ------------------
+# 0 = off = every arm so far. See submit_member_gather_train.sh for the arm.
+: "${MG_W_RADIUS:=0.0}"
+: "${MG_RADIUS_DEAD_ZONE:=1.0}"
+: "${MG_W_SHELL:=0.0}"
+: "${MG_SHELL_DEAD_ZONE:=0.02}"
+# Reduce the sorted pairing to this many equal-COUNT quantile bins. 0 = the full
+# rank-by-rank pairing every arm through 2026-09-08 ran. MEASURED: at Q=0 the
+# w_shell=30 arm drove its train residual 7.3x while holdout moved 1.4x -- the
+# full pairing hands the loss one degree of freedom per set and most of them are
+# per-host detail that does not transfer. Try 3-5.
+: "${MG_SHELL_QUANTILES:=0}"
+: "${MG_SHELL_EPS:=0.01}"
+: "${MG_RADIUS_HUBER:=0.0}"
 # --- the guards --------------------------------------------------------------
 : "${MG_W_LOW:=100.0}"
 : "${MG_W_HIGHK:=10.0}"
@@ -114,6 +207,26 @@ set -euo pipefail
 : "${MG_UNSUP_TILES_PER_STEP:=8}"  # tiles carrying the hinge each step
 : "${MG_W_HIGHK_UNSUP:=0.0}"       # 0 = only measure the pool; >0 adds the loss
 : "${MG_UNSUP_HIGHK_MAX:=0.0}"     # 0 = no box-wide verdict gate
+# --- the box-wide kNN-distance support, src/cosmo_sr/features/knn_cdf.py. Same
+# pool as the hinge; grid-free and catalog-free. Default OFF. MG_KNN_KS max sets
+# halo vs fragments (measured) -- keep it >= 64. Set MG_KNN_BUFFER_CELLS from
+# knn_cdf_diagnostic.py's boundary experiment, not by taste.
+: "${MG_W_KNN_UNSUP:=0.0}"
+: "${MG_KNN_KS:=8 32 64 128}"
+: "${MG_KNN_QUERIES:=1024}"
+: "${MG_KNN_QUANTILES:=64}"
+: "${MG_KNN_DEAD_ZONE:=0.02}"
+: "${MG_KNN_BUFFER_CELLS:=0}"
+: "${MG_KNN_NBR_MARGIN_CELLS:=8}"
+: "${MG_KNN_CENTRE:=centroid}"
+: "${MG_KNN_ONE_SIDED:=0}"
+# MEASURED (round 5b, docs/sr2_knn_distance.md section 12): the term is worth
+# training on ONLY in phase space and ONLY per subhalo class. Position-only
+# ranks the working arms at rho -0.23 (p 0.32); (x, v/4000) at -0.65 (p 0.002).
+# Hosts belong in the monitor, never the loss: the working arms gain subhalos by
+# over-concentrating hosts in phase space (class term vs count, rho +0.91).
+: "${MG_KNN_PHASE_LAMBDA:=0}"      # km/s per Mpc/h; 4000 is the measured pass
+: "${MG_KNN_CLASSES:=}"            # e.g. "sub_50_200"; empty = pooled (do not)
 # --- the HR critic, docs/sr2_gather_critic.md. Default OFF: MG_W_ADV=0 makes the
 # run byte-identical to the four finished arms. The hand-crafted high-k/velocity
 # hinges above each charge for ONE named statistic; the critic is their general
@@ -132,6 +245,17 @@ set -euo pipefail
 : "${MG_CRITIC_NORM_FIT_TILES:=32}"
 : "${MG_LABEL:=}"
 : "${MG_SEED:=0}"
+# --- the NOISE realisation (the memorisation channel) ------------------------
+# A run holds (LR tile, noise tile) constant for every step, so the fixed noise
+# is an input carrying real per-tile detail and zero generalisable information.
+# Anything the LR field does not carry can still be fitted through it, and all
+# of that evaporates on a held-out box's fresh draw -- which is the shape of the
+# 2026-09-08 shell result. These three knobs remove it, and default to OFF so an
+# unset run reproduces every arm on disk exactly.
+: "${MG_NOISE_DRAWS:=1}"        # realisations per tile available to training
+: "${MG_NOISE_MODE:=fixed}"     # fixed | rotate
+: "${MG_FRESH_NOISE_EVAL:=0}"   # reserve one never-trained draw for the 2x2
+: "${MG_SHELL_NOISE_DRAWS:=0}"  # average the shell curve over this many extras
 : "${MG_WANDB_MODE:=}"          # online / offline / disabled; empty = config
 
 # The preamble builds a MINIMAL environment on purpose and never sources
@@ -203,6 +327,19 @@ MG_HIGHK_TWO_SIDED_FLAG=""
 [ "$MG_HIGHK_TWO_SIDED" = "1" ] && MG_HIGHK_TWO_SIDED_FLAG="--highk-two-sided"
 MG_CRITIC_GLOBAL_POOL_FLAG=""
 [ "$MG_CRITIC_GLOBAL_POOL" = "1" ] && MG_CRITIC_GLOBAL_POOL_FLAG="--critic-global-pool"
+MG_FRESH_NOISE_FLAG=""
+[ "$MG_FRESH_NOISE_EVAL" = "1" ] && MG_FRESH_NOISE_FLAG="--fresh-noise-eval"
+
+echo "    noise:  ${MG_NOISE_DRAWS} draw(s), mode ${MG_NOISE_MODE}," \
+     "fresh-noise eval ${MG_FRESH_NOISE_EVAL}," \
+     "shell averaged over +${MG_SHELL_NOISE_DRAWS}"
+if [ "$MG_NOISE_MODE" = "rotate" ] || [ "$MG_FRESH_NOISE_EVAL" = "1" ]; then
+  echo "      NOTE each extra draw costs one frozen forward AND one full"
+  echo "           reference build per host at pool time: centre_self and the"
+  echo "           hybrid reference are functions of the frozen field, so a"
+  echo "           draw carries its own set table or it is not an honest draw."
+  echo "           Budget pool build time as ~N_DRAWS x the single-draw run."
+fi
 
 echo "    budget: bound penalty ${MG_BOUND_PENALTY}, term-norm ${MG_TERM_NORM}"
 if [ "$MG_BOUND_PENALTY" = "hinge" ] && [ "$MG_TERM_NORM" != "1" ]; then
@@ -219,6 +356,47 @@ echo "          and score the HELD-OUT hosts, because in-sample this arm can"
 echo "          only look worse than the full term."
 fi
 echo "            (0/0 is the pure quadratic that scored 72/154 -- the control)"
+echo "    env:    env_select ${MG_ENV_SELECT} (host floor ${MG_ENV_HOST_FLOOR}p)"
+echo "    iso:    w_isolation ${MG_W_ISOLATION}, radius ${MG_ISO_RADIUS_FRAC}"\
+     " of the bg sphere, min count ${MG_ISO_MIN_COUNT}"
+echo "    shell:  w_radius ${MG_W_RADIUS}, dead zone ${MG_RADIUS_DEAD_ZONE}r," \
+     "Huber knee ${MG_RADIUS_HUBER}r"
+if [ "${MG_W_RADIUS%%.*}" != "0" ] || [ "${MG_W_RADIUS#*.}" != "0" ]; then
+echo "    NOTE: the shell arm. Charges the host-centric RADIUS only, direction"
+echo "          free -- the 60% of the centre offset that is a rule (58% of"
+echo "          frozen sets sit too CLOSE, median error 2.80 radii) and none of"
+echo "          the transverse part no input predicts. It targets the \`self\`"
+echo "          arm's radial collapse: held-out set9 median 0.35 host R_vir vs"
+echo "          HR's 1.13, 6496 subhalos inside 0.25 R_vir where HR has 593."
+if [ "$MG_CENTRE_MODE" = "self" ]; then
+echo "    WARNING: --centre-mode self PINS the radius this term is trying to"
+echo "             move. Both quadratic, they settle at w_radius/(w_centre +"
+echo "             w_radius) of the correction -- HALF at equal weights. Use"
+echo "             MG_CENTRE_MODE=self_tan to make them orthogonal instead."
+fi
+echo "          Read train/radius_ratio -> 1.0 and holdout/radius_ratio; the"
+echo "          host preservation sets never carry this term (a host has no"
+echo "          host) and are forced to w_radius=0."
+fi
+echo "    soft:   w_shell ${MG_W_SHELL}, dead zone ${MG_SHELL_DEAD_ZONE}," \
+     "quantile bins ${MG_SHELL_QUANTILES} (0=full rank pairing)" \
+     "fractional, eps ${MG_SHELL_EPS} Mpc/h"
+if [ "${MG_W_SHELL%%.*}" != "0" ] || [ "${MG_W_SHELL#*.}" != "0" ]; then
+echo "    NOTE: the SOFT shell. Sorts this host's candidate and target radii and"
+echo "          pairs them by RANK -- the radius DISTRIBUTION, no addresses. It"
+echo "          is w_radius's post-mortem: that address has an out-of-sample R2"
+echo "          of 0.022, so all_blocks_selfshell memorised it (train err 2.86"
+echo "          -> 1.32, held out 2.68 -> 2.81) and paid 55% of the abundance"
+echo "          (host subhalos 367 -> 167 vs HR 374). Only the multiplicative"
+echo "          part transferred, and this asks for that alone."
+if [ "$MG_CENTRE_MODE" = "self" ]; then
+echo "    WARNING: --centre-mode self PINS the radii this term redistributes,"
+echo "             exactly as it does w_radius. Use MG_CENTRE_MODE=self_tan."
+fi
+echo "          Read shell_resid (-> 0), NOT radius_err_radii: a perfect"
+echo "          distribution match still leaves 79%/85% of the per-set address"
+echo "          error standing, so the address metric barely moves on a win."
+fi
 echo "    guards: low_k w=$MG_W_LOW, HIGH-K HINGE w=$MG_W_HIGHK above k=$MG_K_SPLIT"
 if [ "$MG_HIGHK_BINS" -gt 0 ] 2>/dev/null; then
     echo "            high-k BANDED: $MG_HIGHK_BINS log bins, k_max ${MG_HIGHK_K_MAX}" \
@@ -279,6 +457,7 @@ python -u scripts/features/finetune_member_gather.py \
     --sets-per-step "$MG_SETS_PER_STEP" \
     --clip "$MG_CLIP" \
     --eval-every "$MG_EVAL_EVERY" \
+    --gate-at-steps "$MG_GATE_AT_STEPS" \
     --w-virial "$MG_W_VIRIAL" \
     --w-bound "$MG_W_BOUND" \
     --w-d6 "$MG_W_D6" \
@@ -290,6 +469,19 @@ python -u scripts/features/finetune_member_gather.py \
     --host-max-sets "$MG_HOST_MAX_SETS" \
     --host-sets-per-step "$MG_HOST_SETS_PER_STEP" \
     --min-num-p "$MG_MIN_NUM_P" \
+    --cond-channels "$MG_COND_CHANNELS" \
+    --cond-mode "$MG_COND_MODE" \
+    --cond-min-hr-num-p "$MG_COND_MIN_HR_NUM_P" \
+    --cond-r-max-rvir "$MG_COND_R_MAX_RVIR" \
+    --cond-log-mhost-ref "$MG_COND_LOG_MHOST_REF" \
+    --cond-log-mhost-scale "$MG_COND_LOG_MHOST_SCALE" \
+    --cond-root "$MG_COND_ROOT" \
+    --cond-lr "$MG_COND_LR" \
+    --population "$MG_POPULATION" \
+    --max-num-p "$MG_MAX_NUM_P" \
+    --set-select "$MG_SET_SELECT" \
+    --env-select "$MG_ENV_SELECT" \
+    --env-host-floor "$MG_ENV_HOST_FLOOR" \
     --min-purity "$MG_MIN_PURITY" \
     --min-live-frac "$MG_MIN_LIVE_FRAC" \
     --softening "$MG_SOFTENING" \
@@ -304,6 +496,21 @@ python -u scripts/features/finetune_member_gather.py \
     --centre-mode "$MG_CENTRE_MODE" \
     --centre-dead-zone "$MG_CENTRE_DEAD_ZONE" \
     --centre-huber-radii "$MG_CENTRE_HUBER" \
+    --w-radius "$MG_W_RADIUS" \
+    --w-isolation "$MG_W_ISOLATION" \
+    --iso-radius-frac "$MG_ISO_RADIUS_FRAC" \
+    --iso-softness "$MG_ISO_SOFTNESS" \
+    --iso-min-count "$MG_ISO_MIN_COUNT" \
+    --radius-dead-zone "$MG_RADIUS_DEAD_ZONE" \
+    --w-shell "$MG_W_SHELL" \
+    --shell-dead-zone "$MG_SHELL_DEAD_ZONE" \
+    --shell-quantiles "$MG_SHELL_QUANTILES" \
+    --noise-draws "$MG_NOISE_DRAWS" \
+    --noise-mode "$MG_NOISE_MODE" \
+    --shell-noise-draws "$MG_SHELL_NOISE_DRAWS" \
+    $MG_FRESH_NOISE_FLAG \
+    --shell-eps-mpc-h "$MG_SHELL_EPS" \
+    --radius-huber-radii "$MG_RADIUS_HUBER" \
     --w-low "$MG_W_LOW" \
     --w-highk "$MG_W_HIGHK" \
     --k-split "$MG_K_SPLIT" \
@@ -323,6 +530,17 @@ python -u scripts/features/finetune_member_gather.py \
     --unsup-tiles-per-step "$MG_UNSUP_TILES_PER_STEP" \
     --w-highk-unsup "$MG_W_HIGHK_UNSUP" \
     --unsup-highk-max "$MG_UNSUP_HIGHK_MAX" \
+    --w-knn-unsup "$MG_W_KNN_UNSUP" \
+    --knn-ks $MG_KNN_KS \
+    --knn-queries "$MG_KNN_QUERIES" \
+    --knn-quantiles "$MG_KNN_QUANTILES" \
+    --knn-dead-zone "$MG_KNN_DEAD_ZONE" \
+    --knn-buffer-cells "$MG_KNN_BUFFER_CELLS" \
+    --knn-nbr-margin-cells "$MG_KNN_NBR_MARGIN_CELLS" \
+    --knn-centre "$MG_KNN_CENTRE" \
+    --knn-phase-lambda "$MG_KNN_PHASE_LAMBDA" \
+    ${MG_KNN_CLASSES:+--knn-classes $MG_KNN_CLASSES} \
+    $( [ "$MG_KNN_ONE_SIDED" = "1" ] && echo --knn-one-sided ) \
     --w-adv "$MG_W_ADV" \
     --adv-warmup-steps "$MG_ADV_WARMUP" \
     --adv-ramp-steps "$MG_ADV_RAMP" \

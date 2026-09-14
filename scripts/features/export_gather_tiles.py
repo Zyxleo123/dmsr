@@ -77,7 +77,9 @@ from _sr2_direct import (  # noqa: E402
     soft_config_of,
 )
 from free_field_gather import member_config_of  # noqa: E402
-from overfit_host_mse import BOXSIZE, NG_HR, TILE  # noqa: E402
+from overfit_host_mse import (  # noqa: E402
+    BOXSIZE, NG_HR, TILE, cond_config_of,
+)
 # The trainer's own pool builder, forward and parser. Three separate reasons,
 # all the same reason: a second definition here would be a different experiment.
 from finetune_member_gather import (  # noqa: E402
@@ -141,6 +143,14 @@ def main(argv=None) -> int:
     ap.add_argument("--box", required=True,
                     help="ONE held-out box, e.g. set9. Its hosts are all "
                          "held out by construction -- the split is by box.")
+    ap.add_argument(
+        "--checkpoint", default="tuned.pt",
+        help="which checkpoint file inside --run-dir to export. The "
+             "default is the live one, rewritten every eval. Name a "
+             "tuned_step<N>.pt snapshot (see the trainer's "
+             "--gate-at-steps) to gate a run that is STILL TRAINING: "
+             "the snapshot is immutable, so the export is not racing "
+             "the trainer for the ~138 s it spends reading it.")
     ap.add_argument("--out-dir", default="",
                     help="default <run-dir>/holdout_<box>")
     ap.add_argument("--device", default="")
@@ -151,9 +161,13 @@ def main(argv=None) -> int:
     args, extra = ap.parse_known_args(argv)
 
     run_dir = Path(args.run_dir)
-    ckpt_p = run_dir / "tuned.pt"
+    ckpt_p = run_dir / str(args.checkpoint)
     if not ckpt_p.is_file():
-        raise SystemExit(f"no tuned.pt under {run_dir}")
+        raise SystemExit(
+            f"no {args.checkpoint} under {run_dir}. A tuned_step<N>.pt is "
+            "written only if the training run was launched with "
+            "--gate-at-steps N (MG_GATE_AT_STEPS); check that, and that the "
+            "run has actually reached step N.")
     out_dir = Path(args.out_dir) if args.out_dir \
         else run_dir / f"holdout_{args.box}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -180,10 +194,37 @@ def main(argv=None) -> int:
     for p in frozen.parameters():
         p.requires_grad_(False)
 
+    # --- the conditioning channels, twice, and they must agree --------------
+    # `ccfg` comes from the REPLAYED config, so `build_pool` below rebuilds the
+    # channel crops the same way the run built them. `ck["cond"]` is what the
+    # checkpoint says it was trained with. Comparing the two is the check this
+    # line has been bitten by the absence of before: a gate whose replay builds
+    # different channels scores a different model and reports it as this one,
+    # with no error anywhere.
+    ccfg = cond_config_of(targs)
+    ck = torch.load(ckpt_p, map_location="cpu", weights_only=False)
+    ck_cond = ck.get("cond")
+    replay_cond = ccfg.to_dict() if ccfg is not None else None
+    if ck_cond != replay_cond:
+        raise SystemExit(
+            f"the checkpoint was trained with conditioning {ck_cond} but the "
+            f"replayed config rebuilds {replay_cond}. Exporting would score a "
+            "DIFFERENT model than the one that was trained. (A checkpoint from "
+            "before conditioning existed has no 'cond' key at all; re-export "
+            "it with --cond-channels unset.)")
+    if ccfg is not None:
+        print(f"  conditioning: {ccfg.n_chan} channel(s) "
+              f"{list(ccfg.channels)}, mode {ccfg.mode}", flush=True)
+
     tuned = load_controlled_generator(
         model_path_of(cfg), in_chan=in_chan, out_chan=out_chan,
-        scale_factor=geom.scale_factor, device=device, eval_mode=True)
-    ck = torch.load(ckpt_p, map_location="cpu", weights_only=False)
+        scale_factor=geom.scale_factor, device=device, eval_mode=True,
+        cond_chan=(ccfg.n_chan if ccfg is not None else 0))
+    if ck.get("partial") or ck.get("snapshot"):
+        print(f">>> NOTE: {args.checkpoint} is a MID-RUN checkpoint at step "
+              f"{ck.get('step')}. The catalog this produces is that step's, "
+              "not the arm's final one, and every artifact below records "
+              "which.", flush=True)
     tuned.load_state_dict(ck["model"], strict=True)
     for p in tuned.parameters():
         p.requires_grad_(False)
@@ -194,9 +235,11 @@ def main(argv=None) -> int:
     # The checkpoint is a FULL state dict on purpose, so a silently mismatched
     # architecture would load clean and generate a different field. Confirm the
     # two models actually differ, and only where the rung says.
-    n_diff = sum(1 for (n, a), (_, b) in
-                 zip(tuned.state_dict().items(), frozen.state_dict().items())
-                 if not torch.equal(a.cpu(), b.cpu()))
+    # Keyed, not zipped: a conditioned `tuned` has `cond0.weight`, which frozen
+    # does not, and a positional zip would silently pair it with the next key.
+    _tsd, _fsd = tuned.state_dict(), frozen.state_dict()
+    n_diff = sum(1 for n, a in _tsd.items()
+                 if n not in _fsd or not torch.equal(a.cpu(), _fsd[n].cpu()))
     print(f"  {n_diff} tensors differ from frozen "
           f"(rung claims {len(ck.get('trained_names', []))})")
     if n_diff == 0:
@@ -291,7 +334,15 @@ def main(argv=None) -> int:
                 "n_live": n_live})
     write_json(out_dir / "export.json", {
         "ok": True, "run_dir": str(run_dir), "box": args.box,
-        "checkpoint": {"rung": ck.get("rung"), "step": ck.get("step"),
+        # `file`, `partial` and `snapshot` so a catalog can never be read as
+        # a finished arm's when it came from a mid-run snapshot. An early
+        # gate is a one-sided test -- a clear negative is informative, a null
+        # is not evidence of failure -- and that reading depends entirely on
+        # knowing which of the two this was.
+        "checkpoint": {"file": str(args.checkpoint),
+                       "rung": ck.get("rung"), "step": ck.get("step"),
+                       "partial": bool(ck.get("partial", False)),
+                       "snapshot": bool(ck.get("snapshot", False)),
                        "n_trained_tensors": len(ck.get("trained_names", [])),
                        "n_tensors_differing": int(n_diff)},
         "n_hosts": len(tasks), "n_tiles": len(tiles),
@@ -299,6 +350,7 @@ def main(argv=None) -> int:
         "spliced_volume_fraction": len(tiles) / float((NG_HR // TILE) ** 3),
         "per_host": per_host,
         "centre_mode": str(getattr(targs, "centre_mode", "")),
+        "cond": replay_cond,
     })
     frac = 100.0 * len(tiles) / float((NG_HR // TILE) ** 3)
     print(f"\n  wrote {out_dir}/tiles.npz  "

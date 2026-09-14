@@ -16,6 +16,7 @@ cooling the whole neighbourhood.
 """
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from cosmo_sr.features.bound_discriminator import (  # noqa: E402
     set_statistics, specific_potential,
 )
+from cosmo_sr.features import member_gather  # noqa: E402
 from cosmo_sr.features.member_gather import (  # noqa: E402
     MemberGatherConfig, build_member_sets, member_gather_loss,
     set_statistics_torch, specific_potential_torch, tile_particles,
@@ -240,7 +242,7 @@ def test_d6_against_a_local_background_resists_a_global_cooling():
 # --------------------------------------------------------------------------- #
 def _toy(seed: int = 7, tight: float = 0.15, loose: float = 0.9,
          cold: float = 30.0, hot: float = 1000.0,
-         split: bool = False):
+         split: bool = False, bg_scale: float = 1.2):
     """A 16^3 box, one trained tile, two subhalos: HR tight, frozen diffuse.
 
     The frozen field is built to look like the real failure -- the same
@@ -290,8 +292,9 @@ def _toy(seed: int = 7, tight: float = 0.15, loose: float = 0.9,
     rest = site[440:] if split else site[350:]
     half = rest.size // 2
     bx = np.concatenate([
-        rng.normal(scale=1.2, size=(half, 3)) + centres[10],
-        rng.normal(scale=1.2, size=(rest.size - half, 3)) + centres[11]])
+        rng.normal(scale=bg_scale, size=(half, 3)) + centres[10],
+        rng.normal(scale=bg_scale, size=(rest.size - half, 3))
+        + centres[11]])
     bv = rng.normal(scale=900.0, size=(rest.size, 3))
     for f in (hr, fz):
         f[0, 0:3, gx[rest], gy[rest], gz[rest]] = (bx - q[rest]) / DIS
@@ -299,6 +302,7 @@ def _toy(seed: int = 7, tight: float = 0.15, loose: float = 0.9,
 
     ids = [1, 10, 11] + ([12] if split else [])
     cat = SimpleNamespace(
+        n=len(ids),
         ids=np.array(ids), parent_ids=np.array([-1] + [1] * (len(ids) - 1)),
         num_p=np.array([TILE ** 3, 200, 150] + ([100] if split else [])),
         mvir=np.array([1e14, 1e12, 8e11] + ([5e11] if split else [])),
@@ -1276,3 +1280,1006 @@ def test_a_zero_scale_cannot_blow_up_the_loss():
                                  term_scale={"virial": 0.0})
     assert np.isfinite(float(loss))
     assert d["term_scale"]["virial"] == pytest.approx(1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# The shell: the right distance from the host, any direction (`w_radius`)
+# --------------------------------------------------------------------------- #
+def _shell_cfg(**kw):
+    """Only the placement terms live, so a number IS the term under test."""
+    base = dict(bg_k=0, w_virial=0.0, w_bound=0.0, w_d6=0.0, w_rrms=0.0,
+                w_sigmav=0.0, w_centre=0.0, w_radius=1.0, radius_dead_zone=0.0)
+    base.update(kw)
+    return _cfg(**base)
+
+
+def test_the_shell_term_is_off_by_default():
+    """Every arm in docs/sr2_member_gather_training.md ran without it."""
+    assert MemberGatherConfig().w_radius == 0.0
+    cfg = _cfg(bg_k=0)
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST)
+    pos, vel = _particles(hr, tiles)
+    d = member_gather_loss(pos, vel, ms, cfg)[1]
+    assert d["term_radius"] == 0.0
+    assert d["term_eff_radius"] == 0.0
+
+
+def _on_the_sphere(ms, i, a):
+    """A displacement of exactly ``|a|`` sideways that keeps the radius EXACT.
+
+    With ``d = c - h = r rhat``, a shift ``a perp + b rhat`` lands at radius
+    ``sqrt((r + b)^2 + a^2)``, so ``b = sqrt(r^2 - a^2) - r`` puts it back on the
+    sphere. Second order in ``a/r`` and therefore small, but it is not zero, and
+    a test that ignored it would be asserting the dead zone rather than the
+    direction-blindness this term exists for.
+    """
+    rhat = ms.centre_rhat[i]
+    perp = torch.linalg.cross(rhat, torch.tensor([0.0, 0.0, 1.0],
+                                                 dtype=rhat.dtype))
+    perp = perp / torch.linalg.vector_norm(perp)
+    r = float(torch.linalg.vector_norm(ms.centre_target[i] - ms.centre_host[i]))
+    b = float(np.sqrt(r * r - a * a) - r)
+    return a * perp + b * rhat
+
+
+def test_the_shell_term_is_blind_to_a_move_along_the_sphere():
+    """The whole point: wherever it is, as long as the distance is right.
+
+    The transverse direction is the 37% of the centre offset that no input
+    determines, so a term that charged for it would be asking the generator for
+    realisation noise. Here a set is walked a full search radius sideways and
+    the term stays at zero -- while `full` charges the whole thing, which is the
+    same fact stated as the cost.
+    """
+    cfg = _shell_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST)
+    pos, vel = _particles(hr, tiles)
+    for i in range(ms.n_sets):
+        shift = _on_the_sphere(ms, i, a=1.0)
+        d = member_gather_loss(pos + shift, vel, ms, cfg, set_indices=[i])[1]
+        assert d["term_radius"] == pytest.approx(0.0, abs=1e-9)
+        assert d["median_radius_ratio"] == pytest.approx(1.0, abs=1e-9)
+        # ...and it really did move: the address term charges every metre of
+        # it, which is the cost this arm is choosing not to pay. Staying on the
+        # sphere costs a second-order radial step, so the displacement is
+        # sqrt(a^2 + b^2) rather than `a` -- assert what was actually applied.
+        moved = float(torch.linalg.vector_norm(shift))
+        assert moved == pytest.approx(1.0, abs=1e-3)
+        full = member_gather_loss(pos + shift, vel, ms,
+                                  _shell_cfg(w_centre=1.0, w_radius=0.0),
+                                  set_indices=[i])[1]
+        assert full["median_centre_offset_mpc_h"] == pytest.approx(moved, abs=1e-6)
+        assert full["term_centre"] > 1.0
+
+
+def test_the_shell_term_charges_a_radial_move_and_is_sign_symmetric():
+    """Too close and too far cost the same; only the distance is specified."""
+    cfg = _shell_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST)
+    pos, vel = _particles(hr, tiles)
+    for i in range(ms.n_sets):
+        s = float(ms.centre_scale[i])
+        out = member_gather_loss(pos + 2.0 * s * ms.centre_rhat[i], vel, ms,
+                                 cfg, set_indices=[i])[1]
+        inn = member_gather_loss(pos - 2.0 * s * ms.centre_rhat[i], vel, ms,
+                                 cfg, set_indices=[i])[1]
+        # Two search radii out, dead zone off: (2)^2 = 4, on both sides.
+        assert out["term_radius"] == pytest.approx(4.0, rel=1e-4)
+        assert inn["term_radius"] == pytest.approx(4.0, rel=1e-4)
+        # ...and the SIGN survives into the diagnostic, which is how a run says
+        # "radially collapsed" rather than merely "misplaced".
+        assert out["median_radius_err_radii"] == pytest.approx(2.0, rel=1e-4)
+        assert out["frac_radius_too_close"] == 0.0
+        assert inn["frac_radius_too_close"] == 1.0
+        assert inn["median_radius_ratio"] < 1.0
+
+
+def test_the_shell_dead_zone_is_free_inside_and_exact_outside():
+    """"Not too strict": one search radius of slack, then the usual quadratic."""
+    ms, _, hr, _, tiles = _sets(_shell_cfg(), host_pos=HOST)
+    pos, vel = _particles(hr, tiles)
+    cfg = _shell_cfg(radius_dead_zone=1.0)
+    for i in range(ms.n_sets):
+        s = float(ms.centre_scale[i])
+        near = member_gather_loss(pos + 0.9 * s * ms.centre_rhat[i], vel, ms,
+                                  cfg, set_indices=[i])[1]
+        far = member_gather_loss(pos + 3.0 * s * ms.centre_rhat[i], vel, ms,
+                                 cfg, set_indices=[i])[1]
+        assert near["term_radius"] == pytest.approx(0.0, abs=1e-12)
+        assert far["term_radius"] == pytest.approx(4.0, rel=1e-4)   # (3-1)^2
+
+
+def test_self_tan_drops_the_radial_direction_and_keeps_the_transverse_one():
+    """The half of `self` that does not fight the shell term."""
+    cfg = _cfg(bg_k=0, centre_mode="self_tan", w_virial=0.0, w_bound=0.0,
+               w_d6=0.0, w_rrms=0.0, w_sigmav=0.0, w_centre=1.0)
+    ms, _, _, fz, tiles = _sets(cfg, host_pos=HOST)
+    pos, vel = _particles(fz, tiles)          # cbar == centre_self exactly
+    slf = dataclasses.replace(cfg, centre_mode="self")
+    for i in range(ms.n_sets):
+        rhat = ms.centre_rhat[i]
+        perp = torch.linalg.cross(rhat, torch.tensor([0.0, 0.0, 1.0],
+                                                     dtype=rhat.dtype))
+        perp = perp / torch.linalg.vector_norm(perp)
+        s = float(ms.centre_scale[i])
+
+        rad = member_gather_loss(pos + 2.0 * s * rhat, vel, ms, cfg,
+                                 set_indices=[i])[1]
+        assert rad["term_centre"] == pytest.approx(0.0, abs=1e-9)
+        # `self` would have charged the full (2)^2 for the same move.
+        assert member_gather_loss(pos + 2.0 * s * rhat, vel, ms, slf,
+                                  set_indices=[i])[1]["term_centre"] == \
+            pytest.approx(4.0, rel=1e-4)
+
+        tan = member_gather_loss(pos + 2.0 * s * perp, vel, ms, cfg,
+                                 set_indices=[i])[1]
+        assert tan["term_centre"] == pytest.approx(
+            member_gather_loss(pos + 2.0 * s * perp, vel, ms, slf,
+                               set_indices=[i])[1]["term_centre"], rel=1e-9)
+
+
+def test_self_fights_the_shell_term_and_self_tan_does_not():
+    """The composition claim, as a number rather than an argument.
+
+    `self` anchors the set's whole position, radius included, so the radial step
+    the shell term asks for is a step `self` charges for -- at equal weights the
+    two settle at half the correction. `self_tan` gives that one coordinate up.
+    """
+    ms, _, _, fz, tiles = _sets(_cfg(bg_k=0), host_pos=HOST)
+    pos, vel = _particles(fz, tiles)
+
+    def centre_term(mode, shift, i):
+        cfg = _cfg(bg_k=0, centre_mode=mode, w_virial=0.0, w_bound=0.0,
+                   w_d6=0.0, w_rrms=0.0, w_sigmav=0.0, w_centre=1.0)
+        return member_gather_loss(pos + shift, vel, ms, cfg,
+                                  set_indices=[i])[1]["term_centre"]
+
+    for i in range(ms.n_sets):
+        step = 1.5 * float(ms.centre_scale[i]) * ms.centre_rhat[i]
+        assert centre_term("self", step, i) > 1.0          # charged for moving
+        assert centre_term("self_tan", step, i) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_shell_term_without_a_host_position_is_refused():
+    """Silently measuring from the origin of the box is the failure mode."""
+    cfg = _shell_cfg()
+    ms, rep, hr, _, tiles = _sets(cfg)                    # no host_pos
+    assert rep["host_pos_supplied"] is False
+    pos, vel = _particles(hr, tiles)
+    with pytest.raises(ValueError, match="w_radius"):
+        member_gather_loss(pos, vel, ms, cfg)
+
+
+def test_self_tan_without_a_host_position_is_refused():
+    """It would silently be a plain `self` run -- the exact mode it is not."""
+    cfg = _cfg(bg_k=0, centre_mode="self_tan")
+    ms, _, hr, _, tiles = _sets(cfg)
+    pos, vel = _particles(hr, tiles)
+    with pytest.raises(ValueError, match="centre_rhat"):
+        member_gather_loss(pos, vel, ms, cfg)
+
+
+def test_the_radius_diagnostic_is_nan_rather_than_zero_without_a_host():
+    """A zero here would read as "the shell is already right"."""
+    cfg = _cfg(bg_k=0)
+    ms, _, hr, _, tiles = _sets(cfg)                      # no host_pos
+    pos, vel = _particles(hr, tiles)
+    d = member_gather_loss(pos, vel, ms, cfg)[1]
+    assert d["has_host"] is False
+    assert np.isnan(d["median_radius_err_radii"])
+    assert np.isnan(d["median_radius_ratio"])
+
+
+def test_the_shell_is_satisfied_by_the_hr_field_it_was_measured_from():
+    """Zero cost at the answer, so the term adds nothing to a solved set."""
+    cfg = _shell_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST)
+    pos, vel = _particles(hr, tiles)
+    loss, d = member_gather_loss(pos, vel, ms, cfg)
+    assert float(loss) == pytest.approx(0.0, abs=1e-9)
+    assert d["median_radius_ratio"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_a_negative_shell_weight_is_refused():
+    with pytest.raises(ValueError, match="w_radius"):
+        _cfg(w_radius=-1.0)
+
+
+def test_a_shell_huber_inside_the_dead_zone_is_refused():
+    with pytest.raises(ValueError, match="radius_huber_radii"):
+        _cfg(radius_dead_zone=2.0, radius_huber_radii=1.0)
+
+
+def test_the_shell_term_has_a_gradient_where_it_charges():
+    """A term with no gradient is a report, not an objective."""
+    cfg = _shell_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST)
+    pos, vel = _particles(hr, tiles)
+    shift = torch.zeros_like(pos, requires_grad=True)
+    loss, _ = member_gather_loss(pos + shift + 2.0 * float(ms.centre_scale[0])
+                                 * ms.centre_rhat[0], vel, ms, cfg,
+                                 set_indices=[0])
+    loss.backward()
+    g = shift.grad[ms.live_rows[0]]
+    assert torch.isfinite(g).all()
+    assert float(g.abs().sum()) > 0.0
+    # Pushed out along +rhat, so the DESCENT direction must point back in.
+    descent = -g.sum(dim=0)
+    descent = descent / torch.linalg.vector_norm(descent)
+    assert float(descent @ ms.centre_rhat[0]) == pytest.approx(-1.0, abs=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# The SOFT shell (`w_shell`): the radius DISTRIBUTION, never an address
+# --------------------------------------------------------------------------- #
+#: The toy's two subhalos sit at [10,10,10] and [30,30,30], symmetrically about
+#: `HOST`, so from it they have the SAME true radius -- and every
+#: address-vs-distribution test below would be vacuous, because an exchange of
+#: two equal numbers is not an exchange. Displacing the host 1 Mpc/h along the
+#: [1,1,1] diagonal moves it toward one and away from the other, so the two
+#: radii differ by exactly 2 Mpc/h and a swap is a real swap.
+HOST_OFF = HOST + 1.0 / np.sqrt(3.0)
+
+
+def _soft_cfg(**kw):
+    """Only the soft shell is live, so a number IS the term under test."""
+    base = dict(bg_k=0, w_virial=0.0, w_bound=0.0, w_d6=0.0, w_rrms=0.0,
+                w_sigmav=0.0, w_centre=0.0, w_radius=0.0, w_shell=1.0,
+                shell_dead_zone=0.0)
+    base.update(kw)
+    return _cfg(**base)
+
+
+def _radii(ms):
+    return [float(torch.linalg.vector_norm(ms.centre_target[i]
+                                           - ms.centre_host[i]))
+            for i in range(ms.n_sets)]
+
+
+def _move_each(pos, ms, shifts):
+    """``pos`` with each set's OWN member rows shifted by its own vector.
+
+    The existing shell tests shift the whole field and evaluate one set with
+    ``set_indices``; that cannot express the state this term is about, which is
+    two sets at different radii at the same time.
+    """
+    p = pos.clone()
+    for i, d in enumerate(shifts):
+        p[ms.live_rows[i]] = p[ms.live_rows[i]] + d
+    return p
+
+
+def _scaled(pos, ms, factors):
+    """Every set moved radially to ``factors[i]`` times its true radius."""
+    r = _radii(ms)
+    return _move_each(pos, ms, [(float(factors[i]) - 1.0) * r[i]
+                                * ms.centre_rhat[i] for i in range(ms.n_sets)])
+
+
+def test_the_soft_shell_is_off_by_default():
+    """Every arm recorded so far ran without it, `all_blocks_selfshell` included."""
+    assert MemberGatherConfig().w_shell == 0.0
+    assert MemberGatherConfig().shell_dead_zone == 0.02
+    cfg = _cfg(bg_k=0)
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    d = member_gather_loss(pos, vel, ms, cfg)[1]
+    assert d["term_shell"] == 0.0
+    assert d["term_eff_shell"] == 0.0
+
+
+def test_the_soft_shell_is_zero_on_the_field_it_was_measured_from():
+    """The module's standing property: the loss never asks for more than HR."""
+    cfg = _soft_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    d = member_gather_loss(pos, vel, ms, cfg)[1]
+    assert d["term_shell"] == pytest.approx(0.0, abs=1e-9)
+    assert d["median_shell_resid"] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_the_soft_shell_is_blind_to_an_exchange_of_radii():
+    """The defining property, and the whole reason the term exists.
+
+    Two sets are put on each OTHER's true radius. The multiset of radii is
+    unchanged, so this term is unchanged -- while `w_radius`, which names every
+    set against its own target, charges the entire swap. That difference is the
+    point: the address `w_radius` charges for has an out-of-sample R^2 of 0.022
+    on the 7,560-set pool, and `all_blocks_selfshell` paid 55% of the abundance
+    (host subhalos 367 -> 167 against HR's 374) memorising it.
+    """
+    cfg = _soft_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    assert ms.n_sets == 2
+    r = _radii(ms)
+    # The toy's design, to within the member scatter: `centre_target` is the
+    # reachable HR CENTROID of each set, not the catalog centre the 1 Mpc/h host
+    # displacement was measured against, so 2.03 rather than 2.00.
+    assert abs(r[0] - r[1]) == pytest.approx(2.0, rel=0.05)
+    swap = _move_each(pos, ms, [(r[1] - r[0]) * ms.centre_rhat[0],
+                                (r[0] - r[1]) * ms.centre_rhat[1]])
+    assert member_gather_loss(swap, vel, ms, cfg)[1]["term_shell"] == \
+        pytest.approx(0.0, abs=1e-5)
+    # ...and the address term charges every bit of it: each set now sits |dr| =
+    # |r0 - r1| from its own target, which in its own search radii is the cost.
+    got = member_gather_loss(swap, vel, ms, _shell_cfg())[1]["term_radius"]
+    dr = abs(r[0] - r[1])
+    want = float(np.mean([(dr / float(ms.centre_scale[i])) ** 2
+                          for i in range(2)]))
+    assert got == pytest.approx(want, rel=1e-3)
+    assert got > 100.0            # the term it replaces, at its worst
+
+
+def test_the_soft_shell_charges_a_uniform_radial_scaling_in_log_space():
+    """The component it exists to keep: every set the same fraction too close.
+
+    That is the frozen field's defect in miniature -- 58.3% of sets sit inside
+    their true radius, median ratio 0.974 -- and it is exactly what survives the
+    sort (signed median -0.026 -> -0.041 on train), so it must be charged at
+    exactly log(f)^2 and stay signed in the diagnostic.
+    """
+    cfg = _soft_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    for f in (0.9, 1.1):
+        d = member_gather_loss(_scaled(pos, ms, [f, f]), vel, ms, cfg)[1]
+        assert d["term_shell"] == pytest.approx(float(np.log(f)) ** 2, rel=1e-3)
+        assert d["median_shell_resid_signed"] == pytest.approx(
+            float(np.log(f)), rel=1e-3)
+
+
+def test_the_soft_shell_dead_zone_is_a_fractional_radius_error():
+    """`log1p(x)`, so the knob means what it says: 5% is 5% of the radius."""
+    cfg = _soft_cfg(shell_dead_zone=0.05)
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    inside = member_gather_loss(_scaled(pos, ms, [1.04, 1.04]), vel, ms, cfg)[1]
+    assert inside["term_shell"] == pytest.approx(0.0, abs=1e-9)
+    assert inside["frac_shell_outside_dead_zone"] == 0.0
+    outside = member_gather_loss(_scaled(pos, ms, [1.10, 1.10]), vel, ms, cfg)[1]
+    assert outside["term_shell"] == pytest.approx(
+        (float(np.log(1.10)) - float(np.log1p(0.05))) ** 2, rel=1e-3)
+    assert outside["frac_shell_outside_dead_zone"] == 1.0
+
+
+def test_the_soft_shell_has_no_plateau_below_its_floor():
+    """`sqrt(|d|^2 + eps^2)` on the candidate, NOT `clamp_min(eps)`.
+
+    A clamp is a flat region below the floor, and collapse toward the host
+    centre is the one failure this term must never stop pushing back on. Two
+    candidate radii well inside the floor must cost DIFFERENT amounts; under a
+    clamp they would be identical and the gradient there would be zero.
+    """
+    cfg = _soft_cfg(shell_eps_mpc_h=0.5)
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    deep = float(member_gather_loss(_scaled(pos, ms, [0.01, 0.01]), vel, ms,
+                                    cfg)[1]["term_shell"])
+    less = float(member_gather_loss(_scaled(pos, ms, [0.02, 0.02]), vel, ms,
+                                    cfg)[1]["term_shell"])
+    assert deep > less                      # strictly worse further in
+    # ...and the gradient survives a set sitting ON the host centre, where a
+    # bare `vector_norm` is not differentiable at all.
+    at = _scaled(pos, ms, [0.0, 0.0]).detach().requires_grad_(True)
+    loss, _ = member_gather_loss(at, vel, ms, cfg)
+    loss.backward()
+    assert torch.isfinite(at.grad).all()
+
+
+def test_the_sorted_pairing_never_costs_more_than_the_address_pairing():
+    """The rearrangement inequality, which is why this term can only ask LESS.
+
+    Rank pairing minimises a convex cost of the difference over every pairing,
+    so the soft shell is a lower bound on the identity-paired cost of the same
+    configuration -- for a monotone-preserving move the two coincide, and for a
+    rank-scrambling one the soft term forgives the scramble.
+    """
+    cfg = _soft_cfg()
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    rng = np.random.default_rng(0)
+    saw_strict = False
+    for _ in range(12):
+        f = rng.uniform(0.4, 2.0, size=2)
+        got = float(member_gather_loss(_scaled(pos, ms, f), vel, ms,
+                                       cfg)[1]["term_shell"])
+        address = float(np.mean(np.log(f) ** 2))     # the identity pairing
+        assert got <= address + 1e-6
+        saw_strict |= got < address - 1e-6
+    assert saw_strict, "no rank-scrambling draw: the bound was never exercised"
+
+
+def test_the_soft_shell_without_a_host_position_is_refused():
+    """It would otherwise match a distribution of distances from the box origin.
+
+    Same guard, and the same reason, as `w_radius`: the host preservation sets
+    are built `host_pos=None` by design, and silently measuring them from the
+    origin is the failure mode this refuses.
+    """
+    cfg = _soft_cfg()
+    ms, _, hr, _, tiles = _sets(cfg)                  # host_pos=None
+    pos, vel = _particles(hr, tiles)
+    with pytest.raises(ValueError, match="w_shell > 0"):
+        member_gather_loss(pos, vel, ms, cfg)
+
+
+def test_the_soft_shell_knobs_refuse_nonsense():
+    with pytest.raises(ValueError, match="w_shell"):
+        _cfg(w_shell=-1.0)
+    with pytest.raises(ValueError, match="shell_dead_zone"):
+        _cfg(shell_dead_zone=-0.1)
+    with pytest.raises(ValueError, match="shell_eps_mpc_h"):
+        _cfg(shell_eps_mpc_h=0.0)
+
+
+def test_the_shell_residual_is_reported_at_w_shell_zero():
+    """Same standing property as `radius_ratio` at `w_radius=0`.
+
+    An arm that cannot report the number cannot be read against one that
+    optimises it, and this is the number to read for this term:
+    `radius_err_radii` barely moves even on a total win, because a perfect
+    distribution match still leaves 79% (train) / 85% (holdout) of the per-set
+    address error standing.
+    """
+    cfg = _cfg(bg_k=0)                                # w_shell = 0
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    d = member_gather_loss(_scaled(pos, ms, [0.9, 0.9]), vel, ms, cfg)[1]
+    assert d["term_shell"] == 0.0
+    assert d["median_shell_resid"] == pytest.approx(abs(float(np.log(0.9))),
+                                                    rel=1e-3)
+    # NaN, not 0, where there is no host: a plotted zero would read as
+    # "the distribution is already right".
+    ms2, _, _, _, _ = _sets(cfg)
+    assert np.isnan(
+        member_gather_loss(pos, vel, ms2, cfg)[1]["median_shell_resid"])
+
+
+def test_the_two_terms_settle_at_half_the_correction_under_self():
+    """The conflict priced, by minimising the actual loss rather than arguing.
+
+    A radial step ``delta`` from the frozen centroid costs
+    ``w_centre (delta/s)^2 + w_radius ((|dr| - delta)/s)^2``, minimised at
+    ``delta* = |dr| w_radius / (w_centre + w_radius)`` -- half at equal weights.
+    Under ``self_tan`` the anchor charges nothing radially and the minimum is the
+    full correction. Both come out on the nose, which is why the submitter warns
+    rather than leaving this to be discovered in a metrics file.
+    """
+    def cfg(mode):
+        return _cfg(bg_k=0, centre_mode=mode, w_virial=0.0, w_bound=0.0,
+                    w_d6=0.0, w_rrms=0.0, w_sigmav=0.0, w_centre=1.0,
+                    w_radius=1.0, radius_dead_zone=0.0)
+
+    ms, _, _, fz, tiles = _sets(cfg("self"), host_pos=HOST)
+    pos, vel = _particles(fz, tiles)
+    for i in range(ms.n_sets):
+        rhat = ms.centre_rhat[i]
+        # The signed step that would put this set exactly on its true shell.
+        dr0 = member_gather_loss(pos, vel, ms, cfg("self"),
+                                 set_indices=[i])[1]["median_radius_err_mpc_h"]
+        full = -dr0
+        for mode, want in (("self", 0.5), ("self_tan", 1.0)):
+            grid = np.linspace(-0.5 * abs(full), 1.5 * abs(full), 201) * np.sign(full)
+            losses = [float(member_gather_loss(pos + float(d) * rhat, vel, ms,
+                                               cfg(mode), set_indices=[i])[0])
+                      for d in grid]
+            assert grid[int(np.argmin(losses))] / full == pytest.approx(
+                want, abs=0.02), mode
+
+
+# --------------------------------------------------------------------------- #
+# The cap policy: which sets survive --max-sets
+# --------------------------------------------------------------------------- #
+# `largest` is right for a subhalo run and is a trap for a mass-window one: the
+# pool of a cluster region IS a mass function, so keeping the top of it drops
+# exactly the small halos a small-halo arm exists to build. These pin that the
+# three policies differ in the way the docstring claims, and that all three
+# return ascending rows -- a reordering alone would move every
+# `--sets-per-step` sample and make two runs incomparable for a reason that has
+# nothing to do with the selection.
+def test_largest_cap_keeps_the_top_of_the_mass_function():
+    from cosmo_sr.features.member_gather import _apply_cap
+
+    rows = np.arange(100, 110)
+    n_sites = np.arange(10, 20) ** 3          # strictly increasing
+    got = _apply_cap(rows, n_sites, 3, "largest", seed=0)
+    assert got.tolist() == [107, 108, 109]
+
+
+def test_stratified_cap_spans_the_mass_range_the_largest_cap_truncates():
+    from cosmo_sr.features.member_gather import _apply_cap
+
+    # A realistic pool: 200 small sets and 5 huge ones, four log2 decades apart.
+    n_sites = np.concatenate([np.full(200, 60), np.full(5, 40_000)])
+    rows = np.arange(n_sites.size)
+    largest = _apply_cap(rows, n_sites, 10, "largest", seed=0)
+    strat = _apply_cap(rows, n_sites, 10, "stratified", seed=0)
+
+    # `largest` spends half its budget on the five giants; `stratified` splits
+    # the budget between the two occupied log2 bins, so the small population
+    # survives the cap in both -- but the giants do not crowd it out.
+    assert set(largest.tolist()) >= set(range(200, 205))
+    assert sum(1 for r in strat if r >= 200) == 5
+    assert sum(1 for r in strat if r < 200) == 5
+    assert list(strat) == sorted(strat)
+
+
+def test_random_cap_is_deterministic_in_the_seed_and_ascending():
+    from cosmo_sr.features.member_gather import _apply_cap
+
+    rows = np.arange(50)
+    n_sites = np.full(50, 100)
+    a = _apply_cap(rows, n_sites, 8, "random", seed=3)
+    b = _apply_cap(rows, n_sites, 8, "random", seed=3)
+    c = _apply_cap(rows, n_sites, 8, "random", seed=4)
+    assert a.tolist() == b.tolist() == sorted(a.tolist())
+    assert a.tolist() != c.tolist()
+    assert len(set(a.tolist())) == 8          # no repeats
+
+
+def test_config_refuses_an_empty_window_and_an_unknown_population():
+    from cosmo_sr.features.member_gather import MemberGatherConfig
+
+    with pytest.raises(ValueError, match="population"):
+        MemberGatherConfig(population="field")
+    with pytest.raises(ValueError, match="max_num_p"):
+        MemberGatherConfig(min_num_p=200, max_num_p=200)
+    with pytest.raises(ValueError, match="set_select"):
+        MemberGatherConfig(set_select="smallest")
+    # The window is a window, not a floor: 200 <= num_p < 2000 is legal.
+    assert MemberGatherConfig(min_num_p=200, max_num_p=2000).max_num_p == 2000
+
+
+# --------------------------------------------------------------------------- #
+# The environment axis: WHICH surroundings the supervised sets come from
+# --------------------------------------------------------------------------- #
+# Why a third selection axis exists at all. `--population all` selected on SIZE
+# and the set9 census measured what that bought: in the edited region the arm
+# built 3,374 net objects and Rockstar filed every one of them as a subhalo
+# (subs +4,260, top-level -886), overshooting HR in `field` (subhalos 3,316
+# against HR's 2,466) while closing 249 of the 6,557-object `near` deficit --
+# 3.8% of the bin that holds 56% of everything missing. Selecting by size cannot
+# reach that, because a cluster region's pool is dominated by field halos and
+# `stratified` stratifies on mass.
+def _env_cat(pos, num_p, rvir, parent_ids=None):
+    n = len(num_p)
+    return SimpleNamespace(
+        n=n, ids=np.arange(n), pos=np.asarray(pos, dtype=np.float64),
+        num_p=np.asarray(num_p, dtype=np.int64),
+        rvir=np.asarray(rvir, dtype=np.float64),
+        parent_ids=(np.full(n, -1, dtype=np.int64) if parent_ids is None
+                    else np.asarray(parent_ids, dtype=np.int64)))
+
+
+def test_halo_environment_bins_by_distance_in_host_rvir():
+    from cosmo_sr.features.subhalo_gather import ENV_LABELS, halo_environment
+
+    # One 1 Mpc/h host at the origin, three halos at 0.5, 2 and 10 of its R_vir.
+    cat = _env_cat(
+        pos=[[50.0, 50.0, 50.0], [50.5, 50.0, 50.0],
+             [52.0, 50.0, 50.0], [60.0, 50.0, 50.0]],
+        num_p=[10000, 100, 100, 100], rvir=[1000.0, 50.0, 50.0, 50.0])
+    env = [ENV_LABELS[e] for e in halo_environment(cat, host_floor=200,
+                                                   boxsize_mpc_h=BOX)]
+    # The host itself is measured against hosts BIGGER than it, of which there
+    # are none, so it is `field` and the label is never self-referential.
+    assert env == ["field", "inside", "near", "field"]
+
+
+def test_halo_environment_is_periodic():
+    from cosmo_sr.features.subhalo_gather import ENV_LABELS, halo_environment
+
+    # The satellite is 0.5 Mpc/h from the host THROUGH the box face. A
+    # non-periodic distance would put it 99.5 away and call it `field`.
+    cat = _env_cat(pos=[[0.25, 50.0, 50.0], [99.75, 50.0, 50.0]],
+                   num_p=[10000, 100], rvir=[1000.0, 50.0])
+    env = [ENV_LABELS[e] for e in halo_environment(cat, host_floor=200,
+                                                   boxsize_mpc_h=BOX)]
+    assert env[1] == "inside"
+
+
+def test_env_mask_any_is_the_identity_and_a_typo_raises():
+    from cosmo_sr.features.subhalo_gather import env_mask
+
+    e = np.array([0, 1, 2, 1])
+    assert env_mask(e, "any").all()
+    assert env_mask(e, "near").tolist() == [False, True, False, True]
+    assert env_mask(e, "near,field").tolist() == [False, True, True, True]
+    # A typo must not quietly select nothing: that would surface four steps
+    # later as the unrelated "no supervised sets survived".
+    with pytest.raises(ValueError, match="unknown environments"):
+        env_mask(e, "nearby")
+
+
+def test_env_select_filters_the_pool_and_records_the_mix():
+    # The toy's two subhalos sit 10 and 30 Mpc/h from the host, whose R_vir is
+    # 1 Mpc/h -- so both are `field` by the census's own bins. Asking for `near`
+    # must therefore empty the pool, and asking for `field` must keep it whole.
+    cat, oidx, tiles, hr, fz = _toy()
+    from cosmo_sr.features.subhalo_gather import halo_environment
+    env = halo_environment(cat, host_floor=100, boxsize_mpc_h=BOX)
+
+    def build(sel):
+        rep = {}
+        ms = build_member_sets(cat, oidx, tiles, hr, fz, _cfg(env_select=sel),
+                               particle_mass_msun_h=M_P, ng_hr=NG, tile_hr=TILE,
+                               boxsize_mpc_h=BOX, dis_scale_mpc_h=DIS,
+                               vel_scale_kms=VEL, env=env, report=rep)
+        return ms, rep
+
+    ms, rep = build("field")
+    assert ms.n_sets == 2
+    assert rep["n_by_env"] == {"inside": 0, "near": 0, "field": 2}
+    assert rep["n_after_env"] == 2
+    with pytest.raises(ValueError, match="no supervised sets survived"):
+        build("near")
+
+    # `any` records the same mix without cutting: an untargeted run's row is
+    # what makes a targeted run's row readable as a change.
+    ms, rep = build("any")
+    assert ms.n_sets == 2 and rep["n_by_env"]["field"] == 2
+
+
+def test_env_select_refuses_to_run_without_the_labels():
+    # A selection silently not applied is the failure mode `--set-select
+    # largest` under `--population all` already paid for once.
+    cat, oidx, tiles, hr, fz = _toy()
+    with pytest.raises(ValueError, match="no `env` array was passed"):
+        build_member_sets(cat, oidx, tiles, hr, fz, _cfg(env_select="near"),
+                          particle_mass_msun_h=M_P, ng_hr=NG, tile_hr=TILE,
+                          boxsize_mpc_h=BOX, dis_scale_mpc_h=DIS,
+                          vel_scale_kms=VEL, report={})
+
+
+def test_the_cap_stratifies_over_mass_AND_environment():
+    from cosmo_sr.features.member_gather import _apply_cap
+
+    # 40 sets: 20 small field, 20 large near. Mass-only stratification has two
+    # bins that happen to coincide with the environments here, so the test that
+    # bites is the OTHER way round -- one mass bin spanning both environments.
+    rows = np.arange(40)
+    n_sites = np.full(40, 100)             # one mass bin for all of them
+    env = np.array([2] * 20 + [1] * 20)    # 20 field, 20 near
+    keep = _apply_cap(rows, n_sites, 10, "stratified", seed=0, env=env)
+    got = env[keep]
+    assert keep.size == 10
+    assert int((got == 1).sum()) == 5 and int((got == 2).sum()) == 5
+    # Without the env axis the single mass bin is drained in whatever order the
+    # shuffle produced, and the balance is not guaranteed.
+    plain = _apply_cap(rows, n_sites, 10, "stratified", seed=0)
+    assert plain.size == 10
+    # Ascending rows in both cases: the cap changes WHICH sets, never the order.
+    assert np.all(np.diff(keep) > 0) and np.all(np.diff(plain) > 0)
+
+
+# --------------------------------------------------------------------------- #
+# The isolation term: the only INTER-set statement in the loss
+# --------------------------------------------------------------------------- #
+def _iso_setup(**cfgkw):
+    """Sets with a background, plus the HR particle table as the candidate.
+
+    Candidate == HR means every statistic sits exactly at its reference, so any
+    non-zero isolation cost in what follows is caused by the perturbation under
+    test and not by the toy's starting point.
+    """
+    kw = dict(bg_k=256, bg_radius_factor=4.0, iso_min_count=1.0,
+              w_isolation=1.0, w_virial=0.0, w_bound=0.0, w_d6=0.0,
+              w_rrms=0.0, w_sigmav=0.0, w_centre=0.0)
+    kw.update(cfgkw)
+    cfg = _cfg(**kw)
+    # A TIGHT non-member cloud, unlike the default toy's: the isolation
+    # count is a count, and at the default 1.2 Mpc/h scale the background
+    # sphere holds ten particles and the soft count is half of one -- which
+    # is precisely the regime `iso_min_count` exists to refuse to score.
+    ms, rep, hr, fz, tiles = _sets(cfg, bg_scale=0.35)
+    pos, vel = _particles(hr, tiles)
+    return cfg, ms, pos, vel
+
+
+def _squeeze_background(pos, ms, s, factor):
+    """Move set ``s``'s background particles radially by ``factor`` about the
+    set's own centroid. < 1 is a pedestal growing on the object; > 1 is a
+    neighbourhood cleaner than HR's."""
+    out = pos.clone()
+    bg = ms.bg_rows[s]
+    c = pos[ms.live_rows[s]].mean(dim=0, keepdim=True)
+    out[bg] = c + factor * (pos[bg] - c)
+    return out
+
+
+def test_isolation_is_exactly_zero_when_the_candidate_is_hr():
+    cfg, ms, pos, vel = _iso_setup()
+    loss, diag = member_gather_loss(pos, vel, ms, cfg)
+    assert diag["n_iso"] == ms.n_sets
+    assert diag["term_isolation"] == pytest.approx(0.0, abs=1e-9)
+    assert diag["median_iso_ratio"] == pytest.approx(1.0, rel=1e-6)
+    assert float(loss) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_isolation_charges_a_pedestal_growing_on_the_object():
+    # THE failure this term exists for. Every other term is a moment of the
+    # MEMBERS about their own centroid, so pulling non-member mass onto the
+    # object costs nothing anywhere else in the loss -- and that is exactly the
+    # state that makes Rockstar file the object as somebody's subhalo, which is
+    # what `--population all` measured itself doing 4,260 times.
+    cfg, ms, pos, vel = _iso_setup()
+    piled = _squeeze_background(pos, ms, 0, 0.35)
+    _, diag = member_gather_loss(piled, vel, ms, cfg)
+    assert diag["median_iso_ratio"] > 1.0
+    assert diag["term_isolation"] > 0.0
+    # The members did not move, so no other term noticed. That IS the finding.
+    for k in ("virial", "rrms", "sigmav", "bound", "centre"):
+        assert diag[f"term_{k}"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_isolation_is_hinged_a_cleaner_neighbourhood_is_free():
+    # The module's standing property: the loss may never ask for more than HR
+    # has. A candidate whose surroundings are emptier than HR's is not charged.
+    cfg, ms, pos, vel = _iso_setup()
+    swept = _squeeze_background(pos, ms, 0, 2.5)
+    _, diag = member_gather_loss(swept, vel, ms, cfg)
+    assert diag["median_iso_ratio"] < 1.0
+    assert diag["term_isolation"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_isolation_gradient_reaches_the_background_and_not_the_members():
+    # The centroid is DETACHED on purpose: the term must push the surrounding
+    # mass out to where HR has it, not let the set run away from the pile. A
+    # live centroid would permit the second, and would put this term in the same
+    # tug-of-war with `centre_mode="self"` that `w_radius` lost (docs s.14).
+    cfg, ms, pos, vel = _iso_setup()
+    x = _squeeze_background(pos, ms, 0, 0.35).requires_grad_(True)
+    loss, _ = member_gather_loss(x, vel, ms, cfg)
+    loss.backward()
+    g = x.grad
+    assert float(g[ms.bg_rows[0]].abs().sum()) > 0.0
+    assert float(g[ms.live_rows[0]].abs().sum()) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_isolation_skips_sets_whose_hr_background_is_shot_noise():
+    # A ratio taken on three particles is the background sampler's seed, not a
+    # measurement, and hinging on it would charge the run for that seed.
+    cfg, ms, pos, vel = _iso_setup(iso_min_count=1e9)
+    piled = _squeeze_background(pos, ms, 0, 0.2)
+    _, diag = member_gather_loss(piled, vel, ms, cfg)
+    assert diag["n_iso"] == 0
+    assert diag["term_isolation"] == pytest.approx(0.0, abs=1e-12)
+    assert np.isnan(diag["median_iso_ratio"])
+
+
+def test_the_isolation_ratio_is_measured_even_at_weight_zero():
+    # The four velocity-guard arms failed on the one quantity none of them
+    # logged. The count is a sum over <=bg_k particles against a step dominated
+    # by O(N^2) pair blocks, so there is no reason to be blind here.
+    cfg, ms, pos, vel = _iso_setup()
+    off = dataclasses.replace(cfg, w_isolation=0.0)
+    piled = _squeeze_background(pos, ms, 0, 0.35)
+    _, diag = member_gather_loss(piled, vel, ms, off)
+    assert diag["median_iso_ratio"] > 1.0
+    assert diag["term_eff_isolation"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_the_counting_radius_comes_from_hr_not_from_the_candidate():
+    # If the radius tracked the candidate's own size the run could satisfy the
+    # term by SHRINKING the sphere instead of clearing it -- which is the
+    # gaming failure `docs/sr2_gather_finetune.md` s.6 records for the window
+    # loss, in a new costume. The radius is a stored constant of the data.
+    cfg, ms, pos, vel = _iso_setup()
+    assert np.all(ms.iso_radius > 0.0)
+    stored = ms.iso_radius.copy()
+    collapsed = pos.clone()
+    for s in range(ms.n_sets):
+        c = pos[ms.live_rows[s]].mean(dim=0, keepdim=True)
+        collapsed[ms.live_rows[s]] = c + 0.01 * (pos[ms.live_rows[s]] - c)
+    member_gather_loss(collapsed, vel, ms, cfg)
+    assert np.allclose(ms.iso_radius, stored)
+
+
+# --------------------------------------------------------------------------- #
+# The splits: WHICH population and WHICH environment moved
+# --------------------------------------------------------------------------- #
+def test_the_loss_splits_its_diagnostics_by_population_and_environment():
+    # `MemberSets.parent_id` was added for exactly this and nothing read it, so
+    # `all_blocks_smallhalo` spent 6.9 GPU-hours on a top-level hypothesis and
+    # reported one number pooled over both populations. A pooled median cannot
+    # tell "the objective is wrong" from "the objective got no budget", and
+    # those need different next runs.
+    cat, oidx, tiles, hr, fz = _toy()
+    from cosmo_sr.features.subhalo_gather import halo_environment
+    env = halo_environment(cat, host_floor=100, boxsize_mpc_h=BOX)
+    rep = {}
+    ms = build_member_sets(cat, oidx, tiles, hr, fz, _cfg(bg_k=128),
+                           particle_mass_msun_h=M_P, ng_hr=NG, tile_hr=TILE,
+                           boxsize_mpc_h=BOX, dis_scale_mpc_h=DIS,
+                           vel_scale_kms=VEL, env=env, report=rep)
+    pos, vel = _particles(fz, tiles)
+    _, diag = member_gather_loss(pos, vel, ms, _cfg(bg_k=128))
+
+    pop, by_env = diag["by_population"], diag["by_env"]
+    # The toy's two sets are both satellites of catalog id 1, and both `field`.
+    assert pop["sub"]["n"] == 2.0 and pop["top"]["n"] == 0.0
+    assert by_env["field"]["n"] == 2.0
+    assert by_env["near"]["n"] == 0.0 and by_env["inside"]["n"] == 0.0
+    # Counts sum to the sets evaluated, in both splits: a set that fell out of
+    # every bin would be a bookkeeping bug that a pooled number would hide.
+    assert sum(v["n"] for v in pop.values()) == float(diag["n_sets"])
+    assert sum(v["n"] for v in by_env.values()) == float(diag["n_sets"])
+    # An empty split reports n = 0 with NaN medians rather than vanishing: a
+    # missing key reads as a bug, a zero reads as a fact.
+    assert np.isnan(pop["top"]["bound_hard"])
+    assert pop["sub"]["bound_hard"] == pytest.approx(diag["median_bound_hard"])
+
+
+def test_the_host_guard_keeps_every_environment_whatever_the_arm_selects():
+    """A run that supervises only the infall region still damages the hosts it
+    is not being asked to build. Narrowing the guard with the objective would
+    remove the protection exactly where the new work is happening."""
+    import sys as _sys
+    from pathlib import Path as _P
+    for _p in (_P(__file__).resolve().parents[2] / "scripts" / "features",
+               _P(__file__).resolve().parents[2] / "scripts" / "reward"):
+        if str(_p) not in _sys.path:
+            _sys.path.insert(0, str(_p))
+    from finetune_member_gather import host_member_config
+
+    mcfg = _cfg(env_select="near", w_radius=1.0, centre_mode="radial")
+    args = SimpleNamespace(host_min_num_p=200, host_max_sets=256)
+    h = host_member_config(mcfg, args)
+    assert h.env_select == "any"
+    assert h.population == "top" and h.max_num_p == 0
+    assert h.centre_mode == "self" and h.w_radius == 0.0
+    # The isolation weight IS inherited: for a host, "more non-member mass
+    # inside my radius than the FROZEN field had" is the accretion that
+    # re-parents it, which is the damage the guard exists to charge for.
+    assert h.w_isolation == mcfg.w_isolation
+
+
+# --------------------------------------------------------------------------- #
+# `shell_quantiles`: ask only for the part of the distribution that transfers
+# --------------------------------------------------------------------------- #
+def test_shell_quantiles_is_off_by_default_and_rejects_negatives():
+    """Every arm through 2026-09-08 ran the full rank-by-rank pairing."""
+    assert MemberGatherConfig().shell_quantiles == 0
+    with pytest.raises(ValueError, match="shell_quantiles"):
+        _cfg(shell_quantiles=-1)
+
+
+def test_shell_reduce_at_q_zero_is_the_sorted_log_pairing():
+    """Q=0 must be the pre-2026-09-09 term exactly, or no arm is comparable."""
+    cfg = _soft_cfg(shell_quantiles=0)
+    rc = torch.tensor([3.0, 1.0, 2.0])
+    rt = torch.tensor([2.0, 4.0, 1.0])
+    lc, lt = member_gather.shell_reduce(rc, rt, cfg)
+    assert torch.allclose(lc, torch.log(torch.tensor([1.0, 2.0, 3.0])))
+    assert torch.allclose(lt, torch.log(torch.tensor([1.0, 2.0, 4.0])))
+
+
+def test_shell_quantiles_bins_by_equal_count_and_means_in_log():
+    """Six sorted radii into three bins is three pairs, averaged in LOG space.
+
+    Equal-COUNT, not equal-radius: each bin must carry the same weight however
+    the radii pile up, or a dense inner shell would outvote the outskirts.
+    """
+    cfg = _soft_cfg(shell_quantiles=3)
+    r = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    lc, _lt = member_gather.shell_reduce(r, r, cfg)
+    want = torch.tensor([np.log([1.0, 2.0]).mean(), np.log([3.0, 4.0]).mean(),
+                         np.log([5.0, 6.0]).mean()], dtype=lc.dtype)
+    assert lc.shape == (3,)
+    assert torch.allclose(lc, want, atol=1e-6)
+
+
+def test_shell_quantiles_at_or_above_n_is_the_full_pairing():
+    """A small host must never be charged on emptier bins than it has sets."""
+    r = torch.tensor([1.0, 2.0, 3.0])
+    for q in (3, 4, 99):
+        lc, _ = member_gather.shell_reduce(r, r, _soft_cfg(shell_quantiles=q))
+        assert lc.shape == (3,), q
+
+
+def test_shell_quantiles_hides_a_rank_wiggle_that_the_full_pairing_charges():
+    """The whole point: an equal-and-opposite rank swap inside a bin is free.
+
+    That swap is the per-host detail the 2026-09-08 sweep memorised -- train
+    residual 7.3x against holdout 1.4x. Q must be blind to it while staying
+    sensitive to a shift of the distribution itself.
+    """
+    cfg0, cfg2 = _soft_cfg(shell_quantiles=0), _soft_cfg(shell_quantiles=2)
+    rt = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    # Same bin means in log, different rank-by-rank values: sqrt(2)*(1,2) has
+    # the same log mean as (1,2)... build it explicitly.
+    inner = torch.tensor([np.exp(np.log([1.0, 2.0]).mean() - 0.3),
+                          np.exp(np.log([1.0, 2.0]).mean() + 0.3)])
+    outer = torch.tensor([np.exp(np.log([4.0, 8.0]).mean() - 0.3),
+                          np.exp(np.log([4.0, 8.0]).mean() + 0.3)])
+    rc = torch.cat([inner, outer]).float()
+    q2 = float(member_gather.shell_charge(
+        *member_gather.shell_reduce(rc, rt, cfg2), cfg2))
+    q0 = float(member_gather.shell_charge(
+        *member_gather.shell_reduce(rc, rt, cfg0), cfg0))
+    assert q2 == pytest.approx(0.0, abs=1e-10), "bin means match; Q=2 is free"
+    assert q0 > 1e-3, "the full pairing still charges the within-bin wiggle"
+
+
+def test_shell_quantiles_still_charges_a_shift_of_the_distribution():
+    """Blind to the wiggle, not blind to the signal the term exists for."""
+    cfg = _soft_cfg(shell_quantiles=2)
+    rt = torch.tensor([1.0, 2.0, 4.0, 8.0])
+    lc, lt = member_gather.shell_reduce(0.5 * rt, rt, cfg)
+    assert float(member_gather.shell_charge(lc, lt, cfg)) > 0.4
+
+
+def test_shell_quantiles_keeps_a_gradient_on_every_set_in_the_bin():
+    """A bin mean must not park the gradient on one representative member."""
+    cfg = _soft_cfg(shell_quantiles=2)
+    rc = torch.tensor([1.0, 2.0, 4.0, 8.0], requires_grad=True)
+    rt = torch.tensor([2.0, 3.0, 6.0, 9.0])
+    member_gather.shell_charge(*member_gather.shell_reduce(rc, rt, cfg),
+                               cfg).backward()
+    assert torch.all(rc.grad != 0.0)
+
+
+def test_the_soft_shell_at_q_zero_is_unchanged_end_to_end():
+    """The full loss at Q=0 must equal the default config's, on real sets."""
+    ms, _, hr, _, tiles = _sets(_soft_cfg(), host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    moved = _scaled(pos, ms, [1.4, 0.7])
+    a = member_gather_loss(moved, vel, ms, _soft_cfg())[1]["term_shell"]
+    b = member_gather_loss(moved, vel, ms,
+                           _soft_cfg(shell_quantiles=0))[1]["term_shell"]
+    assert a == pytest.approx(b, rel=1e-12)
+
+
+def test_shell_radii_matches_the_in_loop_radii():
+    """The cheap path must measure the same thing as the loss's own shell.
+
+    `shell_radii` exists so a noise-averaged shell can add a draw for the price
+    of a forward pass instead of the O(N^2) statistics. If it disagreed with the
+    in-loop radii the average would be of two different quantities.
+    """
+    cfg = _soft_cfg(max_set_particles=0)
+    ms, _, hr, _, tiles = _sets(cfg, host_pos=HOST_OFF)
+    pos, vel = _particles(hr, tiles)
+    moved = _scaled(pos, ms, [1.4, 0.7])
+    rc, rt = member_gather.shell_radii(moved, ms, cfg)
+    lc, lt = member_gather.shell_reduce(rc, rt, cfg)
+    charged = float(member_gather.shell_charge(lc, lt, cfg))
+    assert charged == pytest.approx(
+        member_gather_loss(moved, vel, ms, cfg)[1]["term_shell"], rel=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# The noise-averaged shell: mean-then-charge, not charge-then-mean
+# --------------------------------------------------------------------------- #
+def test_averaging_identical_draws_leaves_the_charge_unchanged():
+    """The swap `gather - charge(primary) + charge(mean)` must be a no-op when
+    the draws agree, or every arm's step-0 value would shift for no reason."""
+    cfg = _soft_cfg()
+    rc = torch.tensor([1.0, 2.0, 5.0]), torch.tensor([1.0, 2.0, 5.0])
+    rt = torch.tensor([1.5, 2.5, 4.0])
+    curves = [member_gather.shell_reduce(r, rt, cfg)[0] for r in rc]
+    lt = member_gather.shell_reduce(rc[0], rt, cfg)[1]
+    mean_c = float(member_gather.shell_charge(
+        torch.stack(curves).mean(dim=0), lt, cfg))
+    assert mean_c == pytest.approx(
+        float(member_gather.shell_charge(curves[0], lt, cfg)), rel=1e-12)
+
+
+def test_mean_then_charge_is_not_charge_then_mean():
+    """The whole reason the averaging is done on the CURVE. Two draws that
+    straddle the target average to it exactly; charging each draw first and
+    averaging the costs keeps both penalties and asks for a distribution every
+    single realisation must hit -- which is the per-realisation objective the
+    2026-09-08 arm was already gaming."""
+    cfg = _soft_cfg(shell_dead_zone=0.0)
+    rt = torch.tensor([2.0, 4.0])
+    lo, hi = 0.5 * rt, 2.0 * rt              # straddle in log space
+    lt = member_gather.shell_reduce(rt, rt, cfg)[1]
+    curves = [member_gather.shell_reduce(r, rt, cfg)[0] for r in (lo, hi)]
+    mean_then_charge = float(member_gather.shell_charge(
+        torch.stack(curves).mean(dim=0), lt, cfg))
+    charge_then_mean = float(np.mean([
+        float(member_gather.shell_charge(c, lt, cfg)) for c in curves]))
+    assert mean_then_charge == pytest.approx(0.0, abs=1e-10)
+    assert charge_then_mean > 0.4

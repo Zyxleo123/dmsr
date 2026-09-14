@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "featur
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "reward"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from finetune_member_gather import verdict  # noqa: E402
+from finetune_member_gather import (  # noqa: E402
+    HostTask, draw_seeds, fresh_draw_index, verdict,
+)
 
 
 # highk_max_holdout=0 is the historical train-only verdict, so every test below
@@ -114,10 +117,21 @@ def _wpool(n_hosts=2, **over):
     d = {"label": "train", "n_hosts": n_hosts, "n_sets_total": 300,
          "gather": 1.83, "bound_hard": 0.42, "virial": 6.1,
          "centre_offset_radii": 0.3,
+         "radius_err_radii": 2.8, "radius_ratio": 0.97,
+         # The SOFT shell's residual: the sorted-pairing log ratio, which is the
+         # number to read for --w-shell. It moves where `radius_err_radii` does
+         # not, a perfect distribution match leaving 79%/85% of the per-set
+         # address error standing by construction.
+         "shell_resid": 0.079, "shell_resid_signed": -0.041,
          "r_rms_over_hr": 1.1, "sigma_v_over_hr": 1.05, "low_k": 0.004,
          "highk_ratio": 1.2, "highk_ratio_max": 1.4, "vel_rms_ratio": 0.99,
+         # The pedestal: how much non-member mass sits on the supervised
+         # objects, against HR on the same particle ids. > 1 is the state
+         # that makes Rockstar file them as somebody's subhalos.
+         "iso_ratio": 1.34, "iso_above_hr": 0.71,
          "term_virial": 0.9, "term_bound": 0.4, "term_d6": 0.2,
          "term_rrms": 0.13, "term_sigmav": 0.1, "term_centre": 0.1,
+         "term_radius": 0.0, "term_shell": 0.0, "term_isolation": 0.6,
          # `term_raw_*` is the unweighted term the --term-norm scales are
          # measured from; `term_eff_*` is what actually entered the loss, and
          # under normalisation it is `term_eff_*`, not `term_*`, that sums to
@@ -125,10 +139,27 @@ def _wpool(n_hosts=2, **over):
          # from the charts without reopening metrics.jsonl.
          **{f"term_raw_{k}": v for k, v in
             (("virial", 0.9), ("bound", 0.4), ("d6", 0.2),
-             ("rrms", 0.43), ("sigmav", 0.33), ("centre", 0.1))},
+             ("rrms", 0.43), ("sigmav", 0.33), ("centre", 0.1),
+             ("radius", 2.4), ("shell", 0.071), ("isolation", 1.7))},
          **{f"term_eff_{k}": v for k, v in
             (("virial", 1.0), ("bound", 1.0), ("d6", 1.0),
-             ("rrms", 0.3), ("sigmav", 0.3), ("centre", 1.0))},
+             ("rrms", 0.3), ("sigmav", 0.3), ("centre", 1.0),
+             ("radius", 0.0), ("shell", 0.0), ("isolation", 0.5))},
+         # The splits. One series per (split, bin, field): the chart
+         # `all_blocks_smallhalo` needed and did not have, since a median
+         # pooled over both populations could not say whether its top-level
+         # sets -- its entire hypothesis -- were moving.
+         "by_population": {"sub": {"n": 180.0, "bound_hard": 0.44,
+                                   "virial": 5.8,
+                                   "centre_offset_radii": 0.28,
+                                   "iso_ratio": 1.21},
+                           "top": {"n": 120.0, "bound_hard": 0.31,
+                                   "virial": 7.2,
+                                   "centre_offset_radii": 0.35,
+                                   "iso_ratio": 1.55}},
+         "by_env": {"near": {"n": 40.0, "bound_hard": 0.29, "virial": 8.0,
+                             "centre_offset_radii": 0.4,
+                             "iso_ratio": 1.9}},
          "per_host": [{"key": "set3:h1", "bound_hard": 0.40,
                        "centre_offset_radii": 0.2, "highk_ratio": 1.1},
                       {"key": "set3:h2", "bound_hard": 0.44,
@@ -334,3 +365,190 @@ def test_unsup_gate_is_inert_with_no_unsup_pool():
     """No unsupervised pool built is a missing measurement, not a breach."""
     v = verdict(_row(0.00, 0.00), _row(0.60, 0.55), UNSUP_ARGS)
     assert "GUARD FAILED" not in v["text"]
+
+
+def test_the_population_and_environment_splits_reach_wandb():
+    """The chart `all_blocks_smallhalo` needed and did not have.
+
+    Its hypothesis was entirely about TOP-LEVEL halos and its eval reported one
+    median pooled over both populations, so "the objective is wrong" and "the
+    objective never got any budget" were indistinguishable until a Rockstar gate
+    answered it ten hours later. They need different next runs.
+    """
+    flat = wandb_row(_wrow())
+    assert flat["train/top/n"] == 120.0
+    assert flat["train/top/iso_ratio"] == 1.55
+    assert flat["holdout/sub/bound_hard"] == 0.44
+    assert flat["train/near/iso_ratio"] == 1.9
+
+
+def test_pooling_a_split_sums_counts_and_medians_the_rest():
+    """A host contributing zero sets to a split must not drag its medians toward
+    NaN, and must not silently vanish from the count either -- that distinction
+    is what makes "the near bin got 4 sets" readable as a SELECTION failure
+    rather than as a learning one."""
+    from finetune_member_gather import _pool_splits
+
+    rows = [{"by_env": {"near": {"n": 4.0, "bound_hard": 0.2, "virial": 3.0,
+                                 "centre_offset_radii": 0.5, "iso_ratio": 1.1},
+                        "field": {"n": 0.0, "bound_hard": float("nan"),
+                                  "virial": float("nan"),
+                                  "centre_offset_radii": float("nan"),
+                                  "iso_ratio": float("nan")}}},
+            {"by_env": {"near": {"n": 6.0, "bound_hard": 0.4, "virial": 5.0,
+                                 "centre_offset_radii": 0.7, "iso_ratio": 1.3},
+                        "field": {"n": 10.0, "bound_hard": 0.9, "virial": 2.0,
+                                  "centre_offset_radii": 0.1,
+                                  "iso_ratio": 0.8}}}]
+    out = _pool_splits(rows, "by_env")
+    assert out["near"]["n"] == 10.0
+    assert out["near"]["bound_hard"] == pytest.approx(0.3)
+    # The empty host is counted (0) but does not enter the median.
+    assert out["field"]["n"] == 10.0
+    assert out["field"]["bound_hard"] == pytest.approx(0.9)
+
+
+# --------------------------------------------------------------------------- #
+# The early Rockstar gate
+# --------------------------------------------------------------------------- #
+def test_save_atomic_leaves_no_partial_file_for_a_concurrent_reader():
+    """The whole point of a mid-run snapshot is that a gate may read the run
+    directory WHILE the trainer is writing it. A plain torch.save to a live path
+    is a multi-second non-atomic write, and the export spends ~138 s reading; the
+    collision is a torch unpickling error whose message says nothing about a
+    race. os.replace is atomic on POSIX, so a reader sees the old file or the new
+    one and never half of either."""
+    import os
+    import tempfile
+    import torch
+    from finetune_member_gather import save_atomic
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "tuned.pt"
+        save_atomic({"model": {"a": torch.zeros(3)}, "step": 1}, p)
+        first = torch.load(p, map_location="cpu", weights_only=False)
+        save_atomic({"model": {"a": torch.ones(3)}, "step": 2}, p)
+        second = torch.load(p, map_location="cpu", weights_only=False)
+        assert first["step"] == 1 and second["step"] == 2
+        # No temp file survives either write -- a stray .tmp<pid> in the run dir
+        # would be picked up by nothing, but it would sit on the same quota that
+        # has already killed three stages of this pipeline.
+        assert [f for f in os.listdir(d) if ".tmp" in f] == []
+
+
+def test_save_atomic_cleans_up_when_the_write_fails():
+    import os
+    import tempfile
+    from finetune_member_gather import save_atomic
+
+    class Unpicklable:
+        def __reduce__(self):
+            raise RuntimeError("boom")
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "tuned.pt"
+        with pytest.raises(RuntimeError, match="boom"):
+            save_atomic({"model": Unpicklable()}, p)
+        # The real path was never created, and no temp file is left behind: a
+        # half-written .tmp that later got renamed would be the exact corruption
+        # this function exists to prevent.
+        assert not p.exists()
+        assert os.listdir(d) == []
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("", []), ("2000", [2000]), ("1000,2000", [1000, 2000]),
+    (" 500 2000 ", [500, 2000]), ("2000,2000", [2000]),
+])
+def test_gate_steps_parses_and_dedupes(raw, want):
+    from finetune_member_gather import build_parser, gate_steps
+
+    a = build_parser().parse_args(["--gate-at-steps", raw, "--steps", "8000"])
+    assert gate_steps(a) == want
+
+
+@pytest.mark.parametrize("raw", ["8000", "9000", "0", "-100", "abc"])
+def test_gate_steps_refuses_a_snapshot_that_would_never_be_written(raw):
+    """A gate chain queued against a snapshot outside (0, --steps) strands four
+    jobs on DependencyNeverSatisfied with nothing to read. Catch it at startup,
+    where the message can say why."""
+    from finetune_member_gather import build_parser, gate_steps
+
+    a = build_parser().parse_args(["--gate-at-steps", raw, "--steps", "8000"])
+    with pytest.raises(SystemExit):
+        gate_steps(a)
+
+
+# --------------------------------------------------------------------------- #
+# The noise realisation: draw bookkeeping
+#
+# MEASURED 2026-09-08: the w_shell=30 arm drove its train residual 7.3x while
+# holdout moved 1.4x. A run holds (LR tile, noise tile) constant for 8000 steps,
+# so the noise is an input channel carrying real per-tile detail and zero
+# generalisable information -- a memorisation channel. These pin the machinery
+# that removes it, and above all pin that the DEFAULT is the old single draw.
+# --------------------------------------------------------------------------- #
+def _nargs(**kw):
+    base = dict(seed=0, noise_draws=1, noise_mode="fixed",
+                fresh_noise_eval=False, shell_noise_draws=0)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_a_default_run_has_exactly_one_draw_and_no_reserved_one():
+    """Byte-identical to every arm before 2026-09-09, or nothing is comparable."""
+    a = _nargs()
+    assert draw_seeds(a) == [0]
+    assert fresh_draw_index(a) is None
+
+
+def test_draw_zero_is_always_the_run_seed():
+    """Entry 0 must be `--seed` itself so the rotating path starts where the
+    fixed path is, and a rotating run can be read against a fixed one."""
+    for kw in ({}, dict(noise_draws=4), dict(fresh_noise_eval=True),
+               dict(noise_draws=3, fresh_noise_eval=True)):
+        assert draw_seeds(_nargs(seed=7, **kw))[0] == 7
+
+
+def test_the_fresh_draw_is_reserved_after_every_training_draw():
+    """The reserved draw must sit past the last TRAINED index, or the fresh eval
+    would be measured on a realisation the run had already optimised against and
+    the 2x2 would say nothing."""
+    a = _nargs(noise_draws=3, fresh_noise_eval=True)
+    seeds = draw_seeds(a)
+    assert len(seeds) == 4
+    assert fresh_draw_index(a) == 3
+    assert fresh_draw_index(a) not in range(3)
+
+
+def test_seeds_are_distinct_so_the_draws_are_distinct():
+    seeds = draw_seeds(_nargs(seed=5, noise_draws=4, fresh_noise_eval=True))
+    assert len(set(seeds)) == len(seeds) == 5
+
+
+def test_fresh_eval_alone_still_reserves_a_draw():
+    """`--fresh-noise-eval` is a measurement, usable without any rotation: it
+    asks what the single-draw run already on disk would score on fresh noise."""
+    a = _nargs(fresh_noise_eval=True)
+    assert draw_seeds(a) == [0, 1000]
+    assert fresh_draw_index(a) == 1
+
+
+def test_sets_at_falls_back_to_the_single_table():
+    """A task built before the draw axis existed must still be readable."""
+    t = SimpleNamespace(sets="S", sets_by_draw=None, host_sets="H",
+                        host_sets_by_draw=None)
+    assert HostTask.sets_at(t, 0) == "S"
+    assert HostTask.sets_at(t, 3) == "S"
+    assert HostTask.host_sets_at(t, 2) == "H"
+
+
+def test_sets_at_selects_the_draws_own_table():
+    """`centre_self` and the hybrid reference are functions of the frozen field,
+    so a draw MUST read its own table; borrowing draw 0's anchor would charge
+    the run for ordinary realisation scatter."""
+    t = SimpleNamespace(sets="S0", sets_by_draw=["S0", "S1", "S2"],
+                        host_sets="H0", host_sets_by_draw=["H0", "H1", "H2"])
+    assert [HostTask.sets_at(t, d) for d in range(3)] == ["S0", "S1", "S2"]
+    assert [HostTask.host_sets_at(t, d) for d in range(3)] == ["H0", "H1", "H2"]
+    assert HostTask.n_draws.fget(t) == 3
