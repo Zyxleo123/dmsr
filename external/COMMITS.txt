@@ -5,3 +5,14 @@ SRS-map2map  https://github.com/yueyingn/SRS-map2map  77e68576b538f710ade66443b7
 # Rockstar is cloned under external/rockstar (TIPSY I/O stubbed for missing libtirpc).
 # See external/rockstar/BUILD_NOTE.txt for the exact build commit + flags.
 rockstar     https://github.com/yt-project/rockstar  (see external/rockstar/BUILD_NOTE.txt)
+# GADGET-4 is cloned under external/gadget4, built ONLY to run SUBFIND on our
+# snapshots in post-processing mode (see docs/sr2_subfind_crosscheck.md).
+# Four files in the clone are ours, because the upstream build system has no
+# notion of a cluster whose only toolchain is a conda env:
+#   Config.sh                        FOF + SUBFIND, DM-only, GADGET2_HEADER
+#   Makefile.systype                 SYSTYPE="autonlab"
+#   Makefile (one added block)       the "autonlab" systype: comp.gcc + path.default
+#   buildsystem/Makefile.path.default  -I/-L into $CONDA_PREFIX (the `g4` env)
+# NOT "Generic-gcc": that systype includes Makefile.gen.libs, which expects
+# hand-built dependencies under $(LIB_DIR) and, unset, emits -I/hdf5/build/include.
+gadget4      https://gitlab.mpcdf.mpg.de/vrs/gadget4  (cloned 2026-09-18)

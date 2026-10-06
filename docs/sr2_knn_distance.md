@@ -343,6 +343,24 @@ RESUME=1 LAMBDAS="1000" KNN_3D_REF=0 bash scripts/slurm/submit_knn_phase.sh   # 
   hosts are over-concentrated in phase space, which fits the measured collapse of
   small-scale velocity power. Every kNN form that includes hosts scores the arms that
   make more subhalos as worse.
+- **The POOLED (`unpaired`) form — the original loss, the catalog-free one — has the
+  wrong sign everywhere, and 6D makes it worse.** Recomputed 2026-09-14 from the saved
+  round-5b JSONs with the same `ranking()` and the same 20 working arms, because
+  "can we just train the original loss and drop the label" is the obvious question and
+  deserved a number rather than an argument:
+
+  | space | `unpaired` (og, catalog-free) | `class_cond[sub_50_200]` | `class_cond_equal` |
+  | --- | --- | --- | --- |
+  | 3D | **+0.451** (p 0.046) | −0.233 (p 0.32) | +0.322 (p 0.17) |
+  | λ=2000 | **+0.905** (p 4e-08) | −0.549 (p 0.012) | +0.767 (p 8e-05) |
+  | λ=4000 | **+0.878** (p 4e-07) | **−0.647 (p 0.002) PASS** | +0.759 (p 1e-04) |
+  | λ=8000 | **+0.847** (p 3e-06) | −0.595 (p 0.006) | +0.759 (p 1e-04) |
+
+  Positive means *lower pooled loss ↔ fewer subhalos*: descending the og loss descends
+  away from the goal, at p ~ 1e-7 — not a noise result that a longer run might flip.
+  Only the `sub_50_200`-only charge has the right sign; `class_cond_equal`, which
+  averages all five classes, is +0.759. The discriminating variable is not pooled vs
+  conditioned, it is **whether host particles are in the term at all**.
 - **C:** frozen neighbours cut the error 3× vs 3D (0.35 → 0.12–0.14), and it is flat in
   margin. The residual comes from stale neighbour positions, not from missing
   neighbours. The tile alone gives 0.22–0.30 with 77% of queries incomplete.

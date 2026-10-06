@@ -113,6 +113,9 @@ from cosmo_sr.features.gather_critic import (  # noqa: E402
 from cosmo_sr.features.lr_host_channel import (  # noqa: E402
     channel_field_path, load_channel_field,
 )
+from cosmo_sr.features.host_profile import (  # noqa: E402
+    load_lr_host_table, lr_host_for,
+)
 from cosmo_sr.features.member_gather import (  # noqa: E402
     MemberSets, build_member_sets, member_gather_loss, shell_charge,
     shell_radii, shell_reduce, tile_particles,
@@ -255,6 +258,37 @@ def host_member_config(mcfg, args):
     )
 
 
+#: One LR host table per box, cached for the process. The table is a few
+#: hundred rows and is read once per host otherwise -- a multi-host run visits
+#: the same box dozens of times.
+_LR_TABLES: Dict[str, Dict] = {}
+
+
+def _lr_host_table(box: str, args) -> Dict:
+    """The gated LR host table for ``box``, loaded once.
+
+    Refuses rather than degrades when the table is missing: a silent fallback
+    to zeros would run the arm with a flat background for EVERY host and report
+    itself as the host-profile arm, which is the one failure mode that would
+    not show up in any diagnostic the run writes.
+    """
+    if box in _LR_TABLES:
+        return _LR_TABLES[box]
+    root = (Path(args.lr_host_table) if getattr(args, "lr_host_table", "")
+            else paths.subdir("lr_host_table", create=False))
+    p = Path(root) / f"{box}.npz"
+    if not p.exists():
+        raise SystemExit(
+            f"--soft-host-profile lr needs the LR host table for {box} and "
+            f"{p} does not exist. Build it with\n"
+            f"  scripts/features/build_lr_host_table.py --boxes {box}\n"
+            "(seconds: it parses the LR Rockstar catalog that "
+            "build_lagrangian_host.py already left on disk), or point "
+            "--lr-host-table at the directory holding it.")
+    _LR_TABLES[box] = load_lr_host_table(p)
+    return _LR_TABLES[box]
+
+
 def build_host_sets(
     sel: HostSelection, cat, oidx, cfg, geom, scfg, pscfg, mcfg, args,
     frozen_model, device, env=None,
@@ -296,13 +330,57 @@ def build_host_sets(
     _hrow = np.flatnonzero(np.asarray(cat.ids) == int(sel.halo_id))
     host_pos = (np.asarray(cat.pos[int(_hrow[0])], dtype=np.float64)
                 if _hrow.size else None)
+    # `--soft-host-profile lr`: the LR catalog's size for this host, looked up
+    # by the same r/R_vir rule the conditioning channel assigns sites with. The
+    # HR row supplies only the POSITION to look up -- the profile itself is a
+    # function of the LR box alone, which is what keeps the arm deployable.
+    # Zeros when no gated LR host owns it: `lr-host-channel-fidelity` measured
+    # the LR catalog usable only above ~20k HR particles, and the solve falls
+    # back to the flat background for the rest rather than borrowing a
+    # neighbouring cluster's profile.
+    host_rvir = host_mvir = 0.0
+    if str(getattr(args, "soft_host_profile", "off")) == "lr" and host_pos is not None:
+        tbl = _lr_host_table(sel.box, args)
+        host_rvir, host_mvir, _u = lr_host_for(
+            host_pos, tbl, boxsize_mpc_h=BOXSIZE,
+            r_max_rvir=float(getattr(args, "lr_host_r_max_rvir", 2.0)))
     sets = build_member_sets(
         cat, oidx, sel.tiles, hr, base, mcfg,
         particle_mass_msun_h=float(pscfg.particle_mass_msun_h),
         frozen_box=frozen_box, host_pos=host_pos, env=env,
+        host_rvir_mpc_h=host_rvir, host_mvir_msun_h=host_mvir,
         report=report, **kw)
     if sets.n_sets == 0:
         return None
+
+    # --- relocation (arms B and C): re-choose the material, keep the targets --
+    # A separate pass over a finished pool, for the same reason `build_soft_pools`
+    # is one: the pool costs a 537 MB owner-array load and a CSR inversion per
+    # box, and this needs neither -- only the frozen particle table and the
+    # host's position. So arm B and arm C supervise exactly the objects arm A
+    # does, in the same order, and the three gates are directly comparable.
+    host_rvir = (float(cat.rvir[int(_hrow[0])]) / 1000.0 if _hrow.size else 0.0)
+
+    def _relocate(st, field, into: Dict):
+        if str(mcfg.relocate) == "off":
+            return st
+        from cosmo_sr.features.relocate_sets import relocate_member_sets
+        from cosmo_sr.features.member_gather import tile_particles
+        with torch.no_grad():
+            fp, fv = tile_particles(field, sel.tiles, **kw)
+        return relocate_member_sets(st, fp, fv, mcfg,
+                                    host_rvir_mpc_h=host_rvir, report=into)
+
+    if str(mcfg.relocate) != "off":
+        if not (host_rvir > 0.0):
+            raise SystemExit(
+                f"{sel.key}: --relocate {mcfg.relocate} needs the host's R_vir "
+                "to normalise the radius constraint, and halo "
+                f"{int(sel.halo_id)} was not found in the catalog. Without it "
+                "--relocate-eps would mean something different per host.")
+        rrep: Dict = {}
+        sets = _relocate(sets, base, rrep)
+        report["relocate"] = rrep
 
     # --- the host preservation sets (--w-host-sets > 0) --------------------
     # The reference field is the FROZEN generator's own output (`base`), NOT HR,
@@ -371,6 +449,14 @@ def build_host_sets(
             particle_mass_msun_h=float(pscfg.particle_mass_msun_h),
             frozen_box=frozen_box, host_pos=host_pos, env=env,
             report=rep_d, **kw)
+        # Relocated against THIS draw's frozen field, not draw 0's rows: which
+        # material is compact is a property of the realisation, and pinning
+        # draw 0's choice would supervise a group that is only compact in one
+        # of the fields the run averages over. The OBJECTS are unchanged -- the
+        # assert below still holds, because relocation never drops a set.
+        rrep_d: Dict = {}
+        sets_d = _relocate(sets_d, base_d, rrep_d)
+        rep_d["relocate"] = rrep_d
         if sets_d.n_sets != sets.n_sets:
             raise SystemExit(
                 f"{sel.key}: noise draw {d} selected {sets_d.n_sets} sets "
@@ -383,6 +469,23 @@ def build_host_sets(
         host_sets_by_draw.append(None if hs_d is None else hs_d.to(cpu))
         rep_d["host_sets"] = hrep_d
         report[f"draw{d}"] = rep_d
+    # --- soft membership: attach the candidate pools ------------------------
+    # One build per HOST, shared by every draw. The pool is a function of
+    # `live_rows` and the tiling only -- both draw-independent, and asserted
+    # above ("selection must not depend on the draw") -- so a second build per
+    # draw would produce the same object and merely cost the memory.
+    if bool(mcfg.soft_membership):
+        from cosmo_sr.features.soft_membership import build_soft_pools
+        prep: Dict = {}
+        pools = build_soft_pools(
+            sets_by_draw[0], sel.tiles, mcfg, ng_hr=int(kw["ng_hr"]),
+            tile_hr=int(kw["tile_hr"]), factor=int(args.soft_factor),
+            seed=int(args.seed), report=prep)
+        for st in sets_by_draw:
+            st.pools = pools
+        sets.pools = pools
+        report["soft_pools"] = prep
+
     return HostTask(
         sel=sel, sets=sets.to(cpu), hr=hr.to(cpu), report=report,
         tile_data={t: {"lr": data[t]["lr"].to(cpu),
@@ -466,6 +569,75 @@ def report_pair_cost(tasks: Sequence["HostTask"], args) -> None:
                   flush=True)
 
 
+def report_relocation(tasks: Sequence["HostTask"], args) -> Dict:
+    """The pre-training check: did the requested groups actually get built?
+
+    Seeds at the correct radii are not enough. The nearest-particle group around
+    a correct seed can have a displaced centroid, and a radius with no suitable
+    material produces a *starved* set that silently keeps its HR membership --
+    an arm-A set inside a B/C run. Both are counted here, on the CPU, before a
+    GPU-hour is spent, and ``--relocate-check-only`` stops the job right after.
+
+    Three numbers decide whether the arm is worth running:
+
+    * ``within eps`` -- the fraction whose achieved centroid satisfies the
+      radius constraint. Far below 1 means the material is not there and the
+      answer is a wider ``--relocate-eps`` or a different radius, not training.
+    * ``starved`` -- groups that found no unclaimed material in any direction.
+      These are arm A rows in a B/C run and every downstream split must exclude
+      them; ``MemberSets.relocated`` is the flag that lets an eval do so.
+    * ``kept HR frac`` -- how much of the original membership survived. Near 1
+      says the selector re-found HR's own particles and the arm is arm A under
+      another name; near 0 is the intended regime.
+    """
+    agg: Dict = {}
+    if str(getattr(args, "relocate", "off")) == "off":
+        return agg
+    reps = [t.report.get("relocate") or {} for t in tasks]
+    reps = [r for r in reps if r]
+    if not reps:
+        print("\n  relocation: ON but no host reported it -- nothing was "
+              "relocated. This is a bug, not a result.", flush=True)
+        return agg
+    ssum = lambda k: sum(int(r.get(k, 0)) for r in reps)      # noqa: E731
+    med = lambda k, sub: float(np.median(                     # noqa: E731
+        [float((r.get(k) or {}).get(sub, float("nan"))) for r in reps]))
+    agg = {
+        "mode": str(args.relocate),
+        "eps": float(args.relocate_eps),
+        "n_sets": ssum("n_sets"),
+        "n_relocated": ssum("n_relocated"),
+        "n_starved": ssum("n_starved"),
+        "n_within_eps": ssum("n_within_eps"),
+        "median_radius_err_p50_radii": med("radius_err_radii", "p50"),
+        "median_radius_err_p90_radii": med("radius_err_radii", "p90"),
+        "median_rrms_over_hr_p50": med("rrms_over_hr", "p50"),
+        "median_angular_move_deg_p50": med("angular_move_deg", "p50"),
+        "median_kept_hr_member_frac_p50": med("kept_hr_member_frac", "p50"),
+        "n_particles_claimed": ssum("n_particles_claimed"),
+        "particle_table_size": ssum("particle_table_size"),
+    }
+    n_rel = max(agg["n_relocated"], 1)
+    print(f"\n  relocation: --relocate {args.relocate} "
+          f"(arm {'B' if args.relocate == 'frozen' else 'C'}), "
+          f"eps {args.relocate_eps} R_vir_host, {args.relocate_dirs} directions")
+    print(f"    relocated        {agg['n_relocated']} of {agg['n_sets']} sets; "
+          f"{agg['n_starved']} STARVED (kept their HR membership)")
+    print(f"    within eps       {agg['n_within_eps']} "
+          f"({agg['n_within_eps'] / n_rel * 100.0:.1f}%); radius err median "
+          f"{agg['median_radius_err_p50_radii']:.4f}, p90 "
+          f"{agg['median_radius_err_p90_radii']:.4f} R_vir_host")
+    print(f"    r_rms / HR       median {agg['median_rrms_over_hr_p50']:.2f} "
+          f"(1.0 is HR's own size; >>1 is material recruited from far away)")
+    print(f"    moved            median {agg['median_angular_move_deg_p50']:.1f} "
+          f"deg about the host; kept "
+          f"{agg['median_kept_hr_member_frac_p50'] * 100.0:.1f}% of HR's members")
+    print(f"    claimed          {agg['n_particles_claimed']} of "
+          f"{agg['particle_table_size']} particles in the trained tiles",
+          flush=True)
+    return agg
+
+
 def report_population(tasks: Sequence["HostTask"], args) -> None:
     """What the pool actually supervises, by parent split and by mass.
 
@@ -543,10 +715,20 @@ def report_population(tasks: Sequence["HostTask"], args) -> None:
 def _host_row(t: "HostTask") -> Dict:
     """One host's line in pool.json, including the reference it can reach.
 
-    ``reference_median`` is the hybrid HR-in-tile / frozen-outside target, not
-    pure HR: a member whose Lagrangian site is outside the trained tiles cannot
-    be moved by the run or by the splice, so pure HR is not a reachable target
-    and charging for it would charge for material nobody controls.
+    ``reference_median`` is the target the loss actually uses, and which of the
+    two readings that is depends on ``--stats-members``. ``pure_hr_median``
+    (live members only) and ``hybrid_reference_median`` (live plus the frozen
+    out-of-tile stragglers) are BOTH reported under either policy, and the
+    ratio between them is the straggler inflation: *measured* 2.18x in
+    ``r_rms`` and 1.99x in ``2T/|W|`` at a median live fraction of 0.979
+    (`reference-inflated-by-stragglers`).
+
+    The original argument for the hybrid was that a member outside the trained
+    tiles cannot be moved by the run or by the splice, so pure HR is not a
+    reachable target. What that misses is that ``r_rms`` is an **rms**: the
+    unreachable 2% dominate the statistic, so the reachable 98% barely move it,
+    and the gradient on the members the run CAN move is diluted by the same
+    factor. See ``docs/sr2_outskirt_detection.md`` section 6.
     """
     return {
         "key": t.key,
@@ -576,14 +758,23 @@ def _host_row(t: "HostTask") -> Dict:
         "n_after_env": t.report.get("n_after_env"),
         "n_by_env": t.report.get("n_by_env"),
         "median_iso_radius_mpc_h": t.report.get("median_iso_radius_mpc_h"),
+        "stats_members": t.report.get("stats_members"),
         "reference_median": t.report.get("reference_median"),
         "pure_hr_median": t.report.get("pure_hr_median"),
+        "hybrid_reference_median": t.report.get("hybrid_reference_median"),
+        "outside_excluded_by_policy": t.report.get("outside_excluded_by_policy"),
         # The host preservation guard (present only when --w-host-sets > 0).
         "host_n_sets": int(t.host_sets.n_sets) if t.host_sets is not None else 0,
         "host_reference_median": (t.report.get("host_sets") or {}).get(
             "reference_median"),
         "host_median_live_frac": (t.report.get("host_sets") or {}).get(
             "median_live_frac"),
+        # The soft-membership pool (present only under --soft-membership).
+        # `pool_over_live` and `sum_pool_squared` are the two numbers that say
+        # what the relaxation costs: the first is how much wider the candidate
+        # pool is than the HR mask, the second is the O(N^2) pair bill the step
+        # now commits to, against the hard arm's `sum_num_p_squared`.
+        "soft_pools": t.report.get("soft_pools"),
     }
 
 
@@ -770,7 +961,25 @@ def knn_config_from_args(args) -> KnnConfig:
                      one_sided=bool(args.knn_one_sided),
                      dead_zone=float(args.knn_dead_zone),
                      buffer_cells=float(args.knn_buffer_cells),
-                     phase_lambda=float(args.knn_phase_lambda))
+                     phase_lambda=float(args.knn_phase_lambda),
+                     strata=int(getattr(args, "knn_strata", 0)),
+                     strata_rank=int(getattr(args, "knn_strata_rank", 0)),
+                     strata_charge=knn_strata_charge(args))
+
+
+def knn_strata_charge(args) -> Tuple[int, ...]:
+    """Parse ``--knn-strata-charge``: a comma or space list of stratum indices.
+
+    Empty charges every stratum, which -- and this is the one thing to know
+    before using the flag -- is arithmetically the POOLED loss in finer bins.
+    Partitioning is not reweighting; see ``KnnConfig.strata_charge``.
+    """
+    raw = getattr(args, "knn_strata_charge", None) or []
+    out = []
+    for item in raw:
+        for part in str(item).replace(",", " ").split():
+            out.append(int(part))
+    return tuple(out)
 
 
 def knn_class_ids(args) -> Tuple[int, ...]:
@@ -791,6 +1000,9 @@ def attach_knn_classes(pool: Sequence[Dict], args) -> None:
     for both fields (Lagrangian ids), and is cached per box next to the
     diagnostics.
     """
+    # Attached whenever the classes are NAMED, even when they are demoted to a
+    # diagnostic: the point of --knn-classes-diagnostic-only is to keep the
+    # measurement and drop the supervision, so the labels still have to be here.
     if not knn_class_ids(args) or not pool:
         return
     root = Path(os.environ.get("DMSR_REWARD_ROOT", "")) if os.environ.get(
@@ -950,6 +1162,7 @@ def eval_unsup_knn(model, pool: Sequence[Dict], geom, device, args, kw,
         return None
     gen = torch.Generator(device=device).manual_seed(int(kcfg.seed))
     q10, med, loss, skipped = [], [], [], 0
+    dense = []
     for i in range(0, len(pool), batch):
         _, diags = _unsup_knn(model, pool[i:i + batch], geom, device, args, kw,
                               kcfg, generator=gen, class_ids=class_ids)
@@ -960,6 +1173,8 @@ def eval_unsup_knn(model, pool: Sequence[Dict], geom, device, args, kw,
             q10.append(d["ratio_q10"])
             med.append(d["ratio_med"])
             loss.append(d["loss"])
+            if "ratio_med_dense" in d:
+                dense.append(d["ratio_med_dense"])
     if not q10:
         return {"ks": list(kcfg.ks), "n_tiles": 0, "n_skipped": skipped}
     return {
@@ -969,6 +1184,13 @@ def eval_unsup_knn(model, pool: Sequence[Dict], geom, device, args, kw,
         "n_tiles": len(q10), "n_skipped": skipped,
         "ratio_q10": np.median(np.asarray(q10), axis=0).tolist(),
         "ratio_med": np.median(np.asarray(med), axis=0).tolist(),
+        # The dense stratum's median ratio: the readout the pooled form cannot
+        # give (measured -- pooled reads 1.00 on a field whose dense tail is
+        # 1.4-2.0x HR's). Absent unless --knn-strata > 1.
+        **({"ratio_med_dense": np.median(np.asarray(dense), axis=0).tolist()}
+           if dense else {}),
+        "strata": int(kcfg.strata),
+        "strata_charge": [int(j) for j in kcfg.strata_charge],
         "loss": float(np.median(loss)),
     }
 
@@ -1089,7 +1311,8 @@ def forward_tiles_draw(model, data: Dict[int, Dict], tiles: Sequence[int],
 
 def host_forward(model, task: HostTask, geom, kw, mcfg, device,
                  frozen_model=None, set_indices=None, term_scale=None,
-                 host_set_indices=None, draw: int = 0, shell_draws=()):
+                 host_set_indices=None, draw: int = 0, shell_draws=(),
+                 guard_ref: str = "frozen"):
     """``(candidate, base, hr, gather_loss, diagnostics, host)`` for one host.
 
     ``base`` is recomputed under ``no_grad`` rather than cached on the GPU: it is
@@ -1113,10 +1336,24 @@ def host_forward(model, task: HostTask, geom, kw, mcfg, device,
             data[t]["noise_draws"] = [{s: v.to(device) for s, v in nd.items()}
                                       for nd in task.tile_data[t]["noise_draws"]]
     cand = forward_tiles_draw(model, data, task.tiles, geom, draw).float()
-    with torch.no_grad():
-        base = forward_tiles_draw(frozen_model, data, task.tiles, geom,
-                                  draw).float()
     hr = task.hr.to(device)
+    # `guard_ref` picks what the LR-scale anchor and `vel_rms_ratio` are measured
+    # AGAINST. "frozen" is every arm on disk and stays the default: in a
+    # fine-tune the candidate STARTS as the frozen field, so the anchor is a
+    # drift detector and the frozen field is the only meaningful zero.
+    #
+    # "hr" exists for `train_sr2_scratch.py`. A generator trained from a random
+    # initialisation has not drifted from the frozen field -- it has never been
+    # there -- so anchoring to it would charge the run for failing to reproduce
+    # a checkpoint whose central concentration is the very thing under test
+    # (`radial-placement-is-inverted`). The operator is unchanged; only the
+    # reference moves, and `frozen_model` is then not needed at all.
+    if str(guard_ref) == "hr":
+        base = hr
+    else:
+        with torch.no_grad():
+            base = forward_tiles_draw(frozen_model, data, task.tiles, geom,
+                                      draw).float()
     sets = task.sets_at(draw).to(device)
     pos, vel = tile_particles(cand, task.tiles, **kw)
     gather, diag = member_gather_loss(pos, vel, sets, mcfg, set_indices,
@@ -1178,9 +1415,26 @@ def host_forward(model, task: HostTask, geom, kw, mcfg, device,
         # the self-anchor is the mode whose reference these sets were built for.
         # term_scale is dropped: it is measured on the subhalo terms and does not
         # describe the host ones.
+        # soft_membership is forced OFF here, and that is not an oversight.
+        # The guard says "the frozen field already resolves these hosts, do not
+        # break them", referenced to the frozen field's own value on HR's own
+        # particles. A relaxed membership could satisfy it with a DIFFERENT
+        # collection of particles -- i.e. report a host intact while the host
+        # HR named came apart -- which is precisely what a preservation
+        # constraint must not permit. The subhalo terms are the ones being
+        # asked to build something new; this one is being asked to keep
+        # something, and keeping is an identity statement.
         host = member_gather_loss(
             pos, vel, hsets,
-            dataclasses.replace(mcfg, centre_mode="self", w_radius=0.0),
+            # soft_host_profile goes off with it. The host profile is a
+            # property of the RELAXATION's background -- there is no background
+            # competing for particles once membership is HR's mask -- and
+            # leaving it set here is what killed jobs 56560/56562 five minutes
+            # in, on the MemberGatherConfig refusal that exists to catch
+            # exactly this combination being set by hand.
+            dataclasses.replace(mcfg, centre_mode="self", w_radius=0.0,
+                                soft_membership=False,
+                                soft_host_profile="off", soft_host_weight=0.0),
             host_set_indices)
     return cand, base, hr, gather, diag, host
 
@@ -1188,8 +1442,12 @@ def host_forward(model, task: HostTask, geom, kw, mcfg, device,
 def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
               set_indices=None, term_scale=None, critic=None, critic_norm=None,
               w_adv=0.0, host_set_indices=None, draw: int = 0,
-              shell_draws=()):
+              shell_draws=(), guard_ref: Optional[str] = None):
     """Total loss for one host, plus the row that gets logged.
+
+    ``guard_ref`` defaults to ``args.guard_ref`` ("frozen" for every arm on
+    disk), so the eval path and the training path cannot disagree about what the
+    LR-scale anchor is measured against. See :func:`host_forward`.
 
     ``critic`` is the optional HR critic (:mod:`cosmo_sr.features.gather_critic`).
     When it is supplied the generator's adversarial term ``-D(high-pass(cand))``
@@ -1202,7 +1460,9 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
     cand, base, hr, gather, diag, host = host_forward(
         model, task, geom, kw, mcfg, device, frozen_model, set_indices,
         term_scale=term_scale, host_set_indices=host_set_indices,
-        draw=draw, shell_draws=shell_draws)
+        draw=draw, shell_draws=shell_draws,
+        guard_ref=(str(getattr(args, "guard_ref", "frozen"))
+                   if guard_ref is None else str(guard_ref)))
     g = guards(cand, base, geom)
     # The REPORTED scalar is always the original one, whatever is being
     # penalised: `highk_ratio` is the number every run of this line has quoted
@@ -1309,6 +1569,31 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
         # WHICH population and WHICH environment moved, not just the pool.
         "by_population": diag["by_population"],
         "by_env": diag["by_env"],
+        # --- the relaxation's own health, NaN on the hard arm ---------------
+        # `soft_mass_ratio` must sit at ~1: it is the constraint that stops a
+        # candidate keeping a tiny cold core, and a run drifting below it is a
+        # run whose lambda made the window unfillable. `soft_hr_fraction` is
+        # how much of each solved object is still HR's own material -- 1.0 is
+        # the hard arm, and a collapse toward 0 is the relaxation walking off
+        # the object, which is the failure mode the Rockstar gate would
+        # otherwise be the first to find, ten hours later.
+        "soft_mass_ratio": diag.get("soft_mass_ratio", float("nan")),
+        "soft_mass_ratio_min": diag.get("soft_mass_ratio_min", float("nan")),
+        "soft_hr_fraction": diag.get("soft_hr_fraction", float("nan")),
+        "soft_n_eff_over_target": diag.get("soft_n_eff_over_target",
+                                           float("nan")),
+        # The host-profile background. NaN on every arm that does not use it,
+        # so the columns exist from the frozen start and a run can be read
+        # against one that predates the term. `soft_host_valid_frac` is the
+        # one to watch on the `lr` arm: the LR catalog is incomplete below its
+        # gate, and a run near 0 here is the arm doing NOTHING -- which looks
+        # exactly like the arm failing if this column is missing. It WAS
+        # missing: this row is an explicit whitelist, so a key returned in
+        # `diag` but not named here never reaches metrics.jsonl or wandb.
+        "soft_host_weight": diag.get("soft_host_weight", float("nan")),
+        "soft_host_valid_frac": diag.get("soft_host_valid_frac", float("nan")),
+        "soft_host_logrho_p10": diag.get("soft_host_logrho_p10", float("nan")),
+        "soft_host_logrho_p90": diag.get("soft_host_logrho_p90", float("nan")),
     }
     # The host preservation guard, reported whether or not it is on so the frozen
     # start and every step carry the same keys. `host_gather` is the weighted
@@ -1452,7 +1737,9 @@ _POOL_SCALARS = (("n_hosts", "n_sets_total", "gather", "bound_hard", "virial",
                   "shell_resid", "shell_resid_signed",
                   "r_rms_over_hr", "sigma_v_over_hr",
                   "low_k", "highk_ratio", "highk_ratio_max", "vel_rms_ratio",
-                  "iso_ratio", "iso_above_hr")
+                  "iso_ratio", "iso_above_hr",
+                  "soft_mass_ratio", "soft_mass_ratio_min",
+                  "soft_hr_fraction", "soft_n_eff_over_target")
                  + tuple(f"term_{k}" for k in _TERM_NAMES)
                  + tuple(f"term_raw_{k}" for k in _TERM_NAMES)
                  + tuple(f"term_eff_{k}" for k in _TERM_NAMES))
@@ -1482,6 +1769,8 @@ def wandb_row(row: Dict) -> Dict:
         knn = (block or {}).get("knn") or {}
         for k, r in zip(knn.get("ks", []), knn.get("ratio_q10", [])):
             flat[f"unsup/{side}/knn_q10_k{k}"] = float(r)
+        for k, r in zip(knn.get("ks", []), knn.get("ratio_med_dense", [])):
+            flat[f"unsup/{side}/knn_dense_k{k}"] = float(r)
     for side in ("train", "holdout"):
         pool = row.get(side) or {}
         for k in _POOL_SCALARS:
@@ -1549,6 +1838,12 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
     def med(name):
         return float(np.median([r[name] for r in rows]))
 
+    def nmed(name):
+        """Median over the hosts that HAVE a finite value; NaN if none do."""
+        v = np.asarray([r.get(name, np.nan) for r in rows], dtype=np.float64)
+        v = v[np.isfinite(v)]
+        return float(np.median(v)) if v.size else float("nan")
+
     out = {
         "label": label,
         "draw": int(draw),
@@ -1587,6 +1882,15 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
         "vel_rms_ratio": med("vel_rms_ratio"),
         "iso_ratio": med("iso_ratio"),
         "iso_above_hr": med("iso_above_hr"),
+        # --- the relaxation's health, pooled. NaN on the hard arm, which is
+        # why these use `nmed`: `np.median` of an all-NaN column is NaN with a
+        # warning, and one host missing the key would take the whole pool with
+        # it. The keys are present in EVERY run so the two arms' rows stay one
+        # schema and a soft arm can be charted against a hard one.
+        "soft_mass_ratio": nmed("soft_mass_ratio"),
+        "soft_mass_ratio_min": nmed("soft_mass_ratio_min"),
+        "soft_hr_fraction": nmed("soft_hr_fraction"),
+        "soft_n_eff_over_target": nmed("soft_n_eff_over_target"),
         # Pooled over hosts by SUMMING the counts and taking the median of
         # the medians -- a host with four `near` sets must not weigh the
         # same as one with two hundred in the count, and must not be
@@ -1650,12 +1954,134 @@ def _median_bands(rows: List[Dict]) -> Optional[Dict]:
 # --------------------------------------------------------------------------- #
 # The run
 # --------------------------------------------------------------------------- #
+def _box_to_tiles(box: np.ndarray, tiles: Sequence[int], *,
+                  ng_hr: int = NG_HR, tile_hr: int = TILE) -> np.ndarray:
+    """Slice a full-box field ``(6, ng, ng, ng)`` into ``(B, 6, T, T, T)``.
+
+    The inverse of :func:`tile_particles`'s origin convention -- the same
+    ``tid -> (tx, ty, tz)`` decomposition -- so a tile cut here and gathered
+    there lands on the rows :func:`build_member_sets` indexed.
+    """
+    ng, th = int(ng_hr), int(tile_hr)
+    n_side = ng // th
+    out = []
+    for tid in tiles:
+        tid = int(tid)
+        tx = tid // (n_side * n_side)
+        ty = (tid // n_side) % n_side
+        tz = tid % n_side
+        out.append(box[:, tx * th:(tx + 1) * th,
+                       ty * th:(ty + 1) * th, tz * th:(tz + 1) * th])
+    return np.stack(out, axis=0)
+
+
+def _dump_membership_solve(args, mcfg, scfg, pscfg, by_key, all_tasks) -> None:
+    """Run one host's membership solve with the per-sweep recorder and save it."""
+    from cosmo_sr.features.soft_membership import solve_memberships
+    if not bool(mcfg.soft_membership):
+        raise SystemExit("--dump-membership-npz needs --soft-membership on: "
+                         "there is no P to solve for a hard-mask arm.")
+    key = getattr(args, "dump_membership_host", None)
+    if key:
+        if key not in by_key:
+            raise SystemExit(f"--dump-membership-host {key!r} not in the pool; "
+                             f"pooled keys: {sorted(by_key)[:8]}...")
+        task = by_key[key]
+    else:
+        # The richest host makes the clearest figure: most candidate subhaloes
+        # to show, and the most particle competition in the budget matrix.
+        cand = [t for t in all_tasks if getattr(t.sets, "pools", None) is not None]
+        if not cand:
+            raise SystemExit("no pooled host to dump; pass --dump-membership-host")
+        task = max(cand, key=lambda t: int(t.sets.n_sets))
+        print(f"  (no --dump-membership-host: picked {task.key}, the richest "
+              f"with {int(task.sets.n_sets)} candidate sets)", flush=True)
+    if getattr(task.sets, "pools", None) is None:
+        raise SystemExit(f"host {task.key} carries no soft pools")
+
+    field_path = args.dump_membership_field
+    if not field_path or not os.path.exists(field_path):
+        raise SystemExit(f"--dump-membership-field {field_path!r} does not exist")
+    box = np.load(field_path, mmap_mode="r")
+    if box.ndim != 4 or box.shape[0] < 6:
+        raise SystemExit(f"expected a full-box (6, ng, ng, ng) field, got "
+                         f"{tuple(box.shape)}")
+    tiles = task.tiles
+    sub = np.ascontiguousarray(_box_to_tiles(np.asarray(box), tiles))
+    field = torch.as_tensor(sub, dtype=torch.float32)
+    kw = dict(ng_hr=NG_HR, tile_hr=TILE, boxsize_mpc_h=BOXSIZE,
+              dis_scale_mpc_h=float(scfg.dis_norm_kpc_h) * 1e-3,
+              vel_scale_kms=float(pscfg.vel_norm_km_s))
+    with torch.no_grad():
+        pos, vel = tile_particles(field, tiles, **kw)
+
+    sets = task.sets
+    idx = list(range(sets.n_sets))
+    rec: Dict = {}
+    print(f"solving membership for {task.key}: {sets.n_sets} sets, "
+          f"prior={mcfg.soft_prior} lambda={mcfg.soft_lambda} on {field_path}",
+          flush=True)
+    with torch.no_grad():
+        solve_memberships(pos.double(), vel.double(), sets, sets.pools, idx, mcfg,
+                          record=rec)
+
+    out = args.dump_membership_npz
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    sweeps = rec["sweeps"]
+    np.savez_compressed(
+        out,
+        host_key=str(task.key), box=str(getattr(task.sel, "box", "")),
+        halo_id=np.asarray(rec["halo_id"], dtype=np.int64),
+        n_sets=int(sets.n_sets), lam=float(rec["lam"]),
+        x=rec["x"].astype(np.float32), v=rec["v"].astype(np.float32),
+        rows=rec["rows"].astype(np.int64),
+        setid=rec["setid"].astype(np.int64),
+        is_member=rec["is_member"].astype(bool),
+        mult=rec["mult"].astype(np.float32),
+        logpi=rec["logpi"].astype(np.float32),
+        target_mass=rec["target_mass"].astype(np.float32),
+        sigma_r=rec["sigma_r"].astype(np.float32),
+        sigma_v=rec["sigma_v"].astype(np.float32),
+        sweep_tags=np.asarray([s["tag"] for s in sweeps]),
+        sweep_w=np.stack([s["w"] for s in sweeps]).astype(np.float32),
+        sweep_c=np.stack([s["c"] for s in sweeps]).astype(np.float32),
+        sweep_mass=np.stack([s["mass"] for s in sweeps]).astype(np.float32),
+        sweep_hr_kept=np.stack([s["hr_kept"] for s in sweeps]).astype(np.float32),
+        centre_ref=sets.centre_ref[torch.as_tensor(idx)].cpu().numpy().astype(np.float32),
+        # The host point and the R_vir scale, so a RADIAL question can be
+        # asked of this dump without reopening the field: `host_profile_probe`
+        # signs the M-step drift on the clustercentric direction, and an
+        # unsigned drift says nothing about placement.
+        centre_host=sets.centre_host[torch.as_tensor(idx)].cpu().numpy().astype(np.float32),
+        centre_scale=sets.centre_scale[torch.as_tensor(idx)].cpu().numpy().astype(np.float32),
+        host_rvir=np.asarray(getattr(sets, "host_rvir", None)
+                             if getattr(sets, "host_rvir", None) is not None
+                             else np.zeros(sets.n_sets), dtype=np.float64)[idx],
+        host_mvir=np.asarray(getattr(sets, "host_mvir", None)
+                             if getattr(sets, "host_mvir", None) is not None
+                             else np.zeros(sets.n_sets), dtype=np.float64)[idx],
+    )
+    print(f"  wrote {out}  ({len(sweeps)} snapshots, "
+          f"{rec['x'].shape[0]} pool entries)", flush=True)
+
+
 def run(args) -> Dict:
     cfg = load_direct_config(args)
     geom = geometry_of(cfg)
     scfg = soft_config_of(cfg)
     pscfg = phase_space_config_of(cfg)
     mcfg = member_config_of(args)
+    # --relocate-check-only is --pool-only plus the relocation report, and the
+    # report is written by the pool stage either way. Resolved here rather than
+    # branched on twice, so there is exactly one place that decides whether this
+    # job trains.
+    if bool(getattr(args, "relocate_check_only", False)):
+        if str(args.relocate) == "off":
+            raise SystemExit(
+                "--relocate-check-only with --relocate off checks nothing: "
+                "arm A's membership is HR's owner array and there is no "
+                "selection to inspect. Pass --relocate frozen or hr.")
+        args.pool_only = True
     device = torch.device(args.device if args.device else
                           ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.manual_seed(int(args.seed))
@@ -1687,6 +2113,25 @@ def run(args) -> Dict:
                 f"--shell-noise-draws {args.shell_noise_draws} exceeds the "
                 f"{n_draws - 1} other training draws available at "
                 f"--noise-draws {n_draws}.")
+    if bool(args.soft_membership):
+        f = int(args.soft_factor)
+        if f < 1 or TILE % f:
+            raise SystemExit(
+                f"--soft-factor {f} does not divide the tile edge {TILE}, so a "
+                "coarse cell would straddle two tiles and its pool would "
+                "include rows this run cannot move.")
+        if f != int(geom.scale_factor):
+            print(f"  WARNING: --soft-factor {f} is not the run's "
+                  f"super-resolution factor {geom.scale_factor}. The prior's "
+                  "cell is then not an LR cell, which is a different "
+                  "experiment from the one the flag describes.", flush=True)
+        print(f"  soft membership ON: prior={args.soft_prior} "
+              f"lambda={args.soft_lambda} factor={f} "
+              f"(cell = {f ** 3} HR sites, "
+              f"{BOXSIZE / (NG_HR / f):.4f} Mpc/h a side), "
+              f"pool ratio={args.soft_pool_ratio}, window={args.soft_sigma}. "
+              f"Watch soft_mass_ratio (~1.0) and soft_hr_fraction.", flush=True)
+
     _seeds = draw_seeds(args)
     _fresh = fresh_draw_index(args)
     print(f"  noise: {n_draws} training draw(s) (mode {args.noise_mode}), "
@@ -1759,7 +2204,21 @@ def run(args) -> Dict:
           f"{ho_sum.get('n_boxes', 0)} boxes, "
           f"{sum(t.sets.n_sets for t in hold_tasks)} supervised sets", flush=True)
     report_population(all_tasks, args)
+    reloc_agg = report_relocation(all_tasks, args)
     report_pair_cost(train_tasks + hold_tasks, args)
+
+    # --- membership-solve dump (visualisation only) -------------------------
+    # Reuses the exact pool this arm trained on, runs ZERO training steps, solves
+    # the membership on a saved field with the per-sweep recorder on, and writes
+    # a single npz a CPU viz job renders. Fits the "figures redraw from saved
+    # artefacts" rule: the expensive pool build happens here, the plotting reads
+    # the npz. It exits before training, so it is safe to point at a real arm.
+    if getattr(args, "dump_membership_npz", None):
+        _dump_membership_solve(args, mcfg, scfg, pscfg, by_key, all_tasks)
+        # "ok" is what main() turns into the process exit code; without it the
+        # dump exits 1 despite writing the npz, and the afterok viz job strands
+        # on DependencyNeverSatisfied.
+        return {"dumped": args.dump_membership_npz, "ok": True}
 
     out_dir = paths.subdir("member_gather",
                            f"{args.rung}{args.label}", create=True)
@@ -1768,6 +2227,9 @@ def run(args) -> Dict:
         "rejected": split.rejected,
         "train_hosts": [_host_row(t) for t in train_tasks],
         "holdout_hosts": [_host_row(t) for t in hold_tasks],
+        "relocation": reloc_agg,
+        "relocation_by_host": {t.sel.key: (t.report.get("relocate") or {})
+                               for t in all_tasks} if reloc_agg else {},
     }
     write_json(out_dir / "pool.json", pool_summary)
     print(f"  wrote {out_dir / 'pool.json'}", flush=True)
@@ -1816,10 +2278,33 @@ def run(args) -> Dict:
         print("WARNING: --w-knn-unsup > 0 with --knn-phase-lambda 0 trains on "
               "the POSITION-only statistic, which round 5b measured as unable "
               "to rank the working arms. 4000 is the measured pass.", flush=True)
-    if float(args.w_knn_unsup) > 0 and not knn_cls:
-        print("WARNING: --w-knn-unsup > 0 with no --knn-classes charges the "
-              "POOLED form, which round 5b measured as ranking the working arms "
-              "BACKWARDS (hosts dominate it).", flush=True)
+    if bool(getattr(args, "knn_classes_diagnostic_only", False)):
+        # The catalog-free arm: the labels are still measured and reported, they
+        # just do not reach the gradient. knn_cls is emptied AFTER attach time.
+        if not knn_cls:
+            raise SystemExit(
+                "--knn-classes-diagnostic-only needs --knn-classes to name the "
+                "classes to REPORT; with neither, nothing changes and the flag "
+                "would be a no-op that reads like an arm.")
+        print(f"kNN: classes {[OWNER_CLASSES[i] for i in knn_cls]} are "
+              "DIAGNOSTIC ONLY -- no HR label reaches the loss.", flush=True)
+        knn_loss_cls: Tuple[int, ...] = ()
+    else:
+        knn_loss_cls = knn_cls
+    if float(args.w_knn_unsup) > 0 and not knn_loss_cls:
+        if knn_cfg.strata > 1 and knn_cfg.strata_charge:
+            print(f"kNN: catalog-free arm -- {knn_cfg.strata} density strata, "
+                  f"charging {list(knn_cfg.strata_charge)} on each field's own "
+                  f"r_{knn_cfg.strata_rank or min(knn_cfg.ks)}.", flush=True)
+        elif knn_cfg.strata > 1:
+            print("WARNING: --knn-strata > 1 with no --knn-strata-charge is the "
+                  "POOLED loss in finer bins -- MEASURED, partitioning alone "
+                  "does not reweight the dense tail. Set --knn-strata-charge.",
+                  flush=True)
+        else:
+            print("WARNING: --w-knn-unsup > 0 with no --knn-classes charges the "
+                  "POOLED form, which round 5b measured as ranking the working "
+                  "arms BACKWARDS (hosts dominate it).", flush=True)
     if float(args.w_knn_unsup) > 0 and max(knn_cfg.ks) < 64:
         # Not refused -- the user may be testing exactly this -- but never silent.
         print(f"WARNING: --knn-ks max {max(knn_cfg.ks)} < 64. knn_cdf's measured "
@@ -2120,8 +2605,12 @@ def run(args) -> Dict:
         if unsup_train and float(args.w_knn_unsup) > 0:
             m = min(int(args.unsup_tiles_per_step), len(unsup_train))
             batch = set_rng.sample(unsup_train, m) if m > 0 else unsup_train
+            # knn_loss_cls, not knn_cls: with --knn-classes-diagnostic-only
+            # this is empty and the eval above still reports per class, which is
+            # the whole shape of the catalog-free arm -- measure the label, do
+            # not train on it.
             pen, _ = _unsup_knn(model, batch, geom, device, args, kw, knn_cfg,
-                                class_ids=knn_cls)
+                                class_ids=knn_loss_cls)
             (float(args.w_knn_unsup) * pen).backward()
             knn_pen = float(pen.detach())
         if args.clip > 0:
@@ -2655,6 +3144,160 @@ def build_parser() -> argparse.ArgumentParser:
                          "it the ratio is shot noise and the term would be "
                          "charging the run for the background sampler's seed; "
                          "such sets are skipped and counted in n_iso.")
+    # --- soft membership: WHICH particles, as a latent variable -------------
+    ap.add_argument(
+        "--soft-membership", action="store_true",
+        help="relax the HR member mask into a solved weight P_ij. HR keeps "
+             "supplying the object's REGION (a coarse Lagrangian prior) and "
+             "its PHYSICS (the reference, untouched); the CURRENT SR field "
+             "decides which particles participate, under a per-particle "
+             "budget of one (shared with a background/host category) and a "
+             "per-candidate mass target. Off is every arm on disk, and the "
+             "hard path stays byte-identical when it is off. Needs "
+             "--soft-factor to match the run's LR/HR ratio.")
+    ap.add_argument(
+        "--soft-lambda", type=float, default=1.0,
+        help="KL weight against the prior, and the ONLY knob that "
+             "interpolates: lambda -> inf pins P at the prior, and with "
+             "--soft-prior hard that limit IS the arm already on disk. The "
+             "cost is a squared distance in units of the window's sigma, so "
+             "1.0 means one dispersion of phase-space distance is worth one "
+             "nat of prior. Watch soft_mass_ratio: a lambda small enough to "
+             "make the window unfillable shows up there as a shortfall.")
+    ap.add_argument(
+        "--soft-prior", choices=["coarse", "hard"], default="coarse",
+        help="coarse: every particle of an LR cell gets that cell's member "
+             "FRACTION, the original members included and not privileged. "
+             "hard: the HR mask is the prior and only lambda opens it -- more "
+             "conservative, and the control whose lambda -> inf limit is the "
+             "hard arm.")
+    ap.add_argument(
+        "--soft-factor", type=int, default=8,
+        help="HR sites per LR cell side (the run's super-resolution factor). "
+             "The prior's cell is factor^3 sites; at 8 that is 512, and one "
+             "cell is 1.5625 Mpc/h a side against a 0.15 Mpc/h search radius "
+             "-- which is why the prior is the SUPPORT and never the "
+             "membership.")
+    ap.add_argument(
+        "--soft-pool-ratio", type=float, default=3.0,
+        help="non-members sampled per member, per cell. The pool is (1+ratio) "
+             "times the member count and the estimator is O(pool^2), so this "
+             "multiplies the step cost directly: 3.0 is ~16x the hard arm's "
+             "pair bill. Cap it with --max-set-particles.")
+    ap.add_argument(
+        "--soft-cell-dilate", type=int, default=0,
+        help="add the 26 neighbouring LR cells to each set's support, at "
+             "--soft-prior-eps. 0 is off: the member cells alone already hold "
+             "factor^3 sites each.")
+    ap.add_argument("--soft-prior-eps", type=float, default=1e-3,
+                    help="floor on a prior membership, and the value a dilated "
+                         "cell gets. Never 0: that is an infinite KL and a "
+                         "particle the solve can never reach.")
+    ap.add_argument("--soft-bg-floor", type=float, default=1e-3,
+                    help="floor on the BACKGROUND share of a particle's "
+                         "budget -- the category that makes the budget a "
+                         "constraint rather than a normalisation.")
+    ap.add_argument("--soft-steps", type=int, default=3,
+                    help="EM sweeps of the membership solve per generator "
+                         "step. The solve is O(pool) against an O(pool^2) "
+                         "step, so a handful is free.")
+    ap.add_argument("--soft-mass-steps", type=int, default=10,
+                    help="Sinkhorn iterations of the mass dual per sweep.")
+    ap.add_argument("--soft-mass-eta", type=float, default=1.0)
+    ap.add_argument("--soft-mass-step-cap", type=float, default=20.0)
+    ap.add_argument(
+        "--soft-sigma", choices=["adaptive", "hr", "cand"], default="adaptive",
+        help="dispersions of the 6-D window. adaptive is max(HR, candidate) "
+             "per set: never narrower than the object actually is, tightening "
+             "toward HR as it tightens. 'hr' alone selects NOTHING at the "
+             "start (the frozen field is ~6x wider and ~20x hotter per set, "
+             "which is 400 sigma^2); 'cand' is free to contract onto whatever "
+             "is already cold and call that the object.")
+    ap.add_argument("--soft-sigma-scale", type=float, default=1.0)
+
+    # --- the host as a background component (the radial-placement arm) ------
+    ap.add_argument(
+        "--soft-host-profile", choices=["off", "lr", "self"], default="off",
+        help="give the membership solve a HOST density profile instead of a "
+             "flat background. The flat background plus the n_c/f^3 prior make "
+             "the host core the cheapest place for a candidate to meet its "
+             "mass target, which is a selection-side gradient pointing INWARD "
+             "and is what radial-placement-is-inverted measures (HR 1.13 R_vir "
+             "vs 0.30-0.35 tuned). Subtracting the host's log density turns "
+             "membership into a log OVERDENSITY test, so a lump must beat the "
+             "material that would be at its radius anyway. 'lr' is an analytic "
+             "NFW from the LR catalog (inference-honest, and blank for the 43%% "
+             "of hosts below the LR gate); 'self' is binned off the candidate "
+             "field itself (complete, partly circular). No per-object radial "
+             "target is stated -- that family (one-to-one, rank, quantile) has "
+             "already failed on held-out data.")
+    ap.add_argument(
+        "--soft-host-weight", type=float, default=0.0,
+        help="beta: how much of the log host density enters the background. 0 "
+             "reproduces the flat background EXACTLY (pinned by a test), 1 is "
+             "full overdensity. NOT comparable between --soft-host-profile lr "
+             "and self: their log-density ranges differ by ~3x, so read the "
+             "ladder off soft_host_logrho_p10/p90 in the diagnostics, in nats.")
+    ap.add_argument("--soft-host-conc", type=float, default=5.0,
+                    help="NFW concentration for --soft-host-profile lr.")
+    ap.add_argument(
+        "--lr-host-table", default="",
+        help="directory of per-box LR host tables for --soft-host-profile lr; "
+             "empty means $DMSR_REWARD_ROOT/lr_host_table. Built by "
+             "scripts/features/build_lr_host_table.py.")
+    ap.add_argument(
+        "--lr-host-r-max-rvir", type=float, default=2.0,
+        help="a supervised host further than this many R_vir from every gated "
+             "LR host is treated as having no LR owner, and falls back to the "
+             "flat background. 2.0 is where lr_membership_coverage measured LR "
+             "membership stop being COVERED.")
+    ap.add_argument("--soft-host-bins", type=int, default=24)
+    ap.add_argument("--soft-host-r-max-rvir", type=float, default=4.0)
+
+    # --- relocation: the arm A / B / C experiment ---------------------------
+    ap.add_argument(
+        "--relocate", choices=["off", "frozen", "hr"], default="off",
+        help="WHICH PARTICLES each supervised group is made of. 'off' is arm "
+             "A: HR's owner array, every result recorded in this line so far. "
+             "'frozen' is arm B: the group's particles are re-chosen, once and "
+             "before training, as compact material that already exists in the "
+             "frozen SR field at the host-centric radius the group's frozen "
+             "centroid already sits at -- isolating the effect of replacing "
+             "the membership. 'hr' is arm C: the same selection at HR's "
+             "radius, which adds the placement change on top of B. The HR "
+             "targets are IDENTICAL in all three; only the material changes.")
+    ap.add_argument(
+        "--relocate-dirs", type=int, default=8,
+        help="proposed directions per group on the sphere of the requested "
+             "radius. The first is always the group's own frozen direction, so "
+             "the minimal answer -- the material already there -- is always in "
+             "the running and arm B is a small change when it can be.")
+    ap.add_argument(
+        "--relocate-eps", type=float, default=0.05,
+        help="radius tolerance in units of the HOST's R_vir. A group outside "
+             "it is KEPT and flagged, never dropped: dropping would make the "
+             "three arms supervise different catalogs and their Rockstar gates "
+             "incomparable. The count is in the pre-training check.")
+    ap.add_argument("--relocate-oversample", type=float, default=4.0,
+                    help="neighbours queried per candidate as a multiple of "
+                         "the group size; grown when earlier claims starve it.")
+    ap.add_argument("--relocate-refine-iters", type=int, default=3,
+                    help="local-swap passes. Seeds at the correct radius are "
+                         "not enough -- the nearest-particle group around a "
+                         "correct seed can have a displaced centroid.")
+    ap.add_argument("--relocate-w-vel", type=float, default=0.5,
+                    help="velocity coherence in the candidate score, against "
+                         "compactness at 1.0.")
+    ap.add_argument("--relocate-w-radius", type=float, default=1.0,
+                    help="radius error in the candidate score, in units of "
+                         "--relocate-eps.")
+    ap.add_argument(
+        "--relocate-check-only", action="store_true",
+        help="build the pool, write the relocation report, and exit 0 without "
+             "training. The proposal's 'check this distribution before "
+             "training': it is a CPU job and it answers whether the material "
+             "exists at the requested radii before a GPU-hour is spent.")
+
     ap.add_argument(
         "--w-shell", type=float, default=0.0,
         help="weight on the DISTRIBUTION of the sets' host-centric radii: sort "
@@ -2750,6 +3393,22 @@ def build_parser() -> argparse.ArgumentParser:
              "bins round-robin.")
     ap.add_argument("--min-purity", type=float, default=0.5)
     ap.add_argument("--min-live-frac", type=float, default=0.5)
+    ap.add_argument("--stats-members", default="all", choices=("all", "live"),
+                    help="which members carry every set statistic. 'all' is the "
+                         "historical hybrid -- live rows PLUS the out-of-tile "
+                         "stragglers at frozen coordinates -- and is what every "
+                         "arm on disk trained against. 'live' drops the "
+                         "stragglers from the reference, the candidate, the "
+                         "centre targets and the background radius at once. "
+                         "MEASURED (docs/sr2_outskirt_detection.md section 6): "
+                         "at a median live fraction of 0.979 the hybrid "
+                         "reference sits at 2.18x HR's own r_rms and 1.99x its "
+                         "2T/|W|, because r_rms is an RMS and a tail of two "
+                         "parts in a hundred at ~2 Mpc/h carries roughly "
+                         "three quarters of r_rms^2. That both loosens the "
+                         "target and dilutes the gradient on the members the "
+                         "run can actually move. Read pure_hr_median against "
+                         "hybrid_reference_median in pool.json.")
     ap.add_argument("--max-sets", type=int, default=256)
     ap.add_argument("--softening", type=float, default=0.01)
     ap.add_argument("--softening-kind", default="plummer",
@@ -2892,6 +3551,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "MEASURED (round 5b): hosts belong in the MONITOR, not "
                          "the loss -- the working arms gain subhalos by "
                          "over-concentrating hosts in phase space (rho +0.91)")
+    ap.add_argument("--knn-strata", type=int, default=0,
+                    help="equal-count density strata, computed by each field "
+                         "from its OWN r_k -- the catalog-free stand-in for "
+                         "--knn-classes. 0/1 = pooled. Useless on its own: see "
+                         "--knn-strata-charge")
+    ap.add_argument("--knn-strata-rank", type=int, default=0,
+                    help="neighbour rank defining the strata; must be in "
+                         "--knn-ks. 0 = min(ks)")
+    ap.add_argument("--knn-strata-charge", nargs="*", default=[],
+                    help="which strata reach the loss, dense-first (0 is "
+                         "densest), e.g. `0` or `0,1`. Empty charges all, which "
+                         "is MEASURED to be the pooled loss in finer bins -- "
+                         "partitioning is not reweighting")
+    ap.add_argument("--knn-classes-diagnostic-only", action="store_true",
+                    help="keep --knn-classes measured and REPORTED but out of "
+                         "the gradient: the arm in which no Rockstar label "
+                         "reaches the loss. Pair with --knn-strata*")
     ap.add_argument("--knn-one-sided", action="store_true",
                     help="charge only under-clumping (default: two-sided)")
     ap.add_argument("--knn-measure", action=argparse.BooleanOptionalAction,
@@ -2948,6 +3624,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "scales, once, held fixed and applied to real and fake "
                          "alike")
     # --- optimisation --------------------------------------------------------
+    ap.add_argument("--guard-ref", default="frozen", choices=("frozen", "hr"),
+                    help="what the LR-scale anchor and vel_rms_ratio are "
+                         "measured AGAINST. 'frozen' is every arm on disk: in "
+                         "a fine-tune the candidate STARTS as the frozen field, "
+                         "so the anchor is a drift detector. 'hr' is for "
+                         "train_sr2_scratch.py, where there is no drift to "
+                         "detect because the generator was never there.")
     ap.add_argument("--rung", default="fine")
     ap.add_argument("--lr-scale", type=float, default=10.0)
     ap.add_argument("--steps", type=int, default=8000)
@@ -3009,6 +3692,21 @@ def build_parser() -> argparse.ArgumentParser:
              "lower-variance version of the same per-realisation objective. "
              "Only the radii are recomputed on the extra draws, never the N^2 "
              "statistics. Requires --noise-draws > 1.")
+    ap.add_argument(
+        "--dump-membership-npz", default="",
+        help="visualisation only: build the pool, solve one host's membership on "
+             "--dump-membership-field with the per-sweep recorder on, write the "
+             "snapshots to this npz, and EXIT before training. Needs "
+             "--soft-membership on.")
+    ap.add_argument(
+        "--dump-membership-field", default="",
+        help="the full-box (6, ng, ng, ng) SR field to solve the membership on "
+             "(e.g. an arm's saved flow_rockstar/fields/...npy). Defaults to the "
+             "frozen field is NOT assumed -- pass the arm's own tuned field to "
+             "see the converged solve.")
+    ap.add_argument(
+        "--dump-membership-host", default="",
+        help="which pooled host key to dump; default is the first held-out host.")
     ap.add_argument("--device", default="")
     ap.add_argument("--no-wandb", action="store_true",
                     help="disable Weights & Biases logging for this run "

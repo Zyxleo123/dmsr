@@ -32,7 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from cosmo_sr.features.knn_cdf import (  # noqa: E402
     EPS_MPC_H, KnnConfig, interior_queries, knn_cdf_loss, knn_log_distances,
-    knn_neighbour_ids, knn_tile_loss, tile_geometry,
+    knn_neighbour_ids, knn_stratified_loss, knn_tile_loss, strata_partition,
+    tile_geometry,
 )
 from cosmo_sr.features.member_gather import tile_particles  # noqa: E402
 
@@ -710,3 +711,195 @@ def test_classify_owner_uses_the_catalog_cuts():
         np.array([5000, 120, 40, 900, 300]))]
     assert got == ["unbound", "host", "sub_50_200", "sub_lt50", "sub_ge200",
                    "host", "unbound"]
+
+
+# --------------------------------------------------------------------------- #
+# Density strata: the catalog-free replacement for the HR owner-class mask
+# --------------------------------------------------------------------------- #
+# The point of these is NOT that the feature runs. It is that two of its
+# plausible-sounding claims are false, both were believed while it was being
+# written, and both are cheap to re-believe later. So they are tests.
+N_SUB, N_HOST, N_BACK = 120, 1200, 600
+
+
+def _diluted(sub_spread, seed=11):
+    """A small tight subhalo inside a dominant host, plus background.
+
+    The round-5b situation in miniature and the reason ``--knn-classes`` exists:
+    the subhalo is 6% of the particles, so any statistic pooled over the whole
+    interior is a statement about the host. Labels (the slice boundaries) are
+    used for composition diagnostics only, never by the loss.
+    """
+    rng = np.random.default_rng(seed)
+    return np.concatenate([
+        rng.normal(50.0, sub_spread, size=(N_SUB, 3)),
+        rng.normal(50.0, 4.0, size=(N_HOST, 3)),
+        rng.uniform(0.0, BOX, size=(N_BACK, 3)),
+    ], axis=0)
+
+
+def _diluted_z(sub_spread, cfg, seed=11):
+    x = torch.tensor(_diluted(sub_spread, seed=seed))
+    q = torch.arange(N_SUB + N_HOST + N_BACK)
+    return knn_log_distances(x, q, cfg, boxsize_mpc_h=BOX)
+
+
+def _scfg(**kw):
+    base = dict(ks=(8, 32, 64, 128), n_queries=N_SUB + N_HOST + N_BACK,
+                n_quantiles=16, buffer_cells=0.0, dead_zone=0.0)
+    base.update(kw)
+    return KnnConfig(**base)
+
+
+def test_strata_partition_is_equal_count_and_dense_first():
+    cfg = _scfg(strata=8)
+    z = _diluted_z(1.5, cfg)
+    groups = strata_partition(z, cfg)
+    assert len(groups) == 8
+    sizes = {int(g.numel()) for g in groups}
+    assert max(sizes) - min(sizes) <= 1
+    assert sum(sizes for sizes in (int(g.numel()) for g in groups)) == z.shape[0]
+    # Dense first, and the split is on the stratifying column only.
+    col = list(cfg.ks).index(min(cfg.ks))
+    means = [float(z[g, col].mean()) for g in groups]
+    assert means == sorted(means)
+    # Every row lands in exactly one stratum.
+    allrows = torch.cat(groups).sort().values
+    assert torch.equal(allrows, torch.arange(z.shape[0]))
+
+
+def test_strata_on_the_stratifying_rank_is_finer_binning():
+    """The claim that keeps this feature honest, as exact arithmetic.
+
+    With a SINGLE rank there is no conditional information to be had, and
+    equal-count strata of Q bins each are the same equal-count bins as the
+    pooled form with strata*Q. If this ever stops holding, the partition has
+    started moving weight around and the docstring's "no new information in that
+    column" is no longer true.
+    """
+    n = 480
+    cfg_p = _scfg(ks=(8,), n_quantiles=32)
+    cfg_s = _scfg(ks=(8,), n_quantiles=4, strata=8)
+    zc = _diluted_z(1.5, cfg_p)[:n]
+    zh = _diluted_z(0.25, cfg_p)[:n]
+    pooled = float(knn_cdf_loss(zc, zh, cfg_p)[0])
+    strat = float(knn_stratified_loss(zc, zh, cfg_s)[0])
+    assert strat == pytest.approx(pooled, rel=1e-12)
+
+
+def test_equal_count_strata_do_not_reweight_the_dense_tail():
+    """MEASURED, and it is the finding that made ``strata_charge`` exist.
+
+    Partitioning the queries by density and charging every stratum equally is
+    NOT a fix for host domination: it is the pooled loss in finer bins, to
+    within the small conditional term the other ranks contribute. The dense tail
+    carries the same share of the gradient either way. Only restricting the
+    charge changes that, and the ratio here is ~8x -- the number of strata.
+    """
+    cfg_p = _scfg(strata=0)
+    cfg_e = _scfg(strata=8)
+    cfg_d = _scfg(strata=8, strata_charge=(0,))
+    zh = _diluted_z(0.25, cfg_p)
+    zc = _diluted_z(1.5, cfg_p)
+    pooled = float(knn_cdf_loss(zc, zh, cfg_p)[0])
+    equal = float(knn_stratified_loss(zc, zh, cfg_e)[0])
+    dense = float(knn_stratified_loss(zc, zh, cfg_d)[0])
+    assert equal == pytest.approx(pooled, rel=0.15)     # measured 0.0912/0.0881
+    assert dense > 5.0 * equal                          # measured 0.726/0.0912
+    # The diagnostic, unlike the loss, IS sharpened by partitioning alone: the
+    # pooled median cannot see the subhalo and the dense stratum's can.
+    _, d_e = knn_stratified_loss(zc, zh, cfg_e)
+    _, d_p = knn_cdf_loss(zc, zh, cfg_p)
+    assert all(abs(r - 1.0) < 0.02 for r in d_p["ratio_med"])
+    assert max(d_e["ratio_med_dense"]) > 1.5
+
+
+def test_uncharged_strata_are_measured_but_carry_no_gradient():
+    cfg = _scfg(strata=8, strata_charge=(0,))
+    zh = _diluted_z(0.25, cfg)
+    zc = _diluted_z(1.5, cfg).requires_grad_(True)
+    loss, diag = knn_stratified_loss(zc, zh, cfg)
+    assert diag["n_strata_charged"] == 1
+    assert diag["strata_charge"] == [0]
+    assert len(diag["strata"]) == 8                    # all eight measured
+    assert [b["charged"] for b in diag["strata"]].count(True) == 1
+    loss.backward()
+    groups = strata_partition(zc, cfg)
+    g = zc.grad
+    assert float(g[groups[0]].abs().sum()) > 0.0
+    for j in range(1, 8):
+        assert float(g[groups[j]].abs().sum()) == 0.0
+
+
+def test_the_dense_stratum_is_mostly_host_particles():
+    """MEASURED, and it is why this arm has a diagnostic gate before any GPU.
+
+    A density cut is NOT a subhalo cut. ``--knn-classes sub_50_200`` names
+    subhalo particles; the densest stratum is 65-83% host on this fixture, and
+    the fraction gets WORSE as the candidate's subhalo is made more diffuse --
+    the damaged field has fewer of its own subhalo particles in its own dense
+    tail. Host over-concentration is this line's measured damage
+    (`host-damage-is-mostly-reparenting`), so charging the dense stratum is not
+    a free substitution and the composition on the REAL box has to be measured
+    (scripts/features/knn_strata_composition.py) before this is trained on.
+    """
+    cfg = _scfg(strata=8)
+    label = np.array(["sub"] * N_SUB + ["host"] * N_HOST + ["back"] * N_BACK)
+
+    def host_fraction(sub_spread):
+        z = _diluted_z(sub_spread, cfg)
+        dense = strata_partition(z, cfg)[0].numpy()
+        return float((label[dense] == "host").mean()), float(
+            (label[dense] == "sub").mean())
+
+    h_mild, s_mild = host_fraction(1.5)
+    h_bad, s_bad = host_fraction(3.0)
+    assert h_mild > 0.5 and h_bad > 0.5
+    # Worse when the field is worse: the selection follows the damage.
+    assert s_bad < s_mild
+    # HR's own dense stratum does hold its subhalo, which is what makes the
+    # comparison meaningful at all even though the cut is impure.
+    assert host_fraction(0.25)[1] > s_mild
+
+
+def test_strata_reach_the_tile_loss_and_compose_with_classes():
+    ng, tile = 64, 16
+    rng = np.random.default_rng(5)
+    hr = torch.tensor(rng.uniform(0.0, BOX, size=(ng ** 3, 3)))
+    cand = hr + torch.tensor(rng.normal(0.0, 0.4, size=hr.shape))
+    rows = torch.arange(hr.shape[0])
+    cfg = KnnConfig(ks=(2, 4, 8), n_queries=512, n_quantiles=4, strata=4,
+                    strata_charge=(0,), buffer_cells=0.0, dead_zone=0.0)
+    loss, diag = knn_tile_loss(cand, hr, rows, 0, cfg, ng_hr=ng, tile_hr=ng,
+                               boxsize_mpc_h=BOX)
+    assert not diag["skipped"]
+    assert diag["n_strata_charged"] == 1
+    assert float(loss) >= 0.0
+
+
+def test_a_tile_too_small_for_strata_times_bins_is_skipped():
+    """The interior floor is per STRATUM, not per tile: 4 strata of 16 bins need
+    64 draws, and charging 16 bins on 8 rows would silently compare quantiles
+    that are not the same quantiles."""
+    ng = 16
+    rng = np.random.default_rng(6)
+    hr = torch.tensor(rng.uniform(0.0, BOX, size=(ng ** 3, 3)))
+    rows = torch.arange(hr.shape[0])
+    cfg = KnnConfig(ks=(2, 4, 8), n_queries=40, n_quantiles=16, strata=4,
+                    buffer_cells=0.0)
+    _, diag = knn_tile_loss(hr + 0.01, hr, rows, 0, cfg, ng_hr=ng, tile_hr=ng,
+                            boxsize_mpc_h=BOX)
+    assert diag["skipped"]
+
+
+def test_strata_config_refuses_nonsense():
+    with pytest.raises(ValueError, match="not in ks"):
+        KnnConfig(ks=(2, 4, 8), strata=4, strata_rank=16)
+    with pytest.raises(ValueError, match="needs strata > 1"):
+        KnnConfig(ks=(2, 4, 8), strata_charge=(0,))
+    with pytest.raises(ValueError, match="outside"):
+        KnnConfig(ks=(2, 4, 8), strata=4, strata_charge=(4,))
+    with pytest.raises(ValueError, match="repeats"):
+        KnnConfig(ks=(2, 4, 8), strata=4, strata_charge=(0, 0))
+    # strata_rank 0 means min(ks) and is always legal.
+    KnnConfig(ks=(2, 4, 8), strata=4, strata_rank=0)

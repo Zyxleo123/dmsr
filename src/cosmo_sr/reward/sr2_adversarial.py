@@ -241,25 +241,57 @@ class SR2Critic(nn.Module):
     No normalisation layers with batch statistics: WGAN-GP's gradient penalty is
     a per-sample constraint, and BatchNorm makes the critic's output for one
     sample depend on the others in the batch, which invalidates it. GroupNorm is
-    fine and is what is used.
+    the historical choice and remains the default.
+
+    ``inner_norm`` -- WHY THIS IS A KNOB AND NOT A CONSTANT. GroupNorm divides
+    out the per-group standard deviation, so it is **exactly scale-invariant**:
+    ``GN(a * z) == GN(z)`` for any ``a > 0``. Conv (once the bias is negligible)
+    and LeakyReLU are both positively homogeneous, so a GroupNorm anywhere after
+    the first block makes the WHOLE critic blind to the amplitude of its input.
+    MEASURED on this class, ``width=16, depth=4``: scaling the input by ``a``
+    leaves ``D`` pinned at 0.009504 from ``a = 1e3`` to ``a = 1e6``, while
+    ``||dD/dx||`` falls as exactly ``1/a`` (the product ``a * ||dD/dx||`` is
+    0.6846 at every decade). Spectral norm does not change this -- it was
+    measured with ``--critic-spectral-norm`` on and behaves identically.
+
+    That is the mechanism behind the from-scratch runs' divergence at the
+    MSE handoff (bracket probes C and D, 2026-09-24): with ``--w-mse 0`` nothing
+    else constrains the output amplitude, and the one term left cannot see it
+    AND damps its own corrective gradient by ``1/a`` as the field walks out.
+    ``d_real``/``d_fake`` sitting at +9/-8 against a field 1e5 times too large
+    is not a saturated discriminator -- it is a discriminator that was never
+    shown the scale.
+
+    ``inner_norm="none"`` drops the GroupNorms, which makes the critic
+    positively homogeneous instead: ``D`` then grows with the input amplitude
+    and "far too big" becomes a thing it can learn to say. Pair it with
+    ``spectral_norm`` (the SNGAN combination) -- that is what bounds the critic
+    without blinding it.
     """
 
     IN_CHANNELS = 20
+    #: Normalisation inside the critic body. See the class docstring.
+    INNER_NORMS: Tuple[str, ...] = ("group", "none")
 
-    def __init__(self, width: int = 64, depth: int = 4, in_chan: int = IN_CHANNELS):
+    def __init__(self, width: int = 64, depth: int = 4, in_chan: int = IN_CHANNELS,
+                 inner_norm: str = "group"):
         super().__init__()
+        if str(inner_norm) not in self.INNER_NORMS:
+            raise ValueError(
+                f"inner_norm {inner_norm!r} not in {self.INNER_NORMS}")
         layers: List[nn.Module] = []
         c = int(in_chan)
         for i in range(int(depth)):
             nxt = int(width) * (2 ** min(i, 3))
             layers += [nn.Conv3d(c, nxt, 3, stride=2, padding=1)]
-            if i > 0:
+            if i > 0 and str(inner_norm) == "group":
                 layers.append(nn.GroupNorm(min(8, nxt), nxt))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             c = nxt
         self.body = nn.Sequential(*layers)
         self.head = nn.Linear(c, 1)
         self.in_chan = int(in_chan)
+        self.inner_norm = str(inner_norm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[1] != self.in_chan:

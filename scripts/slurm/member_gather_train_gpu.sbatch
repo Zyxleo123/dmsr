@@ -149,6 +149,7 @@ set -euo pipefail
 : "${MG_GATE_AT_STEPS:=}"
 : "${MG_MIN_PURITY:=0.5}"
 : "${MG_MIN_LIVE_FRAC:=0.5}"
+: "${MG_STATS_MEMBERS:=all}"   # all = the hybrid every arm on disk trained on
 : "${MG_SOFTENING:=0.01}"
 : "${MG_BOUND_TAU:=0.5}"
 : "${MG_BG_K:=4096}"
@@ -169,6 +170,110 @@ set -euo pipefail
 # 0 = off = every arm so far. See submit_member_gather_train.sh for the arm.
 : "${MG_W_RADIUS:=0.0}"
 : "${MG_RADIUS_DEAD_ZONE:=1.0}"
+# --- SOFT MEMBERSHIP: which particles, as a latent variable ------------------
+# 0 = off = every arm recorded so far, and the hard path stays byte-identical.
+#
+# What it changes. Every term of this loss is a statistic of a particle
+# collection the loss is NOT allowed to choose -- HR's owner array names it. So
+# when SR2's material for a subhalo is not the material HR used, the loss
+# charges the generator for failing to bind particles that were never going to
+# be there. Here HR still supplies the object's REGION (a coarse Lagrangian
+# prior: every particle of an LR cell gets that cell's member fraction) and its
+# PHYSICS (the reference, untouched), and the CURRENT SR field decides which
+# particles participate -- under a per-particle budget of one shared with a
+# background/host category, and a per-candidate mass target. Both constraints
+# are load-bearing: without the first, several candidates spend the same
+# convenient particles; without the second, a candidate throws everything away
+# and keeps a tiny cold core that scores perfectly on every moment.
+#
+# MG_SOFT_LAMBDA is the only knob that interpolates: lambda -> inf pins the
+# membership at the prior, and at MG_SOFT_PRIOR=hard that limit IS the arm on
+# disk. So the sweep's two controls are `hard` at large lambda (reproduces the
+# gate-passing arm) and `coarse` at large lambda (says whether the coarse
+# window ALONE is already destructive -- the Gaussian-window failure of
+# docs/sr2_gather_finetune.md section 6, which is the risk this construction
+# is designed around).
+#
+# COST: the pool is (1 + ratio) times the member count and the estimator is
+# O(pool^2), so ratio 2 is ~9x the hard arm's pair bill. MG_MAX_SET_PARTICLES
+# is what bounds it -- leave it set for any soft arm.
+#
+# WATCH in metrics.jsonl: soft_mass_ratio must sit at ~1.0 (below it means
+# lambda made the window unfillable) and soft_hr_fraction says how much of each
+# solved object is still HR's own material -- 1.0 is the hard arm, and a
+# collapse toward 0 is the relaxation walking off the object.
+: "${MG_SOFT_MEMBERSHIP:=0}"
+: "${MG_SOFT_LAMBDA:=1.0}"
+: "${MG_SOFT_PRIOR:=coarse}"     # coarse | hard
+: "${MG_SOFT_FACTOR:=8}"         # HR sites per LR cell side; the run's SR factor
+: "${MG_SOFT_POOL_RATIO:=2.0}"
+: "${MG_SOFT_CELL_DILATE:=0}"
+: "${MG_SOFT_PRIOR_EPS:=1e-3}"
+: "${MG_SOFT_BG_FLOOR:=1e-3}"
+: "${MG_SOFT_STEPS:=3}"
+: "${MG_SOFT_MASS_STEPS:=10}"
+: "${MG_SOFT_MASS_ETA:=1.0}"
+: "${MG_SOFT_MASS_STEP_CAP:=20.0}"
+: "${MG_SOFT_SIGMA:=adaptive}"   # adaptive | hr | cand
+: "${MG_SOFT_SIGMA_SCALE:=1.0}"
+
+# --- THE HOST AS A BACKGROUND COMPONENT (the radial-placement arm) -----------
+# MEASURED (radial-placement-is-inverted): HR's median subhalo sits at 1.13
+# R_vir and every tuned arm at 0.30-0.35. The cause is selection, not the loss:
+# 7 of the 8 gather terms are translation-invariant and cannot express WHERE an
+# object sits, while the membership solve's flat background plus its n_c/f^3
+# prior make the host core the cheapest place for a candidate to meet its mass
+# target. MG_SOFT_HOST_PROFILE subtracts the host's log density from the
+# background so membership becomes a log OVERDENSITY test.
+#
+#   lr    analytic NFW from the LR catalog -- inference-honest, and BLANK for
+#         the ~43% of hosts under the LR completeness gate, which fall back to
+#         the flat background. Needs the table from build_lr_host_table.py.
+#   self  binned off the candidate field itself -- complete, partly circular.
+#
+# MG_SOFT_HOST_WEIGHT=0 is byte-identical to every soft arm already on disk,
+# which is the zero of the ladder. beta is NOT comparable between lr and self
+# (their log-density ranges differ by ~3x) -- read the ladder off
+# soft_host_logrho_p10/p90 in the run's diagnostics, in nats.
+: "${MG_SOFT_HOST_PROFILE:=off}"   # off | lr | self
+: "${MG_SOFT_HOST_WEIGHT:=0.0}"
+: "${MG_SOFT_HOST_CONC:=5.0}"
+: "${MG_SOFT_HOST_BINS:=24}"
+: "${MG_SOFT_HOST_R_MAX_RVIR:=4.0}"
+: "${MG_LR_HOST_TABLE:=}"
+: "${MG_LR_HOST_R_MAX_RVIR:=2.0}"
+
+# --- membership-solve dump (visualisation only) ------------------------------
+# Set MG_DUMP_MEMBERSHIP_NPZ to build this arm's pool, solve one host's
+# membership on MG_DUMP_MEMBERSHIP_FIELD with the per-sweep recorder on, write
+# the snapshots to the npz, and EXIT before training. Everything else (prior,
+# lambda, rung, guards) is the arm's own config, so the dumped solve is the one
+# the arm actually ran. MG_DUMP_MEMBERSHIP_HOST defaults to the first held-out
+# host.
+: "${MG_DUMP_MEMBERSHIP_NPZ:=}"
+: "${MG_DUMP_MEMBERSHIP_FIELD:=}"
+: "${MG_DUMP_MEMBERSHIP_HOST:=}"
+
+# --- relocation: which PARTICLES each supervised group is made of ------------
+# The arm A / B / C experiment (src/cosmo_sr/features/relocate_sets.py).
+#   off     arm A -- HR's owner array. Every result recorded in this line.
+#   frozen  arm B -- groups re-chosen from compact frozen-SR material at the
+#                    radius the group's frozen centroid already sits at.
+#   hr      arm C -- the same selection at HR's radius.
+# The HR targets are IDENTICAL in all three; only the material changes, so the
+# three Rockstar gates are directly comparable.
+#
+# MG_RELOCATE_CHECK_ONLY=1 builds the pool, writes the relocation report into
+# pool.json and exits WITHOUT training -- the proposal's "check this
+# distribution before training". Read `frac_within_eps` and `n_starved` there.
+: "${MG_RELOCATE:=off}"            # off | frozen | hr
+: "${MG_RELOCATE_DIRS:=8}"
+: "${MG_RELOCATE_EPS:=0.05}"       # radius tolerance, in the HOST's R_vir
+: "${MG_RELOCATE_OVERSAMPLE:=4.0}"
+: "${MG_RELOCATE_REFINE_ITERS:=3}"
+: "${MG_RELOCATE_W_VEL:=0.5}"
+: "${MG_RELOCATE_W_RADIUS:=1.0}"
+: "${MG_RELOCATE_CHECK_ONLY:=0}"
 : "${MG_W_SHELL:=0.0}"
 : "${MG_SHELL_DEAD_ZONE:=0.02}"
 # Reduce the sorted pairing to this many equal-COUNT quantile bins. 0 = the full
@@ -227,6 +332,16 @@ set -euo pipefail
 # over-concentrating hosts in phase space (class term vs count, rho +0.91).
 : "${MG_KNN_PHASE_LAMBDA:=0}"      # km/s per Mpc/h; 4000 is the measured pass
 : "${MG_KNN_CLASSES:=}"            # e.g. "sub_50_200"; empty = pooled (do not)
+# --- the catalog-free strata arm (docs/sr2_knn_strata.md). Density strata each
+# field reads off its OWN r_k, in place of the HR owner-class mask. Gated by
+# submit_knn_strata.sh: do NOT set these without a passing verdict json.
+# MG_KNN_STRATA alone is the pooled loss in finer bins -- MEASURED. The arm is
+# STRATA + STRATA_CHARGE, and CLASSES_DIAG_ONLY is what takes the label out of
+# the gradient while keeping it in the report.
+: "${MG_KNN_STRATA:=0}"
+: "${MG_KNN_STRATA_RANK:=0}"       # 0 = min(ks)
+: "${MG_KNN_STRATA_CHARGE:=}"      # e.g. "0" or "0,1"; empty = all (= pooled)
+: "${MG_KNN_CLASSES_DIAG_ONLY:=0}"
 # --- the HR critic, docs/sr2_gather_critic.md. Default OFF: MG_W_ADV=0 makes the
 # run byte-identical to the four finished arms. The hand-crafted high-k/velocity
 # hinges above each charge for ONE named statistic; the critic is their general
@@ -301,7 +416,34 @@ echo "=== $_HAVE training boxes have owner arrays"
 
 EXTRA=()
 [[ "$MG_POOL_ONLY" == "1" ]] && EXTRA+=(--pool-only)
+[[ "$MG_SOFT_MEMBERSHIP" == "1" ]] && EXTRA+=(--soft-membership)
+[[ "$MG_RELOCATE_CHECK_ONLY" == "1" ]] && EXTRA+=(--relocate-check-only)
+if [[ "$MG_SOFT_HOST_PROFILE" != "off" ]]; then
+  if [[ "$MG_SOFT_MEMBERSHIP" != "1" ]]; then
+    echo ">>> GATE FAILED: MG_SOFT_HOST_PROFILE=$MG_SOFT_HOST_PROFILE needs"
+    echo ">>> MG_SOFT_MEMBERSHIP=1 -- the hard arm's member sets are HR's"
+    echo ">>> labels and no background competes for them. Exiting 0 so"
+    echo ">>> dependents report a gate, not a DependencyNeverSatisfied."
+    exit 0
+  fi
+  EXTRA+=(--soft-host-profile "$MG_SOFT_HOST_PROFILE"
+          --soft-host-weight "$MG_SOFT_HOST_WEIGHT"
+          --soft-host-conc "$MG_SOFT_HOST_CONC"
+          --soft-host-bins "$MG_SOFT_HOST_BINS"
+          --soft-host-r-max-rvir "$MG_SOFT_HOST_R_MAX_RVIR"
+          --lr-host-r-max-rvir "$MG_LR_HOST_R_MAX_RVIR")
+  [[ -n "$MG_LR_HOST_TABLE" ]] && EXTRA+=(--lr-host-table "$MG_LR_HOST_TABLE")
+  echo "=== HOST PROFILE: $MG_SOFT_HOST_PROFILE at beta=$MG_SOFT_HOST_WEIGHT"
+  echo "=== watch soft_host_valid_frac (how many hosts got a profile) and"
+  echo "=== soft_host_logrho_p10/p90 (the ladder, in nats)."
+fi
 [[ -n "$MG_WANDB_MODE" ]] && EXTRA+=(--wandb-mode "$MG_WANDB_MODE")
+if [[ -n "$MG_DUMP_MEMBERSHIP_NPZ" ]]; then
+  EXTRA+=(--dump-membership-npz "$MG_DUMP_MEMBERSHIP_NPZ" \
+          --dump-membership-field "$MG_DUMP_MEMBERSHIP_FIELD")
+  [[ -n "$MG_DUMP_MEMBERSHIP_HOST" ]] && \
+    EXTRA+=(--dump-membership-host "$MG_DUMP_MEMBERSHIP_HOST")
+fi
 
 echo "=== member-gather fine-tune"
 echo "    train boxes:   $MG_TRAIN_BOXES"
@@ -312,6 +454,36 @@ echo "    $MG_HOSTS_PER_STEP hosts/step, sets/step ${MG_SETS_PER_STEP} (0=all),"
 echo "    <= $MG_MAX_HOSTS_PER_BOX hosts/box"
 echo "    pair sums: chunk $MG_POT_CHUNK capped at $MG_POT_MAX_ELEMS elements,"
 echo "    per-set particle cap ${MG_MAX_SET_PARTICLES} (0 = exact estimator)"
+if [ "$MG_SOFT_MEMBERSHIP" = "1" ]; then
+  echo "    SOFT MEMBERSHIP ON: prior $MG_SOFT_PRIOR, lambda $MG_SOFT_LAMBDA,"
+  echo "      factor $MG_SOFT_FACTOR, pool ratio $MG_SOFT_POOL_RATIO,"
+  echo "      window $MG_SOFT_SIGMA, ${MG_SOFT_STEPS}x${MG_SOFT_MASS_STEPS} solve."
+  echo "      READ soft_mass_ratio (~1.0) and soft_hr_fraction in metrics.jsonl;"
+  echo "      pool_over_live and sum_pool_squared in pool.json are the cost."
+  if [ "$MG_MAX_SET_PARTICLES" = "0" ]; then
+    echo "      WARNING: MG_MAX_SET_PARTICLES=0 with a ${MG_SOFT_POOL_RATIO}x pool"
+    echo "      leaves the O(N^2) pair sum uncapped -- expect ~9x the hard arm's"
+    echo "      step time. Set a cap unless the bill has been checked."
+  fi
+else
+  echo "    soft membership OFF (hard HR member mask, every arm to date)"
+fi
+
+if [ "$MG_RELOCATE" != "off" ]; then
+  _arm=$([ "$MG_RELOCATE" = "frozen" ] && echo B || echo C)
+  echo "    RELOCATION ON: arm $_arm (--relocate $MG_RELOCATE)."
+  echo "      Each group's particles are re-chosen ONCE, before training, from"
+  echo "      compact frozen-SR material at the requested host-centric radius."
+  echo "      HR's targets are unchanged. eps $MG_RELOCATE_EPS R_vir_host,"
+  echo "      $MG_RELOCATE_DIRS directions, $MG_RELOCATE_REFINE_ITERS swap passes."
+  echo "      READ pool.json 'relocation': frac_within_eps near 1 and n_starved"
+  echo "      near 0, or the material is not there and training answers nothing."
+  if [ "$MG_RELOCATE_CHECK_ONLY" = "1" ]; then
+    echo "      CHECK ONLY: this job writes pool.json and does NOT train."
+  fi
+else
+  echo "    relocation OFF (arm A: HR's owner array, every arm to date)"
+fi
 if awk "BEGIN{exit !($MG_W_HOST_SETS > 0)}"; then
   echo "    HOST PRESERVATION GUARD ON: w $MG_W_HOST_SETS, >= $MG_HOST_MIN_NUM_P p,"
   echo "      <= $MG_HOST_MAX_SETS host sets/cluster, ${MG_HOST_SETS_PER_STEP} host sets/step"
@@ -345,6 +517,17 @@ echo "    budget: bound penalty ${MG_BOUND_PENALTY}, term-norm ${MG_TERM_NORM}"
 if [ "$MG_BOUND_PENALTY" = "hinge" ] && [ "$MG_TERM_NORM" != "1" ]; then
 echo "            (both defaults -- MEASURED, that budget is d6 88%, bound"
 echo "             0.24%, and bound is the gate's own criterion. Section 10.)"
+fi
+if [ "$MG_STATS_MEMBERS" = "live" ]; then
+echo "    REFERENCE: live members only -- the out-of-tile stragglers are OUT of"
+echo "      every statistic (reference, candidate, centre targets, bg radius)."
+echo "      MEASURED: the hybrid reference sits at 2.18x HR's r_rms and 1.99x"
+echo "      its 2T/|W| at live_frac 0.979, because r_rms is an RMS."
+echo "      READ pure_hr_median against hybrid_reference_median in pool.json --"
+echo "      reference_median must now equal pure_hr_median."
+else
+echo "    reference: all members (hybrid: live + frozen stragglers), the"
+echo "      historical default. MG_STATS_MEMBERS=live de-biases it."
 fi
 echo "    centre: mode ${MG_CENTRE_MODE}, dead zone ${MG_CENTRE_DEAD_ZONE}r,"
 echo "            Huber knee ${MG_CENTRE_HUBER}r"
@@ -484,6 +667,7 @@ python -u scripts/features/finetune_member_gather.py \
     --env-host-floor "$MG_ENV_HOST_FLOOR" \
     --min-purity "$MG_MIN_PURITY" \
     --min-live-frac "$MG_MIN_LIVE_FRAC" \
+    --stats-members "$MG_STATS_MEMBERS" \
     --softening "$MG_SOFTENING" \
     --bound-tau "$MG_BOUND_TAU" \
     --bg-k "$MG_BG_K" \
@@ -540,7 +724,31 @@ python -u scripts/features/finetune_member_gather.py \
     --knn-centre "$MG_KNN_CENTRE" \
     --knn-phase-lambda "$MG_KNN_PHASE_LAMBDA" \
     ${MG_KNN_CLASSES:+--knn-classes $MG_KNN_CLASSES} \
+    --knn-strata "$MG_KNN_STRATA" \
+    --knn-strata-rank "$MG_KNN_STRATA_RANK" \
+    ${MG_KNN_STRATA_CHARGE:+--knn-strata-charge $MG_KNN_STRATA_CHARGE} \
+    $( [ "$MG_KNN_CLASSES_DIAG_ONLY" = "1" ] && echo --knn-classes-diagnostic-only ) \
     $( [ "$MG_KNN_ONE_SIDED" = "1" ] && echo --knn-one-sided ) \
+    --soft-lambda "$MG_SOFT_LAMBDA" \
+    --soft-prior "$MG_SOFT_PRIOR" \
+    --soft-factor "$MG_SOFT_FACTOR" \
+    --soft-pool-ratio "$MG_SOFT_POOL_RATIO" \
+    --soft-cell-dilate "$MG_SOFT_CELL_DILATE" \
+    --soft-prior-eps "$MG_SOFT_PRIOR_EPS" \
+    --soft-bg-floor "$MG_SOFT_BG_FLOOR" \
+    --soft-steps "$MG_SOFT_STEPS" \
+    --soft-mass-steps "$MG_SOFT_MASS_STEPS" \
+    --soft-mass-eta "$MG_SOFT_MASS_ETA" \
+    --soft-mass-step-cap "$MG_SOFT_MASS_STEP_CAP" \
+    --soft-sigma "$MG_SOFT_SIGMA" \
+    --soft-sigma-scale "$MG_SOFT_SIGMA_SCALE" \
+    --relocate "$MG_RELOCATE" \
+    --relocate-dirs "$MG_RELOCATE_DIRS" \
+    --relocate-eps "$MG_RELOCATE_EPS" \
+    --relocate-oversample "$MG_RELOCATE_OVERSAMPLE" \
+    --relocate-refine-iters "$MG_RELOCATE_REFINE_ITERS" \
+    --relocate-w-vel "$MG_RELOCATE_W_VEL" \
+    --relocate-w-radius "$MG_RELOCATE_W_RADIUS" \
     --w-adv "$MG_W_ADV" \
     --adv-warmup-steps "$MG_ADV_WARMUP" \
     --adv-ramp-steps "$MG_ADV_RAMP" \

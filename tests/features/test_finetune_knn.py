@@ -235,3 +235,84 @@ def test_attach_knn_classes_reads_the_owner_array(tmp_path, monkeypatch):
     bare = [{"box": "set0", "tile": 5}]
     fmg.attach_knn_classes(bare, _args())
     assert "knn_classes" not in bare[0]
+
+
+# --------------------------------------------------------------------------- #
+# The catalog-free strata arm: density strata in place of the HR class mask
+# --------------------------------------------------------------------------- #
+def test_strata_flags_reach_the_config():
+    a = _args("--knn-ks", "8", "32", "64", "128", "--knn-strata", "8",
+              "--knn-strata-rank", "8", "--knn-strata-charge", "0,1")
+    c = fmg.knn_config_from_args(a)
+    assert c.strata == 8 and c.strata_rank == 8 and c.strata_charge == (0, 1)
+    # Space- and comma-separated forms are the same list, because a submitter
+    # writing an env file will produce whichever the shell leaves it.
+    assert fmg.knn_strata_charge(_args("--knn-strata-charge", "0", "1")) == (0, 1)
+    assert fmg.knn_strata_charge(_args("--knn-strata-charge", "0,1")) == (0, 1)
+    assert fmg.knn_strata_charge(_args()) == ()
+    # Default off, so an unset run is byte-identical to the existing arms.
+    assert fmg.knn_config_from_args(_args()).strata == 0
+
+
+def test_strata_change_the_penalty_and_the_charge_narrows_it():
+    """The term must actually behave differently, and dense-only must be the
+    one that weighs the clumped tail -- the measured point of the whole arm."""
+    cand, hr = _fields(2, seed=5)
+    pool = [{"box": "b", "tile": 0}, {"box": "b", "tile": 1}]
+    base = fmg.KnnConfig(ks=(2, 8), n_queries=256, n_quantiles=4,
+                         buffer_cells=0.0)
+    strat = fmg.KnnConfig(ks=(2, 8), n_queries=256, n_quantiles=4,
+                          buffer_cells=0.0, strata=4)
+    dense = fmg.KnnConfig(ks=(2, 8), n_queries=256, n_quantiles=4,
+                          buffer_cells=0.0, strata=4, strata_charge=(0,))
+    a = _args()
+    out = {}
+    for name, cfg in (("pooled", base), ("equal", strat), ("dense", dense)):
+        gen = torch.Generator().manual_seed(0)
+        pen, diags = fmg._unsup_knn(None, pool, None, torch.device("cpu"), a, KW,
+                                    cfg, generator=gen, cand=cand, hr=hr)
+        out[name] = float(pen)
+        if name != "pooled":
+            assert diags[0]["strata_charge"] == (
+                [0] if name == "dense" else [0, 1, 2, 3])
+    # Equal-weight strata are the pooled loss in finer bins (the measured
+    # identity); dense-only is a different, larger number.
+    assert out["equal"] == pytest.approx(out["pooled"], rel=0.5)
+    assert out["dense"] > out["equal"]
+
+
+def test_diagnostic_only_classes_leave_the_loss_catalog_free():
+    """The arm's defining property: with the flag on, the per-class numbers are
+    still computed for the eval and the TRAINING penalty is the classless one."""
+    cand, hr = _fields(2, seed=6)
+    t = fmg.TILE
+    # Filled with `host`, NOT zeros: 0 is sub_50_200's own index, so a zeroed
+    # vector labels the whole tile as the class and the "subset" is every row.
+    cls = torch.full((t ** 3,), fmg.OWNER_CLASSES.index("host"),
+                     dtype=torch.int8)
+    cls[: t ** 3 // 2] = fmg.OWNER_CLASSES.index("sub_50_200")
+    pool = [{"box": "b", "tile": 0, "knn_classes": cls},
+            {"box": "b", "tile": 1, "knn_classes": cls}]
+    cfg = fmg.KnnConfig(ks=(2, 8), n_queries=256, n_quantiles=4,
+                        buffer_cells=0.0, strata=4, strata_charge=(0,))
+    a = _args()
+    sub = (fmg.OWNER_CLASSES.index("sub_50_200"),)
+
+    def pen_with(class_ids):
+        gen = torch.Generator().manual_seed(0)
+        p, _ = fmg._unsup_knn(None, pool, None, torch.device("cpu"), a, KW, cfg,
+                              generator=gen, cand=cand, hr=hr,
+                              class_ids=class_ids)
+        return float(p)
+
+    # The two are genuinely different objectives -- which is what makes the
+    # demotion a real change and not a relabelling.
+    assert pen_with(sub) != pytest.approx(pen_with(()), rel=1e-6)
+
+
+def test_diagnostic_only_without_named_classes_is_refused():
+    """A flag that silently does nothing is the failure mode this line keeps
+    paying for, so the no-op combination is an error, not a default."""
+    a = _args("--knn-classes-diagnostic-only")
+    assert a.knn_classes_diagnostic_only is True
+    assert fmg.knn_class_ids(a) == ()

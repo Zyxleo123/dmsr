@@ -43,7 +43,7 @@ import glob
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -173,7 +173,9 @@ def shell_profile(a: HaloCatalog, b: HaloCatalog, centre: np.ndarray,
 
 def target_hit_rate(cat: HaloCatalog, hr: HaloCatalog, halo_ids: List[int],
                     *, radius_factor: float = 1.0, min_radius: float = 0.15,
-                    mass_frac: float = 0.25) -> Dict:
+                    mass_frac: float = 0.25,
+                    target_pos: Optional[Dict[int, Sequence[float]]] = None,
+                    ) -> Dict:
     """Did each SUPERVISED subhalo come back as a bound halo?
 
     The per-R_vir count answers a different question than this experiment asked.
@@ -188,15 +190,26 @@ def target_hit_rate(cat: HaloCatalog, hr: HaloCatalog, halo_ids: List[int],
     ``max(radius_factor * r_vir, min_radius)`` Mpc/h of the HR subhalo's centre
     carrying at least ``mass_frac`` of its particles -- position and mass, so a
     passing wisp near the right place does not count.
+
+    ``target_pos`` overrides "the HR subhalo's centre" per halo id, and the
+    relocation arms (:mod:`cosmo_sr.features.relocate_sets`) are why it exists:
+    those runs keep HR's targets but build the object somewhere else on purpose,
+    so searching at HR's catalog position would read ~0 whatever the run
+    achieved. It is written into ``subhalos.json`` only for sets that were
+    actually relocated, so every arm-A number stays exactly what it was.
     """
     rows, hits = [], {"base": 0}
     by_id = {int(h): i for i, h in enumerate(hr.ids)}
+    tpos = dict(target_pos or {})
     for hid in halo_ids:
         i = by_id.get(int(hid))
         if i is None:
             continue
         r = max(float(radius_factor) * float(hr.rvir[i]) / 1000.0, float(min_radius))
-        d = np.linalg.norm(periodic_delta(cat.pos, hr.pos[i][None, :]), axis=1)
+        want = tpos.get(int(hid))
+        centre = (hr.pos[i] if want is None
+                  else np.asarray(want, dtype=hr.pos.dtype))
+        d = np.linalg.norm(periodic_delta(cat.pos, centre[None, :]), axis=1)
         near = np.flatnonzero((d <= r) & (cat.num_p >= mass_frac * hr.num_p[i]))
         # A miss has two very different causes and the hit flag cannot tell them
         # apart: nothing is THERE, or something is there and is too light. Record
@@ -205,6 +218,7 @@ def target_hit_rate(cat: HaloCatalog, hr: HaloCatalog, halo_ids: List[int],
         rows.append({
             "halo_id": int(hid), "hr_num_p": int(hr.num_p[i]),
             "search_radius_mpc_h": r,
+            "searched_at": ("hr_catalog" if want is None else "relocated"),
             "hit": bool(near.size),
             "best_num_p": int(cat.num_p[near].max()) if near.size else 0,
             "nearest_mpc_h": float(d.min()),
@@ -316,14 +330,24 @@ def main(argv=None) -> int:
     # 3b. the supervised targets, one at a time -- the question this run asked
     if args.targets_json:
         import json as _json
-        ids = [int(r["halo_id"]) for r in
-               _json.loads(Path(args.targets_json).read_text())["rows"]]
+        _rows = _json.loads(Path(args.targets_json).read_text())["rows"]
+        ids = [int(r["halo_id"]) for r in _rows]
+        # Where to look for each target. Present only for a relocated set --
+        # see `target_hit_rate` -- so an arm-A catalog produces an empty map
+        # and takes the HR-catalog path unchanged.
+        tpos = {int(r["halo_id"]): r["target_pos"] for r in _rows
+                if r.get("target_pos") is not None}
         tgt = {name: target_hit_rate(
                    cats[name], hr, ids,
                    radius_factor=float(args.match_radius_factor),
-                   mass_frac=float(args.match_mass_frac))
+                   mass_frac=float(args.match_mass_frac), target_pos=tpos)
                for name in ("base", "cand")}
         result["supervised_targets"] = tgt
+        result["n_targets_relocated"] = len(tpos)
+        if tpos:
+            print(f"\n  {len(tpos)} of {len(ids)} targets are RELOCATED: the "
+                  "hit test searches around the position this run asked the "
+                  "group to occupy, not the HR subhalo's catalog centre.")
         print(f"\n  the {tgt['base']['n']} SUPERVISED targets, recovered as bound "
               "halos (position AND mass):")
         print(f"    frozen {tgt['base']['hits']:3d}/{tgt['base']['n']} "
@@ -341,8 +365,14 @@ def main(argv=None) -> int:
             for rf, mf in ladder:
                 row = {"radius_factor": rf, "mass_frac": mf}
                 for name in ("base", "cand"):
+                    # `target_pos` here too, or the ladder searches HR's centre
+                    # while the headline row searched the relocated one, and the
+                    # two disagree by 4x on a relocation arm (reloc_B read 261
+                    # above and 66 here). The ladder exists to loosen the
+                    # THRESHOLD, not to move the address.
                     h = target_hit_rate(cats[name], hr, ids,
-                                        radius_factor=rf, mass_frac=mf)
+                                        radius_factor=rf, mass_frac=mf,
+                                        target_pos=tpos)
                     row[name] = h["hits"]
                     row[f"{name}_rate"] = h["rate"]
                 sweep.append(row)

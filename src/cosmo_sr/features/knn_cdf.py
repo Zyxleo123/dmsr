@@ -42,7 +42,10 @@ compare the *distribution* of those distances to HR's. It is:
   choice of query set, so unlike every term in :mod:`member_gather` it can be
   charged on the **unsupervised box-wide tile pool**, where the supervised loss
   has no support at all and where the 6x train/holdout gap of
-  `selfvel-arm-failed-the-gate` was measured.
+  `selfvel-arm-failed-the-gate` was measured. One caveat, and it is the whole
+  reason ``KnnConfig.strata`` exists: ``--knn-classes`` reintroduces a label by
+  the back door, masking the queries by HR's owner class. ``strata`` is the
+  catalog-free way to make the same split -- see "Density strata" below.
 * **more than 2-point.** The kNN-distance CDF at a fixed ``k`` is a sum over all
   orders of the correlation hierarchy (it is ``1 - P(0 | sphere)``-style void
   probability, complementary to counts-in-cells), which is why a field can match
@@ -223,6 +226,56 @@ class KnnConfig:
     #: -0.55, 8000 -0.60). 0 keeps the position-only statistic of rounds 1-4.
     #: Positions stay periodic; the velocity axes are open.
     phase_lambda: float = 0.0
+    #: Equal-count density strata, computed by each field from ITS OWN
+    #: particles. 0 or 1 is the pooled form. This is the catalog-free
+    #: replacement for ``--knn-classes``: the class mask exists because the
+    #: pooled statistic is dominated by host and unbound particles (round 5b,
+    #: rho +0.91 with subhalo count -- backwards), and the fix it applied was an
+    #: HR Rockstar label in the gradient. Stratifying on each field's own
+    #: ``r_{strata_rank}`` splits the query population by local density with no
+    #: catalog at all, and charges the loss separately in each stratum.
+    #:
+    #: What this does and does not buy, because the arithmetic is exact and the
+    #: claim would otherwise be overstated: for the stratifying column ITSELF,
+    #: equal-count strata of the sorted values, each matched by sorted rank in
+    #: ``n_quantiles`` bins, is *identically* the pooled match in
+    #: ``strata * n_quantiles`` bins -- pinned in
+    #: ``test_strata_on_the_stratifying_rank_is_finer_binning``. There is no new
+    #: information in that column. ALL of the gain is in the OTHER ranks: the
+    #: term becomes the CONDITIONAL distribution ``P(r_k | r_strat decile)``
+    #: rather than the marginal of each, and it is the conditional that separates
+    #: a halo from a field of knots -- a knot has HR's small ``r_8`` and nothing
+    #: like HR's ``r_128`` at that same ``r_8``, which no marginal charges for.
+    strata: int = 0
+    #: Neighbour rank whose distance defines the strata. Must be one of ``ks``
+    #: (the search is shared, so a rank outside ``ks`` would cost a second one).
+    #: 0 means ``min(ks)`` -- the smallest rank is the most local density proxy
+    #: and the one least contaminated by the halo a particle sits in.
+    strata_rank: int = 0
+    #: Which strata enter the loss, dense-first (``0`` is the densest). Empty
+    #: charges all of them with equal weight.
+    #:
+    #: This knob is NOT optional garnish, and the measurement that says so is
+    #: ``test_equal_count_strata_do_not_reweight_the_dense_tail``: equal-count
+    #: strata of ``Q`` bins each partition the query population into exactly the
+    #: same ``strata * Q`` equal-count bins the pooled form already uses, so the
+    #: dense tail's share of the loss is IDENTICAL either way. Measured on the
+    #: dilution fixture: pooled 0.0881, 8 equal-weight strata 0.0912, while the
+    #: densest stratum alone carries 0.726 of a per-stratum budget in which the
+    #: other seven are 0.004 or less. Partitioning alone changes the diagnostic,
+    #: not the gradient; ``strata_charge=(0,)`` is what actually reweights, and
+    #: it is the catalog-free analogue of ``--knn-classes sub_50_200`` -- a
+    #: query mask by density the field reads off itself instead of by owner
+    #: class read off HR's Rockstar catalog.
+    #:
+    #: Read ``docs/sr2_knn_strata.md`` before choosing it: MEASURED on the same
+    #: fixture, the densest stratum is 65-83% HOST particles, not subhalo ones,
+    #: and host over-concentration is this line's characteristic damage
+    #: (`host-damage-is-mostly-reparenting`). Whether a density cut is a usable
+    #: stand-in for the class mask on the REAL box is what
+    #: ``scripts/features/knn_strata_composition.py`` measures, and that
+    #: diagnostic gates this arm.
+    strata_charge: Tuple[int, ...] = ()
     #: Deterministic query draw. The queries are redrawn every evaluation (a
     #: fixed set would supervise a fixed sub-sample, which is a weaker and
     #: memorisable statement); this seeds that draw so a diagnostic is
@@ -248,6 +301,28 @@ class KnnConfig:
             raise ValueError(f"buffer_cells {self.buffer_cells} is negative")
         if self.phase_lambda < 0.0:
             raise ValueError(f"phase_lambda {self.phase_lambda} is negative")
+        if self.strata < 0:
+            raise ValueError(f"strata {self.strata} is negative; 0 is pooled")
+        if self.strata_rank < 0:
+            raise ValueError(f"strata_rank {self.strata_rank} is negative")
+        if self.strata_charge:
+            if self.strata <= 1:
+                raise ValueError(
+                    f"strata_charge {self.strata_charge} needs strata > 1")
+            bad = [j for j in self.strata_charge
+                   if j < 0 or j >= int(self.strata)]
+            if bad:
+                raise ValueError(
+                    f"strata_charge {bad} outside [0, {self.strata})")
+            if len(set(self.strata_charge)) != len(self.strata_charge):
+                raise ValueError(
+                    f"strata_charge {self.strata_charge} repeats a stratum")
+        if self.strata > 1 and self.strata_rank and (
+                self.strata_rank not in self.ks):
+            raise ValueError(
+                f"strata_rank {self.strata_rank} is not in ks {self.ks}; the "
+                "stratifying distance is read from the shared search, so it "
+                "must be a rank the search already returns")
         if self.search_max_elems < 1:
             raise ValueError(
                 f"search_max_elems {self.search_max_elems} is below 1")
@@ -553,6 +628,116 @@ def knn_cdf_loss(
 
 
 # --------------------------------------------------------------------------- #
+# Density strata: splitting the query population without a catalog
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS. ``--knn-classes`` is the one place a Rockstar label reaches
+# this term's gradient: it restricts the queries to HR's ``sub_50_200``
+# particles. It was not a preference, it was measured -- round 5b, the pooled
+# form ranks the working arms BACKWARDS (rho +0.91 with subhalo count) because
+# host and unbound particles are ~95% of any interior and the working arms
+# over-concentrate hosts. The mask fixed the ranking by naming the particles
+# that matter.
+#
+# The label is doing one job there and it is not membership: it is picking out
+# the DENSE tail of the query population. That is a property of the particles,
+# and each field can read it off its own positions. Stratifying on each field's
+# own ``r_{strata_rank}`` does the same split with no owner array, no catalog,
+# no parent ids -- which puts this term back to the catalog-free statement the
+# module docstring claims for it.
+#
+# Read ``KnnConfig.strata`` before using it: for the stratifying column itself
+# this is provably nothing but finer binning, and every bit of what it adds is
+# in the CONDITIONAL distribution of the other ranks.
+def strata_partition(z: torch.Tensor, cfg: KnnConfig) -> list:
+    """Equal-count query groups, ordered dense-first, from ``z``'s own values.
+
+    ``z`` is a field's ``(n_queries, len(ks))`` log-distance block and the split
+    is read from its ``strata_rank`` column, so each field defines its own
+    strata from its own particles -- the point of the whole construction. The
+    ordering is **detached**, exactly as the neighbour search is and for the same
+    reason: an assignment of rows to groups is combinatorial, its derivative is
+    zero almost everywhere, and the distances inside each group stay live.
+
+    Equal COUNT, not equal radius: every stratum then carries the same weight
+    whatever the density distribution does, which is ``_quantile_reduce``'s rule
+    one level up. Group 0 is the densest (smallest ``r``).
+    """
+    n = int(z.shape[0])
+    m = max(int(cfg.strata), 1)
+    col = list(cfg.ks).index(int(cfg.strata_rank) or int(min(cfg.ks)))
+    order = z[:, col].detach().argsort()
+    edges = [(b * n) // m for b in range(m + 1)]
+    return [order[a:b] for a, b in zip(edges[:-1], edges[1:])]
+
+
+def knn_stratified_loss(
+    z_cand: torch.Tensor, z_hr: torch.Tensor, cfg: KnnConfig,
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """:func:`knn_cdf_loss` charged separately in each self-defined stratum.
+
+    ``cfg.strata <= 1`` is :func:`knn_cdf_loss` itself, so this is the only call
+    site the tile loss needs. The charged strata are averaged with equal weight.
+
+    **Partitioning is not reweighting.** Every stratum is measured, but with
+    ``strata_charge`` empty every stratum is also charged, and that is
+    arithmetically the pooled loss in finer bins -- not an approximation of it,
+    the same equal-count bins. See ``KnnConfig.strata_charge`` for the numbers.
+    If the intent is to stop hosts and background dominating the term, the
+    charge has to be restricted; partitioning alone only sharpens the readout.
+
+    The diagnostics keep ``ratio_med`` / ``ratio_q10`` at their pooled shape
+    (one value per ``k``, meaned over strata) so every existing reader keeps
+    working, and add the two that are the reason for the term:
+    ``ratio_med_dense`` (stratum 0, the densest tenth-or-so of queries) and the
+    per-stratum blocks under ``strata``.
+    """
+    if int(cfg.strata) <= 1:
+        return knn_cdf_loss(z_cand, z_hr, cfg)
+    gc = strata_partition(z_cand, cfg)
+    gh = strata_partition(z_hr, cfg)
+    charged = (set(int(j) for j in cfg.strata_charge) if cfg.strata_charge
+               else set(range(len(gc))))
+    per, blocks = [], []
+    for j, (a, b) in enumerate(zip(gc, gh)):
+        if int(a.numel()) < 1 or int(b.numel()) < 1:
+            blocks.append({"skipped": True, "n_queries_cand": int(a.numel()),
+                           "n_queries_hr": int(b.numel())})
+            continue
+        # Every stratum is MEASURED; only the charged ones reach the gradient,
+        # so the diagnostic stays whole whatever the loss is charged on.
+        with torch.set_grad_enabled(j in charged and torch.is_grad_enabled()):
+            l_s, d_s = knn_cdf_loss(z_cand[a], z_hr[b], cfg)
+        d_s["charged"] = bool(j in charged)
+        if j in charged:
+            per.append(l_s)
+        blocks.append(d_s)
+    if not per:
+        return z_cand.sum() * 0.0, {"ks": list(cfg.ks), "skipped": True,
+                                    "strata": blocks}
+    loss = torch.stack(per).mean()
+    live = [d for d in blocks if not d.get("skipped")]
+    diag = {
+        "ks": list(cfg.ks),
+        "n_quantiles": int(live[0]["n_quantiles"]),
+        "n_queries_cand": int(z_cand.shape[0]),
+        "n_queries_hr": int(z_hr.shape[0]),
+        "n_strata_charged": len(per),
+        "strata_charge": [int(j) for j in sorted(charged)],
+        "strata_rank": int(cfg.strata_rank) or int(min(cfg.ks)),
+        "loss": float(loss.detach()),
+        # Stratum 0 is the dense tail -- the population `--knn-classes` was
+        # naming with a catalog. If the term is doing anything, it is here.
+        "ratio_med_dense": list(live[0]["ratio_med"]),
+        "ratio_q10_dense": list(live[0]["ratio_q10"]),
+        "strata": blocks,
+    }
+    for key in ("ratio_med", "ratio_q10", "abs_dlog_med"):
+        diag[key] = [float(v) for v in
+                     torch.tensor([d[key] for d in live]).mean(dim=0)]
+    return loss, diag
+
+
+# --------------------------------------------------------------------------- #
 # Neighbouring material: the z=0 tile is not where its particles are
 # --------------------------------------------------------------------------- #
 # MEASURED, knn_cdf_set9.json (job 49259): with a tile's own 64^3 particles as
@@ -729,6 +914,11 @@ def knn_tile_loss(
     Lagrangian centre. See the block comment above for the measurement that makes
     both necessary at z=0.
 
+    ``cfg.strata > 1`` charges the loss per self-defined density stratum
+    (:func:`knn_stratified_loss`) instead of once on the whole query set. It is
+    the catalog-free alternative to ``classes`` below and composes with it: with
+    both on, each named class is stratified inside itself.
+
     ``classes`` (one label per entry of ``tile_rows``, HR's owner class) with
     ``class_ids`` charges the loss SEPARATELY on each named class and averages
     the classes equally, instead of once on the pooled interior. MEASURED, round
@@ -767,7 +957,10 @@ def knn_tile_loss(
         """``(loss, diag)`` on one row subset, or ``None`` if it is too small."""
         qc, qh = queries(cand_pos, rws), queries(hr_pos, rws)
         n_min = int(min(qc.numel(), qh.numel()))
-        if n_min < max(int(cfg.n_quantiles), 1) or n_min < 2:
+        # Under strata each group gets n_min/strata of the draws, so the bins a
+        # STRATUM must fill are what the floor is about, not the tile's total.
+        need = max(int(cfg.n_quantiles), 1) * max(int(cfg.strata), 1)
+        if n_min < need or n_min < 2:
             return None, {"n_queries_cand": int(qc.numel()),
                           "n_queries_hr": int(qh.numel()), "skipped": True}
         # Equal counts keep the quantile bins identical between the two fields
@@ -779,7 +972,7 @@ def knn_tile_loss(
         with torch.no_grad():
             z_h = knn_log_distances(hr_table, qh, cfg,
                                     boxsize_mpc_h=boxsize_mpc_h)
-        return knn_cdf_loss(z_c, z_h, cfg)
+        return knn_stratified_loss(z_c, z_h, cfg)
 
     zero = torch.zeros((), device=cand_pos.device, dtype=cand_pos.dtype)
     if classes is None or not len(class_ids):

@@ -464,6 +464,224 @@ not amount.
 %  INSIGHTS
 % ======================================================================
 
+% ======================================================================
+%  UPDATE 1: WHICH TERMS ARE ACTUALLY NEEDED
+% ======================================================================
+
+\begin{frame}{Most of the loss terms were not needed}
+\small
+We ablated the loss one term at a time, then removed terms in sequence until the
+result degraded. Two terms survive:
+\vspace{0.1cm}
+\begin{itemize}
+    \item \textbf{virial} --- the driver, as before.
+    \item \textbf{low-$k$ guard} --- keeps the large-scale field from drifting.
+          Without it the field drifts ($10\times$ the limit) and the extra
+          ``subhalos'' are fragmentation.
+\end{itemize}
+\vspace{0.1cm}
+{\footnotesize $d6$, $r_{\mathrm{rms}}$, $\sigma_v$, bound and the high-$k$ guard
+are dead weight --- and $d6$ was actively \emph{harmful}: it was the source of
+the small-scale power excess.}
+
+\vspace{0.25cm}
+\centering
+\begin{tabular}{l c c}
+\hline
+Held-out set9, edited region & Full loss (8 terms) & \textbf{Minimal (2 terms)} \\
+\hline
+Subhalos $\ge50$p / HR   & $0.74$  & $\mathbf{1.07}$ \\
+Hosts $\ge200$p / HR     & $0.66$  & $\mathbf{0.74}$ \\
+Mass-function shape error$^\dagger$ & $0.215$ & $\mathbf{0.174}$ \\
+\hline
+\end{tabular}
+
+\vspace{0.2cm}
+{\scriptsize $^\dagger$ mean $|\log(\mathrm{ours}/\mathrm{HR})|$ over five subhalo
+mass bins; lower is better; SR2 baseline is $0.805$.
+\textbf{Abundance and shape both improve} --- removing terms did not cost us
+shape, it bought it.}
+\end{frame}
+
+% ======================================================================
+%  UPDATE 2: SOFT MEMBERSHIP
+% ======================================================================
+
+\begin{frame}{Who belongs to a subhalo should not be fixed by HR}
+\small
+Make membership a latent variable: model the particles around candidate $j$ as a
+\textbf{mixture of Gaussians in 6-D phase space}, with a background component for
+``belongs to the host, not any subhalo''. Solve by EM.
+
+\vspace{0.15cm}
+\textbf{E-step} (soft assignment): responsibility of particle $i$ to subhalo $j$,
+\[
+P_{ij} \;\propto\; \pi_{ij}\,
+\exp\!\Big[-\tfrac{1}{2}\Big(
+\tfrac{|x_i-c_j|^2}{\sigma_{r,j}^2}+\tfrac{|v_i-\bar v_j|^2}{\sigma_{v,j}^2}
+\Big)\Big],
+\qquad \textstyle\sum_j P_{ij} + P_{i,\mathrm{bg}} = 1.
+\]
+
+\textbf{M-step} (refit centres): $P$-weighted means, widths held at HR's values
+\[
+c_j\leftarrow\frac{\sum_i P_{ij}\,x_i}{\sum_i P_{ij}},\quad
+\bar v_j\leftarrow\frac{\sum_i P_{ij}\,v_i}{\sum_i P_{ij}},\qquad
+\sigma_{r,j},\sigma_{v,j}\ \text{fixed to HR}
+\]
+\vspace{0.1cm}
+\begin{itemize}\footnotesize
+    \item $P_{ij}$: membership of particle $i$ in subhalo $j$; $P_{i,\mathrm{bg}}$: background.
+    \item $\pi_{ij}$: a prior we specify; hard arm is the $P_{ij}\!\in\!\{0,1\}$ argmax limit.
+    \item $x_i,v_i$: particle position, velocity; $c_j,\bar v_j$: candidate $j$'s centre in each.
+    \item $\sigma_{r,j},\sigma_{v,j}$: candidate $j$'s widths in position, velocity.
+\end{itemize}
+\vspace{0.05cm}
+
+{\footnotesize Result: candidates keep HR's particle count but only
+$\mathbf{25\%}$ of HR's own particles --- same object, three quarters different
+material.}
+\end{frame}
+
+% ----------------------
+% ----------------------
+\begin{frame}{Generalising the EM solve to an arbitrary loss}
+\small
+\textbf{The only thing the E-step needs is the posterior $p_\theta(P\mid x)$ the
+loss induces.} The question is whether we can write it down cheaply.
+
+\vspace{0.2cm}
+\textbf{Gaussian (d6) is the easy case.} The cost is a negative log-likelihood,
+$c_j(x_i)=-\log p_\theta(x_i\mid j)$, so Bayes gives the posterior for free:
+\[
+p_\theta(P_{ij}\mid x_i)\;\propto\;\pi_{ij}\,p_\theta(x_i\mid j)
+\;=\;\pi_{ij}\,e^{-c_j(x_i)}
+\quad\Longrightarrow\quad\text{softmax E-step.}
+\]
+
+\vspace{0.2cm}
+Downstream, the solved $P$ enters every member-gathering statistic as a
+\textbf{soft weight} --- kinetic energy and potential energy of the set:
+\[
+T_j=m\sum_i P_{ij}\,\tfrac12|v_i-\bar v_j|^2,
+\qquad
+\Phi_j=\tfrac12 m\!\sum_{i\neq k}P_{ij}P_{kj}\,\phi_{ik},
+\qquad
+P_{ij}\!\equiv\!1 \Rightarrow \text{hard arm.}
+\]
+\end{frame}
+
+% ----------------------
+% ----------------------
+\begin{frame}{What the solve actually picks}
+\small
+\begin{columns}[T]
+\column{0.44\textwidth}
+\centering
+\includegraphics[width=\textwidth]{figures/membership_meanP_xz.png}\\
+{\scriptsize mean membership $\langle P\rangle$ per bin around one host;
+cyan = generated subhalo centres.}
+
+\column{0.54\textwidth}
+\centering
+\includegraphics[width=\textwidth]{figures/membership_radial.png}\\
+{\scriptsize per particle: $\max_j P_{ij}$ over non-background candidates ---
+``how subhalo-like is this particle'' --- against its distance from the host.}
+\end{columns}
+
+\vspace{0.2cm}
+\begin{itemize}\footnotesize
+    \item Membership is \textbf{not} concentrated on the host core: the solve
+          recruits \textbf{outskirt} particles, well past $1\,R_{\mathrm{vir}}$
+          (\alert{[x]} of the assigned mass).
+    \item Only $\sim\!25\%$ of the chosen mass is HR's own named members --- the
+          rest is material HR never assigned to that subhalo.
+    \item That is the intended behaviour, and it is why the abundance improves:
+          the objects are built from whatever SR2 actually has nearby.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Soft membership wins on the halo finder}
+\small
+Held-out set9, edited region, against the \textbf{hard-mask arm trained
+identically}:
+\vspace{0.2cm}
+
+\centering
+\begin{tabular}{l c c c c}
+\hline
+ & SR2 base & Hard mask & \textbf{Soft} & HR \\
+\hline
+Hosts $\ge200$p          & $3028$ & $3118$ & $\mathbf{3148}$ & $3775$ \\
+Subhalos $\ge50$p        & $4541$ & $9993$ & $\mathbf{10138}$ & $12367$ \\
+Shape error              & $0.805$ & $0.153$ & $\mathbf{0.148}$ & --- \\
+Host mass function / HR  & --- & $1.16\times$ & $\mathbf{1.02\times}$ & $1.00\times$ \\
+\hline
+Median $r/R_{\mathrm{vir}}$ & $0.53$ & $0.31$ & $0.35$ & $\mathbf{1.13}$ \\
+\hline
+\end{tabular}
+
+\vspace{0.3cm}
+\begin{columns}[T]
+\column{0.52\textwidth}
+{\footnotesize
+\textbf{Ahead on both axes}, neither traded for the other. The hard mask
+overproduces $16\%$ at the massive end; soft membership halves that.
+Cost: $1.13\times$ the step time.}
+\column{0.46\textwidth}
+{\footnotesize
+\alert{\textbf{Radial placement is not fixed.}} Subhalos still sit far too close
+to their host centre ($0.35$ vs HR's $1.13\,R_{\mathrm{vir}}$). We predicted
+this: the relaxation chooses \emph{which} material, not \emph{where it goes}.}
+\end{columns}
+\end{frame}
+
+% ======================================================================
+%  PHASE-SPACE kNN TERM
+% ======================================================================
+
+\begin{frame}{A phase-space kNN term closes the abundance gap}
+\small
+A subhalo is a set of particles that sit \textbf{close together in 6-D phase
+space}. So, class by class, match the \emph{distribution of nearest-neighbour
+distances} to HR's --- a placement-free statistic that sees clustering the
+critic and $P(k)$ miss.
+\vspace{0.15cm}
+
+For each subhalo-class particle $i$, in the phase-space coordinate
+$w_i=(x_i,\lambda v_i)$ ($\lambda$ = velocity weight), let $r_{i,k}$ be its
+distance to the $k$-th nearest neighbour. Match the sorted log-distances to
+HR's:
+\[
+\mathcal{L}_{\mathrm{kNN}}
+=\sum_{k\in\{8,16,32,64\}}
+W_1\!\Big(\big\{\log r^{\text{ours}}_{i,k}\big\}_{i\in\mathcal S},\;
+          \big\{\log r^{\mathrm{HR}}_{i,k}\big\}_{i\in\mathcal S}\Big),
+\]
+where $\mathcal S$ = the subhalo-class particles \textbf{only} (hosts excluded),
+and $W_1$ of two equal-size 1-D samples is just the mean
+$|\,\text{sorted}-\text{sorted}\,|$.
+\vspace{0.15cm}
+
+Added on top of the gather loss, held-out set9 region:
+
+\centering
+\begin{tabular}{l c c c}
+\hline
+ & gather (self) & \textbf{+ kNN} & HR \\
+\hline
+Subhalos $\ge50$p / HR & $0.74$ & $\mathbf{0.97}$ & $1.00$ \\
+Hosts $\ge200$p / HR   & $0.66$ & $\mathbf{0.74}$ & $1.00$ \\
+Shape error            & $0.204$ & $\mathbf{0.126}$ & --- \\
+\hline
+\end{tabular}
+
+\vspace{0.2cm}
+{\footnotesize The term \textbf{closes the abundance gap} ($0.74\to0.97\times$
+HR) and, as a bonus, \textbf{repairs host damage} ($0.66\to0.74$, above the SR2
+baseline's $0.73$) --- hosts must stay out of the loss for this to hold.}
+\end{frame}
+
 \begin{frame}{Insight 1: SR2 is doing better than it looks}
 \small
 \begin{itemize}
@@ -506,8 +724,9 @@ latent knowledge into detectable subhalos.
 \begin{enumerate}
     \item \textbf{Fix host damage.} Recover subhalos without dropping the
           total halo count ($74\%\to100\%$) --- add a host-preservation guard.
-    \item \textbf{Consolidate high-$k$.} Fold the background high-$k$
-          supervision in cleanly so small-scale power lands in the right places.
+    \item \textbf{Fix radial placement.} Subhalos sit at $0.35\,R_{\mathrm{vir}}$
+          against HR's $1.13$ --- the one axis neither the minimal set nor soft
+          membership moves.
     \item \textbf{Transfer to diffusion / flow-matching.} Carry the same
           subhalo supervision to a multi-modal generator, handling the
           train/inference gap.

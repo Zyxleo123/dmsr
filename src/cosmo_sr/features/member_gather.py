@@ -138,6 +138,38 @@ class MemberGatherConfig:
     population: str = "sub"
     min_purity: float = 0.5
     min_live_frac: float = 0.5
+    #: Which members carry the statistics: ``"all"`` (live rows **plus** the
+    #: out-of-tile stragglers at frozen coordinates) or ``"live"`` (live rows
+    #: only). Applied identically to the reference, the candidate, the centre
+    #: targets and the background radius, so the two sides always measure the
+    #: same collection. ``"all"`` is the default and is bit-identical to every
+    #: arm on disk.
+    #:
+    #: *Measured*, `reference-inflated-by-stragglers` / section 6 of
+    #: ``docs/sr2_outskirt_detection.md``: with ``"all"`` the reachable
+    #: reference sits at **2.18x** HR's own ``r_rms`` and **1.99x** its
+    #: ``2T/|W|`` on the 16 holdout hosts, while the median live fraction is
+    #: 0.979. ``corr(1 - live_frac, r_rms_ref / r_rms_HR)`` is 0.76 held out
+    #: and 0.84 on the 40 training hosts, so the inflation IS the tail: ``r_rms``
+    #: is an **rms**, and ~2% of members ~2 Mpc/h away carry ~78% of ``r_rms^2``.
+    #:
+    #: Two things follow and the second is the worse one -- the target is twice
+    #: too loose, AND the gradient on the live, movable members is diluted by
+    #: the same factor, because compressing them moves a quarter of what it
+    #: should.
+    #:
+    #: The original argument for ``"all"`` (:func:`_gather_one`) was that the
+    #: stragglers are "what the halo finder will actually see". That does not
+    #: hold: Rockstar builds its own groups from the field, and a member 2 Mpc/h
+    #: away joins whatever is near *it*, never this object. Including it charges
+    #: the generator for failing to bind a particle that could never have been
+    #: in the object and that it cannot move either way.
+    #:
+    #: This is an identity cut, not a quantile: the dropped particles are fixed
+    #: at pool-build time by the tiling, so the run cannot make the statistic
+    #: look better by choosing a different subset -- which an adaptive
+    #: "inner 68%" core radius would let it do.
+    stats_members: str = "all"          # "all" | "live"
     max_sets: int = 256
     #: How :attr:`max_sets` chooses when it binds. ``"largest"`` keeps the
     #: biggest sets and is the default because it is what every recorded arm
@@ -470,6 +502,147 @@ class MemberGatherConfig:
     #: never charged on emptier bins than it has sets.
     shell_quantiles: int = 0
 
+    # --- soft membership: WHICH particles, as a latent variable -------------
+    #: Turn the hard HR member mask into a solved weight ``P_ij``. 0/False is
+    #: off and is every arm recorded in ``docs/sr2_member_gather_training.md``;
+    #: the hard path is byte-identical when this is False.
+    #:
+    #: See :mod:`cosmo_sr.features.soft_membership` for the construction. The
+    #: short version: HR keeps supplying the object's REGION (a coarse
+    #: Lagrangian prior) and its PHYSICS (``ref``, untouched), and the current
+    #: SR field decides which particles participate, under a per-particle
+    #: budget of one and a per-candidate mass target.
+    soft_membership: bool = False
+    #: KL weight against the prior, and the ONLY knob that interpolates:
+    #: ``lambda -> inf`` pins ``P`` at the prior, and with
+    #: ``soft_prior="hard"`` that limit is the arm already on disk. Small
+    #: lambda lets the 6-D phase-space term choose freely. In units where the
+    #: cost is a squared HR-sigma distance, so 1.0 is "one HR dispersion of
+    #: phase-space distance is worth one nat of prior".
+    soft_lambda: float = 1.0
+    #: ``"coarse"`` is step 1 of the proposal: every particle of a cell gets
+    #: the cell's member FRACTION, the original members included and not
+    #: privileged. ``"hard"`` keeps the HR mask as the prior and lets only
+    #: lambda open it -- more conservative, and the control whose lambda -> inf
+    #: limit is the hard arm.
+    soft_prior: str = "coarse"          # "coarse" | "hard"
+    #: Non-members sampled per member, per coarse cell. The pool is
+    #: ``(1 + ratio)`` times the member count and the estimator is
+    #: ``O(pool^2)``, so this is a direct multiplier on the step cost: 3.0 is
+    #: 16x the hard arm's pair bill. Use ``max_set_particles`` to cap it.
+    soft_pool_ratio: float = 3.0
+    #: Add the 26 neighbouring coarse cells to each set's support, at prior
+    #: ``soft_prior_eps``. 0 is off: the member cells alone already hold
+    #: ``factor^3 = 512`` sites each and "broader exchanges" cost pool size
+    #: quadratically. Worth one arm, not the default.
+    soft_cell_dilate: int = 0
+    #: Floor on a prior membership, and the value a dilated cell gets. Small,
+    #: but never zero: a zero prior is an infinite KL and a particle the solve
+    #: can never reach, whatever the field does.
+    soft_prior_eps: float = 1e-3
+    #: Floor on the BACKGROUND/host share of a particle's budget. This is the
+    #: category that makes the budget a real constraint rather than a
+    #: normalisation -- without somewhere to put unclaimed material, every
+    #: particle would be forced into some candidate.
+    soft_bg_floor: float = 1e-3
+    #: EM sweeps of the membership solve per generator step, and Sinkhorn
+    #: iterations of the mass dual inside each. The solve is O(pool) and the
+    #: generator step is O(pool^2), so a handful of sweeps is free.
+    soft_steps: int = 3
+    #: Sinkhorn iterations of the mass dual inside each sweep. 10 rather than a
+    #: handful because the dual's convergence rate depends on how much SLACK
+    #: the pool has: the update is multiplicative in the mass, and once most of
+    #: a pool is already claimed (``P -> 1``) the mass stops responding to
+    #: ``alpha`` and the iteration crawls. At ``soft_pool_ratio=3`` the pool
+    #: holds ~4x the target and this is far from binding; on a tight pool it
+    #: is, and ``soft_mass_ratio`` is the diagnostic that says so.
+    soft_mass_steps: int = 10
+    soft_mass_eta: float = 1.0
+    #: Which dispersions the phase-space window uses -- ``"hr"`` (the set's own
+    #: HR reference) or ``"cand"`` (a fixed fallback, for ablation). ``"hr"`` is
+    #: the default and the safe one: a window at the CANDIDATE's dispersion can
+    #: contract onto whatever is already cold and call that the object.
+    #: Which dispersions the 6-D window uses. ``"adaptive"`` (default) is
+    #: ``max(HR, candidate)`` per set: never narrower than the object actually
+    #: is, so the window always selects a sensible fraction, and it tightens
+    #: toward HR's as the object tightens. A window at HR's sigma alone
+    #: (``"hr"``) selects nothing at the start -- *measured*, the frozen field
+    #: is ~6x wider and ~20x hotter than HR per set, which is 400 sigma^2 and
+    #: an exactly-zero membership for every particle. ``"cand"`` is the
+    #: candidate's own and is the unsafe one: a window free to contract onto
+    #: whatever is already cold will call that the object.
+    soft_sigma: str = "adaptive"        # "adaptive" | "hr" | "cand"
+    soft_sigma_scale: float = 1.0
+    #: Cap on one Sinkhorn step of the mass dual, in nats. The budget couples
+    #: the candidates, so an undamped dual can trade overshoots between two
+    #: that want the same particles.
+    soft_mass_step_cap: float = 20.0
+
+    # --- the host as a real background component -----------------------------
+    #: Where the background's density profile comes from, or ``"off"`` for the
+    #: flat background every arm before this one ran. See
+    #: :mod:`cosmo_sr.features.host_profile` for why: the flat background plus
+    #: the ``n_c / f^3`` prior make the host core the CHEAPEST place for a
+    #: candidate to meet its mass target, which is a selection-side gradient
+    #: pointing inward, and ``radial-placement-is-inverted`` is what it
+    #: produces. ``"lr"`` is an analytic NFW from the LR catalog
+    #: (inference-honest, incomplete below ~20k HR particles); ``"self"`` is
+    #: binned off the candidate field itself (complete, partly circular).
+    soft_host_profile: str = "off"      # "off" | "lr" | "self"
+    #: ``beta``: how much of the log host density is subtracted from the
+    #: background. 0 is the flat background EXACTLY -- pinned by a test against
+    #: the unmodified solve -- and 1 is full overdensity. A dose ladder, for
+    #: the same reason ``w_shell`` needed one: a term that only works at one
+    #: value is a term that was tuned, and the shell family failed that test.
+    soft_host_weight: float = 0.0
+    #: NFW concentration for ``soft_host_profile="lr"``. Fixed rather than
+    #: fitted: the LR catalog has no concentration, a mass-concentration
+    #: relation would add a cosmology dependence this line has not measured,
+    #: and the profile is used as a RANKING over radius, where ``c`` moves the
+    #: slope and not the sign.
+    soft_host_conc: float = 5.0
+    #: Radial nodes in the tabulated profile, and how far out it is tabulated
+    #: (in ``R_vir`` for ``"lr"``, in ``centre_scale`` for ``"self"``). Outside
+    #: the table the end slopes continue, so these bound resolution, not range.
+    soft_host_bins: int = 24
+    soft_host_r_max_rvir: float = 4.0
+
+    # --- relocation: choose the group's particles from the SR field ---------
+    #: Which arm of the relocation experiment
+    #: (:mod:`cosmo_sr.features.relocate_sets`) this run is.
+    #:
+    #: * ``"off"`` -- arm A. Membership is HR's owner array, exactly as every
+    #:   result recorded in this line so far.
+    #: * ``"frozen"`` -- arm B. Each group's particles are re-selected from the
+    #:   frozen SR field, at the host-centric radius its frozen centroid
+    #:   already sits at. Isolates *replacing the membership*.
+    #: * ``"hr"`` -- arm C. Same selection, at the radius HR's reachable
+    #:   centroid sits at. Adds *the placement change* on top of B.
+    #:
+    #: The HR targets (``MemberSets.ref``) are identical in all three: the
+    #: replacement particles form no subhalo in HR, so recomputing HR's
+    #: statistics on their ids would supervise the run to reproduce a blob.
+    relocate: str = "off"               # "off" | "frozen" | "hr"
+    #: Proposed directions per group, on the sphere of the requested radius.
+    #: The first is always the group's own frozen direction, so arm B's minimal
+    #: answer -- the material already there -- is always in the running.
+    relocate_dirs: int = 8
+    #: Radius tolerance in units of the HOST's ``R_vir``. Not a constraint the
+    #: selector can violate silently: a group outside it is kept, flagged, and
+    #: counted in the pre-training check.
+    relocate_eps: float = 0.05
+    #: Neighbours queried per candidate, as a multiple of the group size.
+    #: Grown automatically when the pool is starved by earlier claims.
+    relocate_oversample: float = 4.0
+    #: Local-swap passes: re-select the nearest N about a query point corrected
+    #: by the residual between the achieved centroid and the requested sphere.
+    relocate_refine_iters: int = 3
+    #: Weight of velocity coherence in the candidate score, against
+    #: compactness at 1.0. Both are one-sided log ratios to HR's own value.
+    relocate_w_vel: float = 0.5
+    #: Weight of the radius error, measured in units of ``relocate_eps``.
+    relocate_w_radius: float = 1.0
+
     def __post_init__(self) -> None:
         if self.softening_kind not in ("plummer", "clamp"):
             raise ValueError(f"softening_kind {self.softening_kind!r} "
@@ -477,11 +650,39 @@ class MemberGatherConfig:
         if self.bound_penalty not in ("hinge", "log"):
             raise ValueError(f"bound_penalty {self.bound_penalty!r} is not "
                              "'hinge' or 'log'")
+        if self.soft_prior not in ("coarse", "hard"):
+            raise ValueError(f"soft_prior {self.soft_prior!r} is not "
+                             "'coarse' or 'hard'")
+        if self.soft_host_profile not in ("off", "lr", "self"):
+            raise ValueError(f"soft_host_profile {self.soft_host_profile!r} is "
+                             "not 'off', 'lr' or 'self'")
+        if self.soft_host_profile != "off" and not self.soft_membership:
+            raise ValueError(
+                "soft_host_profile only has a meaning inside the membership "
+                "solve, and soft_membership is False -- the hard arm's member "
+                "sets are HR's labels and no background competes for them.")
+        if float(self.soft_host_weight) < 0.0:
+            raise ValueError(
+                f"soft_host_weight {self.soft_host_weight} is negative, which "
+                "ADDS the host density to the background and makes the core "
+                "cheaper still -- the defect this term exists to remove.")
+        if self.soft_host_profile != "off" and int(self.soft_host_bins) < 2:
+            raise ValueError(f"soft_host_bins {self.soft_host_bins} is below 2; "
+                             "the profile is interpolated and needs two nodes.")
+        if self.soft_sigma not in ("adaptive", "hr", "cand"):
+            raise ValueError(f"soft_sigma {self.soft_sigma!r} is not "
+                             "'adaptive', 'hr' or 'cand'")
+        if self.soft_membership and not (float(self.soft_lambda) > 0.0):
+            raise ValueError("soft_lambda must be > 0: it is the KL weight and "
+                             "divides the phase-space cost")
         if self.bound_temperature not in ("adaptive", "hr"):
             raise ValueError(f"bound_temperature {self.bound_temperature!r} "
                              "is not 'adaptive' or 'hr'")
         if not 0.0 < self.min_live_frac <= 1.0:
             raise ValueError(f"min_live_frac {self.min_live_frac} not in (0, 1]")
+        if self.stats_members not in ("all", "live"):
+            raise ValueError(f"stats_members {self.stats_members!r} is not "
+                             "'all' or 'live'")
         if self.max_set_particles and self.max_set_particles < 3:
             raise ValueError(
                 f"max_set_particles {self.max_set_particles} is below 3; the "
@@ -497,6 +698,24 @@ class MemberGatherConfig:
         if self.set_select not in ("largest", "random", "stratified"):
             raise ValueError(f"set_select {self.set_select!r} is not 'largest', "
                              "'random' or 'stratified'")
+        if self.relocate not in ("off", "frozen", "hr"):
+            raise ValueError(f"relocate {self.relocate!r} is not 'off', "
+                             "'frozen' or 'hr'")
+        if self.relocate != "off" and self.soft_membership:
+            raise ValueError(
+                "relocate and soft_membership both replace the member set -- "
+                "one before training, one every step. No result from a run "
+                "with both could be attributed to either.")
+        if self.relocate != "off" and self.relocate_dirs < 1:
+            raise ValueError(f"relocate_dirs {self.relocate_dirs} is below 1")
+        if self.relocate != "off" and not (self.relocate_eps > 0.0):
+            raise ValueError(
+                f"relocate_eps {self.relocate_eps} is not positive; it is a "
+                "tolerance and also divides the radius term of the score")
+        if self.relocate != "off" and self.relocate_oversample < 1.0:
+            raise ValueError(
+                f"relocate_oversample {self.relocate_oversample} is below 1: "
+                "fewer neighbours would be queried than the group needs")
         if self.centre_mode not in ("full", "radial", "self", "self_tan"):
             raise ValueError(f"centre_mode {self.centre_mode!r} is not "
                              "'full', 'radial', 'self' or 'self_tan'")
@@ -674,9 +893,9 @@ class _SpecificPotential(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, pos, gm, eps, clamp, chunk, max_elems):
+    def forward(ctx, pos, gm, eps, clamp, chunk, max_elems, wsrc):
         n = int(pos.shape[0])
-        ctx.save_for_backward(pos)
+        ctx.save_for_backward(pos, wsrc)
         ctx.gm, ctx.eps, ctx.clamp = float(gm), float(eps), bool(clamp)
         ctx.chunk, ctx.max_elems = int(chunk), int(max_elems)
         out = pos.new_zeros(n)
@@ -696,16 +915,23 @@ class _SpecificPotential(torch.autograd.Function):
             # to eps; Plummer gives (0 + eps^2)^{-1/2}), so it is subtracted as a
             # constant instead of zeroing a diagonal -- which used to cost a
             # second N^2 tensor for the `.clone()` the in-place write needed.
-            out[a:b] = -gm * (inv.sum(dim=1) - 1.0 / eps)
+            if wsrc is None:
+                out[a:b] = -gm * (inv.sum(dim=1) - 1.0 / eps)
+            else:
+                # Weighted sources: phi_i = -gm sum_{k != i} w_k u_ik. The self
+                # term is w_a / eps, not 1 / eps -- it carries the row's OWN
+                # weight, so a low-weight particle subtracts little.
+                out[a:b] = -gm * ((inv * wsrc[None, :]).sum(dim=1)
+                                  - wsrc[a:b] / eps)
         return out
 
     @staticmethod
     def backward(ctx, grad_phi):
-        pos, = ctx.saved_tensors
+        pos, wsrc = ctx.saved_tensors
         n = int(pos.shape[0])
         grad = torch.zeros_like(pos)
         if n < 2:
-            return grad, None, None, None, None, None
+            return grad, None, None, None, None, None, None
         gm, eps, clamp = ctx.gm, ctx.eps, ctx.clamp
         g = grad_phi
         rows = _pair_rows(n, ctx.chunk, ctx.max_elems)
@@ -722,17 +948,26 @@ class _SpecificPotential(torch.autograd.Function):
                 k = torch.where(r > eps, r.pow(-3.0), torch.zeros_like(r))
             else:
                 k = (r2 + eps * eps).pow(-1.5)
-            w = (g[a:b, None] + g[None, :]) * k              # (c, N)
+            if wsrc is None:
+                w = (g[a:b, None] + g[None, :]) * k          # (c, N)
+            else:
+                # d/dx_a of sum_i g_i phi_i with weighted sources:
+                #   gm sum_j (g_a w_j + g_j w_a) u_aj^3 d_aj
+                # -- the same one-pass symmetry as the unweighted case, with
+                # each of the two ways x_a enters carrying the OTHER end's
+                # weight. Reduces to the line above at w == 1.
+                w = (g[a:b, None] * wsrc[None, :]
+                     + g[None, :] * wsrc[a:b, None]) * k
             # bmm, not `(w[..., None] * d).sum(1)`: the broadcast form allocates
             # another (c, N, 3) temporary, which is the largest tensor here.
             grad[a:b] = gm * torch.bmm(w.unsqueeze(1), d).squeeze(1)
-        return grad, None, None, None, None, None
+        return grad, None, None, None, None, None, None
 
 
 def specific_potential_torch(
     pos: torch.Tensor, particle_mass_msun_h: float, *,
     softening_mpc_h: float = 0.01, kind: str = "plummer", chunk: int = 2048,
-    max_elems: int = 1 << 24,
+    max_elems: int = 1 << 24, weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """``phi_i`` in ``(km/s)^2``, ``(N,)``. Differentiable in ``pos``.
 
@@ -750,10 +985,21 @@ def specific_potential_torch(
     Memory is one pair block -- ``min(chunk, max_elems // N)`` rows -- rather
     than the whole ``N x N`` tape; see :class:`_SpecificPotential` for why that
     distinction is not academic.
+
+    ``weights`` (``(N,)``, **detached**) gives each particle a mass of
+    ``particle_mass_msun_h * w_k`` as a *source*, so
+    ``phi_i = -G m sum_{k != i} w_k / |x_i - x_k|``. It is what the soft
+    membership relaxation needs (:mod:`cosmo_sr.features.soft_membership`): a
+    particle that only partly belongs to the candidate only partly binds it.
+    ``None`` is the unweighted sum every recorded arm ran, bit for bit -- the
+    weighted branch is never taken when it is ``None``, so no existing number
+    moves. Gradients flow to ``pos`` only; the weights are constants of the
+    generator step by construction (they are re-solved between steps).
     """
     return _SpecificPotential.apply(
         pos, G_MPC_KMS2_PER_MSUN * float(particle_mass_msun_h),
-        float(softening_mpc_h), kind == "clamp", int(chunk), int(max_elems))
+        float(softening_mpc_h), kind == "clamp", int(chunk), int(max_elems),
+        weights)
 
 
 # --------------------------------------------------------------------------- #
@@ -953,6 +1199,32 @@ class MemberSets:
     ref: Dict[str, torch.Tensor]         # HR's value of every statistic
     particle_mass_msun_h: float
     boxsize_mpc_h: float
+    #: The soft-membership candidate pools
+    #: (:class:`cosmo_sr.features.soft_membership.SoftPools`), or ``None`` for
+    #: the hard arm. Attached AFTER the fact by
+    #: :func:`soft_membership.build_soft_pools`, which needs only this object
+    #: and row arithmetic -- no catalog, no owner array -- so a soft arm reuses
+    #: the same cached pool file every hard arm ran on and the two are
+    #: guaranteed to supervise the same objects. Defaulted, and read through
+    #: ``getattr`` at the one place that uses it, so a pool pickled before this
+    #: field existed still loads.
+    pools: Optional[object] = None
+    #: ``(S,)`` bool, or ``None`` for a pool that was never relocated. True
+    #: where :func:`relocate_sets.relocate_member_sets` re-selected the group's
+    #: particles from the SR field; False for a set it left on its HR
+    #: membership because every proposed direction was starved. Carried so an
+    #: eval can split arm B/C's result by whether the object it reports was
+    #: actually the arm's, rather than an arm-A set inside a B/C run.
+    relocated: Optional[np.ndarray] = None
+    #: ``(S,)`` the host's virial radius (Mpc/h) and mass (Msun/h), from the
+    #: **LR** catalog -- the one ``soft_host_profile="lr"`` reads. Zero for a
+    #: host the LR gate dropped (``lr-host-channel-fidelity``: the LR catalog
+    #: falls off a cliff below ~20k HR-equivalent particles, so 43% of region
+    #: subhalos have no usable host row) and zero for every pool built before
+    #: these fields existed. Both are read through ``getattr``, and a zero row
+    #: means "no profile", never "a host of zero mass".
+    host_rvir: Optional[np.ndarray] = None
+    host_mvir: Optional[np.ndarray] = None
 
     @property
     def n_sets(self) -> int:
@@ -990,6 +1262,8 @@ class MemberSets:
             centre_self=self.centre_self.to(device),
             centre_host=self.centre_host.to(device),
             ref={k: v.to(device) for k, v in self.ref.items()},
+            pools=(None if getattr(self, "pools", None) is None
+                   else self.pools.to(device)),
         )
 
 
@@ -1027,10 +1301,52 @@ def _gather_one(pos: torch.Tensor, vel: torch.Tensor, sets: MemberSets, s: int,
     return unwrap_about(p, sets.centre_ref[s], sets.boxsize_mpc_h), v, factor
 
 
+def _gather_one_soft(pos: torch.Tensor, vel: torch.Tensor, sets: MemberSets,
+                     s: int, w_pool: torch.Tensor, *, cap: int = 0,
+                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """:func:`_gather_one` over the CANDIDATE POOL, with membership weights.
+
+    Same three parts as the hard gather -- the movable rows, the frozen
+    stragglers, an optional subsample -- with one addition: a weight per row.
+    The stragglers enter at weight **1**. They are HR members outside the
+    trained tiles; this run cannot move them and the splice will not either, so
+    their membership is not in question and relaxing it would be relaxing
+    something the generator does not control.
+    """
+    pools = sets.pools
+    rows = pools.rows[s]
+    p, v, w = pos[rows], vel[rows], w_pool
+    fp, fv = sets.fixed_pos[s], sets.fixed_vel[s]
+    if fp is not None and fp.shape[0] > 0:
+        p = torch.cat([p, fp.to(p.dtype)], dim=0)
+        v = torch.cat([v, fv.to(v.dtype)], dim=0)
+        w = torch.cat([w, torch.ones(fp.shape[0], device=w.device,
+                                     dtype=w.dtype)], dim=0)
+    factor = 1.0
+    n = int(p.shape[0])
+    k = int(cap)
+    if k and n > k >= 3:
+        take = torch.randperm(n, device=p.device)[:k]
+        p, v, w = p[take], v[take], w[take]
+        # The pair sum is over K of N rows exactly as in `_gather_one`, so it
+        # takes the same (N-1)/(K-1) correction. The WEIGHTS are not rescaled:
+        # they are a per-particle property, and inflating them would inflate
+        # the candidate's mass rather than its pair count.
+        factor = (n - 1.0) / (k - 1.0)
+    return unwrap_about(p, sets.centre_ref[s], sets.boxsize_mpc_h), v, w, factor
+
+
 #: The six terms, in the order they are weighted. Used by the budget
 #: normalisation so a caller cannot pass a scale for a term that does not exist.
 TERM_NAMES = ("virial", "bound", "d6", "rrms", "sigmav", "centre",
               "radius", "shell", "isolation")
+
+
+def _weighted_stats(p, v, *, w, **kw):
+    """:func:`soft_membership.weighted_set_statistics`, keyword-compatible with
+    :func:`set_statistics_torch` so the loop calls one or the other unchanged."""
+    from .soft_membership import weighted_set_statistics
+    return weighted_set_statistics(p, v, w, **kw)
 
 
 def member_gather_loss(
@@ -1150,9 +1466,34 @@ def member_gather_loss(
     if not idx:
         return zero, {"n_sets": 0, "n_sets_total": sets.n_sets, "rows": []}
 
-    for s in idx:
-        p, v, pot_factor = _gather_one(pos, vel, sets, s,
-                                       cap=int(cfg.max_set_particles))
+    # --- SOFT MEMBERSHIP ---------------------------------------------------
+    # Solved once for the whole batch of sets, not per set, because the
+    # per-particle budget couples them: two candidates whose pools overlap must
+    # compete for the same particle, and a per-set solve would let both spend
+    # it. Detached by construction -- see `soft_membership.solve_memberships`.
+    soft_w: Optional[List[torch.Tensor]] = None
+    soft_diag: Dict[str, float] = {}
+    if bool(cfg.soft_membership):
+        from .soft_membership import solve_memberships
+        pools = getattr(sets, "pools", None)
+        if pools is None:
+            raise ValueError(
+                "soft_membership=True but these MemberSets carry no pools. "
+                "Call soft_membership.build_soft_pools(sets, tiles, cfg, ...) "
+                "and attach the result as `sets.pools` -- it is a separate "
+                "pass so a soft arm can reuse a cached hard pool file, which "
+                "means nothing builds it implicitly.")
+        soft_w, soft_diag = solve_memberships(pos, vel, sets, pools, idx, cfg)
+
+    for si, s in enumerate(idx):
+        if soft_w is None:
+            p, v, pot_factor = _gather_one(pos, vel, sets, s,
+                                           cap=int(cfg.max_set_particles))
+            wgt = None
+        else:
+            p, v, wgt, pot_factor = _gather_one_soft(
+                pos, vel, sets, s, soft_w[si],
+                cap=int(cfg.max_set_particles))
         bg = sets.bg_rows[s]
         bp = bv = None
         if bg is not None and bg.numel() > 1:
@@ -1161,7 +1502,12 @@ def member_gather_loss(
 
         scale = (sets.ref["bound_scale"][s]
                  if cfg.bound_temperature == "hr" else None)
-        st = set_statistics_torch(
+        # The HR reference is the SAME either way. HR supplies what the object
+        # must look like; the relaxation only changes which particles are asked
+        # to look like it, so re-deriving `ref` under the soft pool would be
+        # moving the target to wherever the weights went.
+        _stats = set_statistics_torch if wgt is None else _weighted_stats
+        st = _stats(
             p, v, particle_mass_msun_h=sets.particle_mass_msun_h, cfg=cfg,
             bound_scale=scale, bg_pos=bp, bg_vel=bv,
             pot_mass_factor=pot_factor,
@@ -1170,7 +1516,8 @@ def member_gather_loss(
             # pair blocks, so the diagnostic is free -- and an arm run at
             # w_isolation=0 that cannot report its pedestal is exactly the
             # blind spot the four velocity-guard arms had.
-            iso_radius=float(sets.iso_radius[s]))
+            iso_radius=float(sets.iso_radius[s]),
+            **({} if wgt is None else {"w": wgt}))
 
         acc["virial"] = acc["virial"] + _log2(st.virial, sets.ref["virial"][s])
         acc["rrms"] = acc["rrms"] + _log2(st.r_rms, sets.ref["r_rms"][s])
@@ -1181,7 +1528,8 @@ def member_gather_loss(
         # matches on -- max(r_vir, 0.15 Mpc/h), `compare_gather_catalog`'s
         # `min_radius` -- so a unit of this term is exactly one search radius and
         # driving it below 1 is driving the target into the hit criterion.
-        cbar = p.mean(dim=0)
+        cbar = (p.mean(dim=0) if wgt is None
+                else (wgt[:, None] * p).sum(0) / wgt.sum().clamp_min(1e-12))
         # `off` is ALWAYS the full offset to the reachable HR centroid, in every
         # mode, because that is the quantity the Rockstar gate scores. What the
         # loss CHARGES for is `pen`, which the mode chooses. Reporting the two
@@ -1277,8 +1625,29 @@ def member_gather_loss(
         r["parent_id"] = int(sets.parent_id[s])
         r["env"] = int(sets.env[s])
         r["iso_ratio"] = iso_r
+        # What the relaxation actually selected for this set. NaN on the hard
+        # arm so the two tables stay one schema.
+        if wgt is None:
+            r["soft_mass"], r["soft_n_pool"] = float("nan"), float("nan")
+        else:
+            r["soft_mass"] = float(wgt.sum().detach())
+            r["soft_n_pool"] = float(wgt.numel())
         r["centre_offset_radii"] = float(off.detach()
                                          / sets.centre_scale[s].detach())
+        # WHERE this run asked the object to be, for the Rockstar gate to look.
+        # Absent (None) unless the group was relocated, and that is deliberate:
+        # `compare_gather_catalog.target_hit_rate` searches around the HR
+        # subhalo's catalog centre, which is the right address for arm A and the
+        # WRONG one for arms B and C -- those put the group somewhere else on
+        # purpose, and scoring them at HR's position would read ~0 whatever the
+        # run achieved. Emitting it only for relocated sets keeps every arm-A
+        # number already on disk bit-identical.
+        _rel = getattr(sets, "relocated", None)
+        r["relocated"] = bool(_rel[s]) if _rel is not None else False
+        if r["relocated"]:
+            _tp = sets.centre_target[s].detach()
+            r["target_pos"] = [float(x) for x in
+                               torch.remainder(_tp, sets.boxsize_mpc_h)]
         rows.append(r)
 
     # THE SOFT SHELL. One sort per call, over this host's sets in this step:
@@ -1343,6 +1712,8 @@ def member_gather_loss(
     diag["median_iso_ratio"] = float(np.median(_isog)) if _isog.size else float("nan")
     diag["frac_iso_above_hr"] = (float(np.mean(_isog > 1.0)) if _isog.size
                                  else float("nan"))
+    diag["soft_membership"] = bool(cfg.soft_membership)
+    diag.update(soft_diag)
     diag["by_population"] = _split_rows(rows, "parent_id",
                                         {"sub": lambda v: v >= 0,
                                          "top": lambda v: v < 0})
@@ -1699,6 +2070,8 @@ def build_member_sets(
     home: Optional[Dict[str, np.ndarray]] = None,
     frozen_box=None,
     host_pos: Optional[np.ndarray] = None,
+    host_rvir_mpc_h: float = 0.0,
+    host_mvir_msun_h: float = 0.0,
     top_level: bool = False,
     env: Optional[np.ndarray] = None,
     report: Optional[Dict] = None,
@@ -1831,8 +2204,10 @@ def build_member_sets(
     iso_r: List[float] = []
     ref_rows: List[SetTerms] = []
     pure_rows: List[Dict[str, float]] = []
+    hybrid_rows: List[Dict[str, float]] = []
     n_dropped_live = 0
     outside_dropped = 0
+    outside_excluded = 0
 
     for r in keep_rows:
         hid = int(home["halo_id"][r])
@@ -1865,12 +2240,30 @@ def build_member_sets(
         elif outside.size:
             outside_dropped += int(outside.size)
 
+        # `stats_members="live"` drops the out-of-tile stragglers from the
+        # statistics. ONE gate, here, before anything reads them: the reference,
+        # the candidate (via `fixed_pos`), `centre_target`, `centre_self` and the
+        # background radius all derive from `fp`/`fv` below, and a policy applied
+        # to some of them would make the reference and the candidate measure
+        # different collections -- which is the defect, not the fix.
+        keep_stragglers = str(cfg.stats_members) == "all"
+        fps, fvs = (fp, fv) if keep_stragglers else (None, None)
+        if fp is not None and not keep_stragglers:
+            # Still LOADED, because the hybrid counterfactual row below needs
+            # it and that row is what keeps the inflation visible. Pool build
+            # only; the step never sees these particles.
+            outside_excluded += int(fp.shape[0])
+
         rows_t = torch.as_tensor(rows_np, device=dev, dtype=torch.long)
 
-        # --- the reachable reference: HR inside the tiles, frozen outside ----
-        hp = unwrap_about(torch.cat([hr_pos[rows_t]] + ([fp] if fp is not None else []),
+        # --- the reference ---------------------------------------------------
+        # "all": HR inside the tiles, frozen outside -- the hybrid every arm on
+        # disk was trained against. "live": HR inside the tiles alone, which is
+        # HR's own object to within the Lagrangian purity of the tiling
+        # (`subhalos-are-lagrangian-pure`: median 1 tile of origin).
+        hp = unwrap_about(torch.cat([hr_pos[rows_t]] + ([fps] if fps is not None else []),
                                     dim=0), ctr, float(boxsize_mpc_h))
-        hv = torch.cat([hr_vel[rows_t]] + ([fv] if fv is not None else []), dim=0)
+        hv = torch.cat([hr_vel[rows_t]] + ([fvs] if fvs is not None else []), dim=0)
 
         # --- local background: fixed ids, chosen on the frozen field ---------
         r_ref = float(torch.sqrt(
@@ -1904,14 +2297,29 @@ def build_member_sets(
             hp, hv, particle_mass_msun_h=particle_mass_msun_h, cfg=cfg,
             bg_pos=bp, bg_vel=bv, iso_radius=iso_radius))
 
-        # Pure HR, for the report only: how much does partial coverage cost?
-        if fp is not None:
+        # The OTHER reading, for the report only -- whichever of the two the
+        # loss is not using. Both are always reported (`pure_hr_median` and
+        # `hybrid_reference_median`) so the straggler inflation stays visible
+        # from `pool.json` under either policy; a run that could not see its own
+        # reference move is how this went unnoticed for 56 arms. One extra stats
+        # call per set with stragglers, same as before -- pool build only, never
+        # in a step.
+        if fp is None:
+            pure_rows.append(ref_rows[-1].detached())
+            hybrid_rows.append(ref_rows[-1].detached())
+        elif keep_stragglers:
+            hybrid_rows.append(ref_rows[-1].detached())
             php = unwrap_about(hr_pos[rows_t], ctr, float(boxsize_mpc_h))
             pure_rows.append(set_statistics_torch(
                 php, hr_vel[rows_t], particle_mass_msun_h=particle_mass_msun_h,
                 cfg=cfg).detached())
         else:
             pure_rows.append(ref_rows[-1].detached())
+            hyp = unwrap_about(torch.cat([hr_pos[rows_t], fp], dim=0), ctr,
+                               float(boxsize_mpc_h))
+            hybrid_rows.append(set_statistics_torch(
+                hyp, torch.cat([hr_vel[rows_t], fv], dim=0),
+                particle_mass_msun_h=particle_mass_msun_h, cfg=cfg).detached())
 
         # The reachable centroid, not the HR catalog position: the out-of-tile
         # members sit at frozen coordinates and pull the achievable centre of
@@ -1928,7 +2336,7 @@ def build_member_sets(
         # exactly zero before the first step and the run is an anchor, not a
         # pull towards somewhere else.
         fzp = unwrap_about(
-            torch.cat([fz_pos[rows_t]] + ([fp] if fp is not None else []),
+            torch.cat([fz_pos[rows_t]] + ([fps] if fps is not None else []),
                       dim=0), ctr, float(boxsize_mpc_h))
         centre_slf.append(fzp.mean(dim=0).detach())
 
@@ -1956,8 +2364,8 @@ def build_member_sets(
         iso_r.append(float(iso_radius))
         n_live_l.append(int(keep.size))
         live_rows.append(rows_t)
-        fixed_pos.append(fp)
-        fixed_vel.append(fv)
+        fixed_pos.append(fps)
+        fixed_vel.append(fvs)
         bg_rows.append(bg_t)
         centres.append(ctr)
 
@@ -1990,6 +2398,10 @@ def build_member_sets(
         # available before the first step rather than as a wall-clock surprise.
         rep["sum_num_p_squared"] = float(np.sum(_np_.astype(np.float64) ** 2))
     rep["outside_dropped"] = int(outside_dropped)
+    # Excluded BY POLICY (`stats_members="live"`), which is not the same
+    # failure as `outside_dropped` (no frozen box was passed, so the
+    # reference silently overstated how bound the object was).
+    rep["outside_excluded_by_policy"] = int(outside_excluded)
     if outside_dropped:
         rep["outside_dropped_warning"] = (
             "frozen_box was None: members outside the trained tiles were "
@@ -2030,8 +2442,14 @@ def build_member_sets(
         return float(np.median(good)) if good.size else float("nan")
 
     rep["reference_median"] = {k: _med(v.cpu().numpy()) for k, v in ref.items()}
-    rep["pure_hr_median"] = {k: _med([p[k] for p in pure_rows])
-                             for k in ("r_rms", "sigma_v", "virial", "bound_hard")}
+    _rk = ("r_rms", "sigma_v", "virial", "bound_hard")
+    rep["stats_members"] = str(cfg.stats_members)
+    rep["pure_hr_median"] = {k: _med([p[k] for p in pure_rows]) for k in _rk}
+    # The counterfactual, always: `reference_median` equals one of these
+    # two and the ratio between them is the straggler inflation
+    # (`reference-inflated-by-stragglers`, measured 2.18x in r_rms).
+    rep["hybrid_reference_median"] = {
+        k: _med([p[k] for p in hybrid_rows]) for k in _rk}
     rep["median_reference_centre_offset_mpc_h"] = float(np.median(
         [float(torch.linalg.vector_norm(t - c))
          for t, c in zip(centre_tgt, centres)]))
@@ -2071,4 +2489,9 @@ def build_member_sets(
         centre_self=torch.stack(centre_slf),
         centre_host=torch.stack(centre_hst),
         ref=ref, particle_mass_msun_h=float(particle_mass_msun_h),
-        boxsize_mpc_h=float(boxsize_mpc_h))
+        boxsize_mpc_h=float(boxsize_mpc_h),
+        # One host per call, so the per-set arrays are that host's row
+        # broadcast. Kept per set anyway because `soft_membership` solves a
+        # BATCH and a batch spanning two hosts must carry two profiles.
+        host_rvir=np.full(len(halo_id), float(host_rvir_mpc_h), dtype=np.float64),
+        host_mvir=np.full(len(halo_id), float(host_mvir_msun_h), dtype=np.float64))

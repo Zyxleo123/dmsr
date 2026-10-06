@@ -16,3 +16,6 @@ slurm-*.out
 docs/figures/
 # vendored external clone (see external/COMMITS.txt)
 external/rockstar/
+external/gadget4/
+# generated viewers (render_overdensity_html.py)
+overdensity_*.html

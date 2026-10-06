@@ -2059,6 +2059,200 @@ It therefore runs as an advisory stage of `submit_gather_holdout_rockstar.sh`, w
 reading of section 16c's gate: in the region it does not beat frozen at 50-200p
 (2,587 vs 2,762); the +43% was against its `smallctl` control.
 
+## 16e. The loss-term ablation, the minimal set, and the two axes the gate was blind to (2026-09-12..15)
+
+Everything above tunes a loss of eight weighted terms that grew one experiment at
+a time. Nothing had ever measured what each term CONTRIBUTES. This section is that
+measurement, the smaller loss it produced, and the two scores the gate now reports
+because the ablation could not be read without them.
+
+All numbers are the held-out set9 Rockstar gate in the EDITED REGION (32 tiles,
+dilated 2 Mpc/h), never box-wide. HR = 12367 subhalos >= 50p, 3775 hosts >= 200p.
+
+### 16e.1 Leave-one-out: what each term is worth
+
+`scripts/slurm/submit_loss_ablation.sh` (`ABL_SET=loo`). The base is
+`all_blocks_self` with every weight spelled out -- virial 1, bound 1, d6 1,
+rrms 0.3, sigmav 0.3, centre 1, low-k guard 100, high-k guard 10 -- and each arm
+zeroes exactly ONE weight. `repro` zeroes nothing and exists because the trainer
+had changed since August: read every other row as "repro minus one term".
+
+| arm | region subs | region hosts | high-k max |
+|---|--:|--:|--:|
+| repro | 9110 | 2720 | 4.06 |
+| novirial | 5747 | 2696 | 4.78 |
+| nobound | 8916 | 2707 | 4.38 |
+| **nod6** | **11823** | **3201** | **0.60** |
+| norrms | 9225 | 2756 | 4.53 |
+| nosigmav | 9194 | 2704 | 4.76 |
+| nocentre | 8152 | 2616 | 2.26 |
+| nolow | 9163 | 2673 | 4.87 |
+| nohighk | 9229 | 2725 | 6.40 |
+
+`repro` reproduces August `self` at region scope (9110 vs 9187; hosts 2720 vs
+2708), so the table is readable. The host-subhalo column differs by ~50 (314 vs
+367) and that is its noise scale, from one seed.
+
+  * **d6 is HARMFUL.** Dropping it gives 96% of HR's region subhalos, +481 hosts
+    (above frozen's 3028 for the first time on this line) and removes the high-k
+    excess outright, 4.06 -> 0.60, with the high-k guard unchanged. Section 10's
+    budget arithmetic said d6 held 88% of the loss; this is what it was buying.
+    The gain is already present at step 2000 (11453 subs / 3231 hosts), so it is
+    not a late-training artifact.
+  * **virial is the one essential term** (-3363 subhalos without it).
+  * **centre is moderate** (-958) and **bound is small** (-194, ~2%).
+  * **rrms, sigmav and the high-k guard do nothing to the counts.** Removing the
+    high-k guard leaves 9229 subhalos and only raises high-k power 4.06 -> 6.40.
+
+### 16e.2 The minimal set
+
+`ABL_SET=minimal` nests backward from `nod6`. Removing d6 hands its budget to the
+others, so a term that looked dead WITH d6 might matter without it -- the reason
+this is a separate round rather than a reading of 16e.1.
+
+| arm | terms kept | region subs | region hosts | shape | radial |
+|---|---|--:|--:|--:|--:|
+| nod6 | vir bnd rrms sig ctr + low + highk | 11823 | 3201 | 0.130 | 1.017 |
+| min_vcb_l | vir ctr bnd + low | 11917 | 3293 | 0.143 | 1.022 |
+| **min_vc_l** | **vir ctr + low** | **11766** | **3288** | 0.137 | 1.025 |
+| min_v_l | vir + low | 13251 | 3282 | 0.174 | 1.079 |
+| min_vc | vir ctr, NO guards | 13862 | 3306 | 0.200 | 0.939 |
+
+**The minimal set is virial + centre + the low-k guard: three of the original
+eight.** `min_vc_l` matches `nod6` on every axis. rrms, sigmav and the high-k
+guard stay dead without d6; bound is droppable (-151 subs, ~1%).
+
+  * **centre restrains OVERPRODUCTION.** `min_v_l` reaches 1.07x HR's subhalo
+    count and overshoots every bin. Past HR, more subhalos is worse, not better.
+  * **the low-k guard is not optional.** `min_vc` posts the highest counts of all
+    and is a drifted field: held-out low_k 0.194 against the 0.02 limit and
+    vel_rms 0.45. Its extra objects are fragmentation. Counts alone cannot see
+    this; the guard diagnostics can.
+
+### 16e.3 Two scores the gate now always reports
+
+The ablation could not be read on abundance alone, so `gate_verdict_vs_baseline`
+gained two things, and every gate in every chain now carries them.
+
+**The region-wide binned mass function and `shape_score`.** The per-host mass
+function is ~370 objects around one cluster; the region holds ~12k. On the host
+numbers the no-d6 arms looked 1.5-1.8x over HR above 200p. Region-wide that is
+1.15-1.26x, and the real defect is the opposite end: 0.79-0.81 of HR at 50-100p,
+the bin holding 46.5% of HR's subhalos. **The per-host overshoot was a
+small-sample artifact and any conclusion drawn from it should be re-derived at
+region scope.** `shape_score` is mean |log(new/HR)| over the five sub bins.
+
+**The radial distribution and `radial_score`.** Host-centric distance of every
+region subhalo to its own parent, r / host R_vir, on `subhalo_radial.RVIR_BINS`;
+each catalog uses its own parent assignments. `radial_score` is mean
+|log(new/HR)| over those bins computed on FRACTIONS, so placement is scored
+independently of abundance. This is the axis sections 14 and 16b were about, and
+no verdict had ever reported it.
+
+  * A `write_json` trap, worth knowing: the stored bin dicts come back in
+    ALPHABETICAL key order ("100-200p", "200-500p", "2000-...p", "50-100p",
+    "500-2000p"). Reading them in dict order transposes the mass function --
+    caught because HR's own counts came back non-monotonic. Use
+    `loss_ablation_table.bin_order`, which sorts on the numeric lower edge.
+
+### 16e.4 What the radial axis says
+
+| | 0-0.25 | 0.25-0.5 | 0.5-0.75 | 0.75-1 | 1-1.5 | >1.5 | median | radial | subs/HR |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| HR | 0.025 | 0.091 | 0.145 | 0.160 | 0.272 | 0.308 | 1.13 | 0.000 | 1.000 |
+| frozen | 0.292 | 0.192 | 0.098 | 0.057 | 0.078 | 0.284 | 0.53 | 0.929 | 0.367 |
+| repro | 0.409 | - | - | - | - | - | 0.35 | 1.009 | 0.737 |
+| nod6 | 0.414 | - | - | - | - | - | 0.34 | 1.017 | 0.956 |
+| min_vc_l | 0.405 | - | - | - | - | - | 0.33 | 1.025 | 0.951 |
+| min_v_l | 0.447 | - | - | - | - | - | 0.30 | 1.079 | 1.071 |
+| shp_iso1@2k | 0.175 | 0.208 | 0.151 | 0.098 | 0.114 | 0.254 | 0.68 | 0.718 | 0.614 |
+
+**HR has almost no subhalos inside 0.25 R_vir (2.5%). Frozen SR2 has 29%. Tuning
+raises that to 41-45%.** Every tuned arm in this family is WORSE than doing
+nothing on placement while winning on abundance, and the deficit is at the
+virial radius, where HR keeps 58% of its subhalos and the arms keep ~21%.
+
+  * **d6 is irrelevant to placement.** repro 1.009 vs nod6 1.017: removing d6
+    moved abundance 0.737 -> 0.956 and placement not at all. The hypothesis that
+    the shell family (section 14, 16b) failed only because d6 held the budget is
+    therefore FALSIFIED, and re-running `--w-shell` on the minimal set is not
+    warranted on that argument.
+  * **`min_v_l` is the worst placer measured** (1.079, 44.7% inside 0.25 R_vir).
+    The centre term anchors placement as well as restraining overproduction: that
+    arm's abundance overshoot and its placement failure are one fact.
+  * **The abundance/placement trade-off is not a law -- the ISOLATION term breaks
+    it.** `shp_iso1` (min_vc_l + `--w-isolation 1.0`), read at step 2000, beats
+    FROZEN on both axes at once: radial 0.718 vs 0.929 AND 0.614 of HR's
+    subhalos vs 0.367. No other tuned arm beats frozen on placement at all. The
+    mechanism fits the term: it charges non-member mass sitting ON the object,
+    which is what a subhalo dragged into the host centre looks like. It is the
+    only term ever measured to move this axis.
+  * The cost is abundance: 0.614 against `nod6`'s 0.926 at the same step. Where
+    that settles at 8000 steps is UNMEASURED -- the run died at step 3750.
+
+### 16e.5 Arms that answered nothing
+
+  * **`self_critic`** (`--w-adv 0.1`, section 11.7's critic): subs 0.748 of HR vs
+    `self`'s 0.743, shape 0.194 vs 0.204, radial 1.011 vs 0.984, median r/R_vir
+    identical at 0.35. No measurable effect at this weight.
+  * **`nearclean2`** (isolation 1.0 + population all + env inside,near): 4535
+    region subhalos against FROZEN's 4541 -- no gain at all -- with hosts 2801
+    vs base 3028. Its respectable radial (0.904) comes from not building
+    anything.
+  * **`all_blocks_knnmeasure2`**: its `tuned.pt` is bit-identical to frozen
+    (step 0, 0 tensors differ). The export refuses it as a control masquerading
+    as a candidate. It was never a gate candidate.
+
+### 16e.6 Tooling, and the operational traps this round paid for
+
+  * `submit_loss_ablation.sh` -- `ABL_SET=loo|minimal|shape`. Ledgered per arm
+    (`<run>/.abl_ledger/`), so a rerun submits only what is missing and skips
+    what is in flight; it must be rerun in waves because of the cap below.
+  * `loss_ablation_table.py` + `loss_ablation_table_cpu.sbatch` -- the table,
+    rebuilt from gate JSONs alone, no field and no catalog.
+  * `submit_reverdict.sh` -- re-runs ONLY the verdict stage on arms whose
+    catalogs already exist (~30 s each), which is how shape and radial were
+    backfilled onto the whole history. An empty `RV_BASELINE_ARM` scores an arm
+    standalone, which is how the baseline itself finally got a verdict.
+  * `submit_gate_all_arms.sh` -- classifies every trained arm as verdict-only /
+    full chain / ungateable, and submits within the cpu budget.
+  * `rebuild_summary.py` -- reconstructs a killed run's `summary.json` from the
+    argv wandb records, so a cancelled or preempted arm can still be gated. It
+    replays through the trainer's OWN parser and fails loudly on a renamed flag;
+    the written file is marked `reconstructed` and carries the checkpoint's
+    step/partial so a partial run cannot be mistaken for a finished one.
+
+Four traps, all measured:
+
+  1. **The `cpu` partition caps a user at 50 QUEUED jobs**
+     (`QOSMaxSubmitJobPerUserLimit`). A gate is 4-5 cpu jobs, so 9 arms x 2 gates
+     can never be queued at once, and dead `DependencyNeverSatisfied` chains from
+     old sweeps silently hold slots.
+  2. **Disk quota kills jobs with no traceback.** Four arms died mid-step at
+     ~step 3750 with nothing in the log, because the log is on the same quota.
+     `flow_rockstar/fields` held 46 spliced boxes x 3 GB; each gate writes
+     another. `purge_regenerable_fields.py --group spliced --apply` reclaimed
+     135 GB, keeping every catalog and the `tiles.npz` each field rebuilds from.
+  3. **An early (step-N) gate cannot run while its training does.** The export
+     replays `summary.json`, which the trainer writes only at the end. Queue
+     early gates after the run finishes, or rebuild the summary.
+  4. **`--export` still gets jobs requeued and held** (section 18's rule); and a
+     gate submitter that is `set -e` leaves an orphan half-chain when an sbatch
+     is refused mid-way -- an orphan export will collide with the resubmitted
+     gate's `tiles.npz`.
+
+### 16e.7 What this section does NOT establish
+
+  * **One box, one seed.** Every number here is set9. `min_vc_l` and `min_v_l`
+    have checkpoints and set10 is cheap to gate; it has not been done.
+  * **The minimal set is minimal ON THESE ARMS.** Interactions were tested only
+    along one nesting path, and rrms/sigmav were tested at their original small
+    weights (0.3) and at rrms 1.0 in a run that died early.
+  * **Isolation's knee is unmeasured** -- one partial checkpoint at step 2000.
+  * **Placement remains the open defect of the whole line.** No configuration
+    measured here places subhalos like HR; the best tuned arm sits at radial
+    0.718 against frozen's 0.929 and HR's 0.000, and buys that with abundance.
+
 ## 17. Module map
 
 | file | role |
@@ -2084,6 +2278,13 @@ reading of section 16c's gate: in the region it does not beat frozen at 50-200p
 | `slurm/gather_wait_checkpoint_cpu.sbatch` | section 16.7: the file-dependency Slurm does not have |
 | `scripts/features/subhalo_radial.py`, `subhalo_radial_plot.py` | section 14: subhalo mass vs distance-to-host per catalog, the measurement the shell arm answers |
 | `features/member_gather.py` `bound_penalty`, `term_scale` | section 10.4: the two budget levers |
+| `slurm/submit_loss_ablation.sh` | section 16e: the ablation -- `ABL_SET=loo/minimal/shape`, ledgered and rerunnable in waves |
+| `scripts/features/loss_ablation_table.py` (+ `_cpu.sbatch`) | section 16e: the table, from gate JSONs alone; `bin_order` is the sorted-key trap |
+| `gate_verdict_vs_baseline.py` `region_mass_function`, `shape_score` | section 16e.3: the mass function at REGION scope (~12k objects, not one host's ~370) |
+| `gate_verdict_vs_baseline.py` `radial_distribution`, `radial_score` | section 16e.3: where subhalos sit, scored on fractions so placement is independent of abundance |
+| `slurm/submit_reverdict.sh` | section 16e.6: re-run the verdict stage alone (~30 s/arm); empty baseline = standalone scoring |
+| `slurm/submit_gate_all_arms.sh` | section 16e.6: gate every trained arm, classified by cost, within the cpu cap |
+| `scripts/features/rebuild_summary.py` | section 16e.6: a killed run's `summary.json` from the argv wandb recorded, so it can still be gated |
 | `slurm/submit_centre_offset.sh`, `slurm/centre_offset_gpu.sbatch` | its job |
 | `scripts/features/export_gather_tiles.py` | section 11: a finished run's held-out tiles in the splice layout, config replayed from `summary.json` |
 | `slurm/gather_export_gpu.sbatch`, `slurm/submit_gather_holdout_rockstar.sh` | export -> splice -> Rockstar -> compare, one box per arm + a shared frozen control |
@@ -2229,6 +2430,27 @@ bash scripts/slurm/submit_gather_zoom.sh                            # zoom to R_
 # which changes the estimator.
 MG_SETS_PER_STEP=32 MG_RUNG=all_blocks MG_LABEL=_sps32 SKIP_SHAKEOUT=1 \
   bash scripts/slurm/submit_member_gather_train.sh
+```
+
+```bash
+# --- section 16e: the ablation, the minimal set, and gating everything ---------
+ABL_SET=loo     bash scripts/slurm/submit_loss_ablation.sh   # 9 leave-one-out arms
+ABL_SET=minimal bash scripts/slurm/submit_loss_ablation.sh   # backward elimination
+# rerun the same line in waves: the cpu partition caps 50 QUEUED jobs and a gate
+# is 4-5 of them. It submits only what is missing and skips what is in flight.
+
+# the minimal set itself, as a training run:
+MG_W_D6=0.0 MG_W_RRMS=0.0 MG_W_SIGMAV=0.0 MG_W_HIGHK=0.0 MG_W_BOUND=0.0 \
+  MG_CENTRE_MODE=self MG_RUNG=all_blocks MG_LABEL=_minset \
+  bash scripts/slurm/submit_member_gather_train.sh
+
+# score every trained arm, and backfill shape+radial onto old gates:
+bash scripts/slurm/submit_gate_all_arms.sh
+bash scripts/slurm/submit_reverdict.sh
+# a run killed before it wrote summary.json (quota, preemption, wall clock):
+python scripts/features/rebuild_summary.py --run-dir <arm dir>
+# quota is the recurring killer -- reclaim before a gating campaign:
+python scripts/reward/purge_regenerable_fields.py --group spliced --apply
 ```
 
 Artifacts under `$DMSR_REWARD_ROOT/member_gather/<rung><label>/`: `pool.json`

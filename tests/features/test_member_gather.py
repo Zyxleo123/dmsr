@@ -2283,3 +2283,152 @@ def test_mean_then_charge_is_not_charge_then_mean():
         float(member_gather.shell_charge(c, lt, cfg)) for c in curves]))
     assert mean_then_charge == pytest.approx(0.0, abs=1e-10)
     assert charge_then_mean > 0.4
+
+
+# --------------------------------------------------------------------------- #
+# The reference de-bias (--stats-members)
+# --------------------------------------------------------------------------- #
+#
+# `reference-inflated-by-stragglers`, MEASURED on the 16 holdout hosts: at a
+# median live fraction of 0.979 the hybrid reference sits at 2.18x HR's own
+# `r_rms` and 1.99x its `2T/|W|`, with corr(1 - live_frac, inflation) = 0.76
+# held out and 0.84 on the 40 training hosts. `r_rms` is an RMS, so a ~2% tail
+# at ~2 Mpc/h carries ~78% of `r_rms^2`.
+#
+# The toy reproduces the SHAPE of that (10 of 100 members parked 2 Mpc/h away
+# from a 0.15 Mpc/h object), not the magnitude -- the point of these tests is
+# that the policy is applied to both sides of every comparison at once, which
+# is the property a half-applied fix would break silently.
+
+
+def _straggler_box(offset_mpc_h: float = 2.0, vel_kms: float = 400.0):
+    """A 16^3 frozen box whose halo-12 out-of-tile members sit far from it.
+
+    `build_member_sets` reads the stragglers through
+    `bound_discriminator.particles_at`, which wants the whole box rather than
+    the trained tiles, so the toy's `split=True` neighbour sites are given
+    displacements that put them `offset_mpc_h` from halo 12's centre. Every
+    other site is left at its lattice point and is never read.
+
+    They also get a bulk `vel_kms`, and that is not decoration: a straggler is
+    a particle the tiling cut away, not a member at rest, so it does not share
+    the subhalo's frame. Leaving the velocity channels at zero makes the tail
+    inflate `r_rms` while *lowering* `2T/|W|`, which is the opposite of the
+    measured defect and would let a broken policy pass.
+    """
+    cell = BOX / NG
+    box = np.zeros((6, NG, NG, NG), dtype=np.float64)
+    nb = (np.arange(10) // (TILE * TILE)) * NG * NG \
+        + ((np.arange(10) // TILE) % TILE) * NG + (np.arange(10) % TILE) + TILE
+    iz, iy, ix = nb % NG, (nb // NG) % NG, nb // (NG * NG)
+    q = np.stack([(ix + 0.5) * cell, (iy + 0.5) * cell, (iz + 0.5) * cell])
+    want = np.array([15.0, 15.0, 15.0])[:, None] + np.array(
+        [[offset_mpc_h], [0.0], [0.0]])
+    box[0:3, ix, iy, iz] = (want - q) / DIS
+    box[3, ix, iy, iz] = vel_kms / VEL
+    return box
+
+
+def _split_sets(stats_members: str, offset_mpc_h: float = 2.0):
+    cat, oidx, tiles, hr, fz = _toy(split=True)
+    rep = {}
+    ms = build_member_sets(
+        cat, oidx, tiles, hr, fz,
+        _cfg(min_live_frac=0.5, stats_members=stats_members),
+        particle_mass_msun_h=M_P, ng_hr=NG, tile_hr=TILE, boxsize_mpc_h=BOX,
+        dis_scale_mpc_h=DIS, vel_scale_kms=VEL,
+        frozen_box=_straggler_box(offset_mpc_h), report=rep)
+    s = int(np.flatnonzero(ms.halo_id == 12)[0])
+    return ms, rep, s, tiles, fz
+
+
+def test_stats_members_defaults_to_the_hybrid_every_arm_trained_on():
+    assert MemberGatherConfig().stats_members == "all"
+    with pytest.raises(ValueError, match="stats_members"):
+        _cfg(stats_members="core")
+
+
+def test_the_straggler_tail_inflates_the_reference_r_rms():
+    """The defect, reproduced: 10% of members 2 Mpc/h out, and the reference
+    the loss optimises against is several times HR's own object.
+
+    Read PER SET, not off the medians: only halo 12 straddles a tile face, so
+    a median over the three sets is 2/3 made of rows the policy cannot move
+    and would report the defect as absent.
+    """
+    a_ms, rep, s, _, _ = _split_sets("all")
+    l_ms, _, sl, _, _ = _split_sets("live")
+    assert rep["outside_dropped"] == 0            # a frozen box WAS supplied
+    assert a_ms.fixed_pos[s] is not None and a_ms.fixed_pos[s].shape[0] == 10
+    assert float(a_ms.ref["r_rms"][s]) > 2.0 * float(l_ms.ref["r_rms"][sl])
+    assert float(a_ms.ref["virial"][s]) > 2.0 * float(l_ms.ref["virial"][sl])
+
+
+def test_live_policy_makes_the_reference_hrs_own_object():
+    ms, rep, s, _, _ = _split_sets("live")
+    assert ms.fixed_pos[s] is None and ms.fixed_vel[s] is None
+    assert rep["outside_excluded_by_policy"] == 10
+    assert rep["outside_dropped"] == 0
+    for k in ("r_rms", "sigma_v", "virial", "bound_hard"):
+        assert rep["reference_median"][k] == pytest.approx(
+            rep["pure_hr_median"][k], rel=1e-9)
+
+
+def test_the_inflation_stays_visible_under_the_live_policy():
+    """A run that cannot see its own reference move is how this went unnoticed
+    for 56 arms, so `hybrid_reference_median` is reported under BOTH policies
+    and always means the same thing."""
+    all_rep = _split_sets("all")[1]
+    live_rep = _split_sets("live")[1]
+    assert all_rep["stats_members"] == "all"
+    assert live_rep["stats_members"] == "live"
+    for k in ("r_rms", "virial"):
+        assert live_rep["hybrid_reference_median"][k] == pytest.approx(
+            all_rep["reference_median"][k], rel=1e-9)
+        assert live_rep["pure_hr_median"][k] == pytest.approx(
+            all_rep["pure_hr_median"][k], rel=1e-9)
+
+
+def test_the_policy_tightens_what_the_loss_asks_for():
+    """The point of the change. Same field, same members moved, smaller target:
+    the rrms term at step 0 must be LARGER under the live policy, because the
+    candidate is being compared to HR's real compactness instead of to a
+    reference the stragglers had already loosened."""
+    def rrms_term(policy):
+        ms, _, _, tiles, fz = _split_sets(policy)
+        cfg = _cfg(min_live_frac=0.5, stats_members=policy,
+                   w_virial=0.0, w_bound=0.0, w_d6=0.0, w_sigmav=0.0,
+                   w_centre=0.0, w_rrms=1.0)
+        pos, vel = _particles(fz, tiles)
+        return member_gather_loss(pos, vel, ms, cfg)[1]["term_rrms"]
+    assert rrms_term("live") > rrms_term("all")
+
+
+def test_centre_self_is_still_exactly_zero_at_step_zero():
+    """The invariant a half-applied policy would break. `centre_mode="self"`
+    anchors the set where the frozen field already put it, so the term must be
+    zero before the first step under EITHER policy -- which is only true if
+    `centre_self` and what `_gather_one` builds see the same collection."""
+    for policy in ("all", "live"):
+        ms, _, _, tiles, fz = _split_sets(policy)
+        cfg = _cfg(min_live_frac=0.5, stats_members=policy,
+                   w_virial=0.0, w_bound=0.0, w_d6=0.0, w_rrms=0.0,
+                   w_sigmav=0.0, w_centre=1.0, centre_mode="self")
+        pos, vel = _particles(fz, tiles)
+        assert member_gather_loss(pos, vel, ms, cfg)[1]["term_centre"] \
+            == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_set_with_no_stragglers_is_untouched_by_the_policy():
+    """Halos 10 and 11 are wholly inside the trained tile, so the flag must be
+    a no-op for them -- otherwise the arms this is compared against move for a
+    reason that has nothing to do with the reference."""
+    a_ms, _, _, _, _ = _split_sets("all")
+    l_ms, _, _, _, _ = _split_sets("live")
+    for hid in (10, 11):
+        ia = int(np.flatnonzero(a_ms.halo_id == hid)[0])
+        il = int(np.flatnonzero(l_ms.halo_id == hid)[0])
+        assert a_ms.fixed_pos[ia] is None and l_ms.fixed_pos[il] is None
+        for k in ("r_rms", "sigma_v", "virial"):
+            assert float(a_ms.ref[k][ia]) == pytest.approx(
+                float(l_ms.ref[k][il]), rel=1e-12)

@@ -192,6 +192,79 @@ MG_RADIUS_HUBER="${MG_RADIUS_HUBER:-0.0}"
 #             bash scripts/slurm/submit_member_gather_train.sh
 #   the controls are all_blocks_self (w_shell 0) and all_blocks_selfshell.
 # All OFF by default: MG_W_SHELL=0 leaves the loss and its gradient unchanged.
+# --- SOFT MEMBERSHIP: which particles, as a latent variable ------------------
+# OFF by default; MG_SOFT_MEMBERSHIP=0 leaves the loss and its gradient exactly
+# as every arm on disk ran them.
+#
+# The standing defect this targets. Every term here is a statistic of a particle
+# collection the loss cannot choose: HR's owner array names it, once, before the
+# run. When SR2's material for a subhalo is not the material HR used, the loss
+# charges the generator for failing to bind particles that were never going to
+# be there and rewards it for dragging in the wrong ones. The gate-passing arm
+# works anyway (20 -> 366 held-out subhalos against HR's 369) and its remaining
+# defects are placement ones -- radially collapsed satellites, host damage that
+# is ~88% re-parenting -- which is what a wrong-material objective would look
+# like from the outside.
+#
+# The relaxation. HR keeps supplying the object's REGION (a coarse Lagrangian
+# prior: n_c of an LR cell's 512 sites belong to this subhalo, so EVERY SR
+# particle of that cell starts at membership n_c/512, the original members
+# included and not privileged) and its PHYSICS (the reference, untouched). The
+# CURRENT SR field decides which particles participate, by a 6-D phase-space
+# fit -- position AND velocity, the same quantity Rockstar groups on. Two
+# constraints make the solve honest and both are load-bearing:
+#   * a per-particle budget of one, shared with a background/host category, so
+#     two candidates cannot spend the same convenient particles; and
+#   * a per-candidate mass target, so a candidate cannot discard everything and
+#     keep a tiny cold core that scores perfectly on every moment.
+#
+# THE RISK, named before it is run: a coarse window is exactly the Gaussian
+# window that already failed on this line (docs/sr2_gather_finetune.md section
+# 6 -- its statistics described the surrounding host material, not the object).
+# That is why the prior is the SUPPORT and never the membership: one LR cell is
+# 1.5625 Mpc/h a side against a 0.15 Mpc/h search radius. And it is why the
+# ladder below runs the coarse-at-large-lambda control, which is the arm that
+# says whether the window alone is already destructive.
+#
+# THE LADDER (run the controls, or the arm proves nothing):
+#   hard, lambda 1e6   reproduces the arm on disk -- a correctness check
+#   coarse, lambda 1e6 the window ALONE, membership frozen at the prior
+#   hard, lambda 1     the conservative relaxation: HR's mask, opened
+#   coarse, lambda 1   the proposal as written
+# Use submit_soft_membership_ladder.sh, which submits all four plus the control.
+#
+# WATCH soft_mass_ratio (must sit at ~1.0) and soft_hr_fraction (1.0 is the hard
+# arm; a collapse toward 0 is the relaxation walking off the object).
+#
+# COST: the pool is (1 + ratio) times the member count against an O(pool^2)
+# estimator, so ratio 2 is ~9x the hard arm's pair bill. MG_MAX_SET_PARTICLES
+# bounds it and the ladder sets one.
+MG_SOFT_MEMBERSHIP="${MG_SOFT_MEMBERSHIP:-0}"
+MG_SOFT_LAMBDA="${MG_SOFT_LAMBDA:-1.0}"
+MG_SOFT_PRIOR="${MG_SOFT_PRIOR:-coarse}"
+MG_SOFT_FACTOR="${MG_SOFT_FACTOR:-8}"
+MG_SOFT_POOL_RATIO="${MG_SOFT_POOL_RATIO:-2.0}"
+MG_SOFT_CELL_DILATE="${MG_SOFT_CELL_DILATE:-0}"
+MG_SOFT_PRIOR_EPS="${MG_SOFT_PRIOR_EPS:-1e-3}"
+MG_SOFT_BG_FLOOR="${MG_SOFT_BG_FLOOR:-1e-3}"
+MG_SOFT_STEPS="${MG_SOFT_STEPS:-3}"
+MG_SOFT_MASS_STEPS="${MG_SOFT_MASS_STEPS:-10}"
+MG_SOFT_MASS_ETA="${MG_SOFT_MASS_ETA:-1.0}"
+MG_SOFT_MASS_STEP_CAP="${MG_SOFT_MASS_STEP_CAP:-20.0}"
+MG_SOFT_SIGMA="${MG_SOFT_SIGMA:-adaptive}"
+MG_SOFT_SIGMA_SCALE="${MG_SOFT_SIGMA_SCALE:-1.0}"
+
+# --- the host as a background component (docs/sr2_host_profile.md) ----------
+# The radial-placement arm. OFF by default: MG_SOFT_HOST_PROFILE=off is
+# byte-identical to every soft arm on disk. See the batch script for what the
+# two sources are and why beta is not comparable between them.
+MG_SOFT_HOST_PROFILE="${MG_SOFT_HOST_PROFILE:-off}"
+MG_SOFT_HOST_WEIGHT="${MG_SOFT_HOST_WEIGHT:-0.0}"
+MG_SOFT_HOST_CONC="${MG_SOFT_HOST_CONC:-5.0}"
+MG_SOFT_HOST_BINS="${MG_SOFT_HOST_BINS:-24}"
+MG_SOFT_HOST_R_MAX_RVIR="${MG_SOFT_HOST_R_MAX_RVIR:-4.0}"
+MG_LR_HOST_TABLE="${MG_LR_HOST_TABLE:-}"
+MG_LR_HOST_R_MAX_RVIR="${MG_LR_HOST_R_MAX_RVIR:-2.0}"
 MG_W_SHELL="${MG_W_SHELL:-0.0}"
 # 0.02, not radius_dead_zone's 1.0 rescaled: as a FRACTIONAL error 0.02 charges
 # 81%/78% of sets against a sorted median residual of 0.079/0.064, while 0.05
@@ -358,6 +431,7 @@ MG_ISO_MIN_COUNT="${MG_ISO_MIN_COUNT:-8.0}"
 MG_GATE_AT_STEPS="${MG_GATE_AT_STEPS:-}"
 MG_MIN_PURITY="${MG_MIN_PURITY:-0.5}"
 MG_MIN_LIVE_FRAC="${MG_MIN_LIVE_FRAC:-0.5}"
+MG_STATS_MEMBERS="${MG_STATS_MEMBERS:-all}"
 MG_SOFTENING="${MG_SOFTENING:-0.01}"
 MG_BOUND_TAU="${MG_BOUND_TAU:-0.5}"
 MG_BG_K="${MG_BG_K:-4096}"
@@ -423,6 +497,13 @@ MG_KNN_ONE_SIDED="${MG_KNN_ONE_SIDED:-0}"
 # keeps the position-only pooled form of rounds 1-4 (which cannot rank arms).
 MG_KNN_PHASE_LAMBDA="${MG_KNN_PHASE_LAMBDA:-0}"
 MG_KNN_CLASSES="${MG_KNN_CLASSES:-}"
+# The catalog-free strata arm (docs/sr2_knn_strata.md). Gated: see
+# scripts/slurm/submit_knn_strata_arm.sh, which sets these for you and refuses
+# to run without a passing verdict json.
+MG_KNN_STRATA="${MG_KNN_STRATA:-0}"
+MG_KNN_STRATA_RANK="${MG_KNN_STRATA_RANK:-0}"
+MG_KNN_STRATA_CHARGE="${MG_KNN_STRATA_CHARGE:-}"
+MG_KNN_CLASSES_DIAG_ONLY="${MG_KNN_CLASSES_DIAG_ONLY:-0}"
 # --- the HR critic, docs/sr2_gather_critic.md. A REGULARISER on the gather loss,
 # the general form of the two hand-crafted guards above: it sees whole HR tiles
 # vs tuned tiles (6-channel high-pass, velocity included) and charges for the
@@ -439,6 +520,19 @@ MG_CRITIC_GLOBAL_POOL="${MG_CRITIC_GLOBAL_POOL:-0}"
 MG_CRITIC_R1_GAMMA="${MG_CRITIC_R1_GAMMA:-10.0}"
 MG_CRITIC_R1_INTERVAL="${MG_CRITIC_R1_INTERVAL:-16}"
 MG_CRITIC_NORM_FIT_TILES="${MG_CRITIC_NORM_FIT_TILES:-32}"
+# --- relocation: the arm A / B / C experiment --------------------------------
+# off = arm A (HR memberships, every result on this line so far); frozen = arm B
+# (groups re-chosen from frozen-SR material at the frozen radius); hr = arm C
+# (the same selection at HR's radius). Same targets, same setup, one scalar per
+# set between B and C. scripts/slurm/submit_relocate_arms.sh runs all three.
+MG_RELOCATE="${MG_RELOCATE:-off}"
+MG_RELOCATE_DIRS="${MG_RELOCATE_DIRS:-8}"
+MG_RELOCATE_EPS="${MG_RELOCATE_EPS:-0.05}"
+MG_RELOCATE_OVERSAMPLE="${MG_RELOCATE_OVERSAMPLE:-4.0}"
+MG_RELOCATE_REFINE_ITERS="${MG_RELOCATE_REFINE_ITERS:-3}"
+MG_RELOCATE_W_VEL="${MG_RELOCATE_W_VEL:-0.5}"
+MG_RELOCATE_W_RADIUS="${MG_RELOCATE_W_RADIUS:-1.0}"
+MG_RELOCATE_CHECK_ONLY="${MG_RELOCATE_CHECK_ONLY:-0}"
 MG_LABEL="${MG_LABEL:-}"
 MG_SEED="${MG_SEED:-0}"
 # online / offline / disabled. Empty uses configs/reward/sr2_direct_finetune.yaml's
@@ -486,6 +580,35 @@ MG_CENTRE_HUBER="$MG_CENTRE_HUBER"
 MG_W_RADIUS="$MG_W_RADIUS"
 MG_RADIUS_DEAD_ZONE="$MG_RADIUS_DEAD_ZONE"
 MG_W_SHELL="$MG_W_SHELL"
+MG_RELOCATE="$MG_RELOCATE"
+MG_RELOCATE_DIRS="$MG_RELOCATE_DIRS"
+MG_RELOCATE_EPS="$MG_RELOCATE_EPS"
+MG_RELOCATE_OVERSAMPLE="$MG_RELOCATE_OVERSAMPLE"
+MG_RELOCATE_REFINE_ITERS="$MG_RELOCATE_REFINE_ITERS"
+MG_RELOCATE_W_VEL="$MG_RELOCATE_W_VEL"
+MG_RELOCATE_W_RADIUS="$MG_RELOCATE_W_RADIUS"
+MG_RELOCATE_CHECK_ONLY="$MG_RELOCATE_CHECK_ONLY"
+MG_SOFT_MEMBERSHIP="$MG_SOFT_MEMBERSHIP"
+MG_SOFT_LAMBDA="$MG_SOFT_LAMBDA"
+MG_SOFT_PRIOR="$MG_SOFT_PRIOR"
+MG_SOFT_FACTOR="$MG_SOFT_FACTOR"
+MG_SOFT_POOL_RATIO="$MG_SOFT_POOL_RATIO"
+MG_SOFT_CELL_DILATE="$MG_SOFT_CELL_DILATE"
+MG_SOFT_PRIOR_EPS="$MG_SOFT_PRIOR_EPS"
+MG_SOFT_BG_FLOOR="$MG_SOFT_BG_FLOOR"
+MG_SOFT_STEPS="$MG_SOFT_STEPS"
+MG_SOFT_MASS_STEPS="$MG_SOFT_MASS_STEPS"
+MG_SOFT_MASS_ETA="$MG_SOFT_MASS_ETA"
+MG_SOFT_MASS_STEP_CAP="$MG_SOFT_MASS_STEP_CAP"
+MG_SOFT_SIGMA="$MG_SOFT_SIGMA"
+MG_SOFT_HOST_PROFILE="$MG_SOFT_HOST_PROFILE"
+MG_SOFT_HOST_WEIGHT="$MG_SOFT_HOST_WEIGHT"
+MG_SOFT_HOST_CONC="$MG_SOFT_HOST_CONC"
+MG_SOFT_HOST_BINS="$MG_SOFT_HOST_BINS"
+MG_SOFT_HOST_R_MAX_RVIR="$MG_SOFT_HOST_R_MAX_RVIR"
+MG_LR_HOST_TABLE="$MG_LR_HOST_TABLE"
+MG_LR_HOST_R_MAX_RVIR="$MG_LR_HOST_R_MAX_RVIR"
+MG_SOFT_SIGMA_SCALE="$MG_SOFT_SIGMA_SCALE"
 MG_SHELL_DEAD_ZONE="$MG_SHELL_DEAD_ZONE"
 MG_SHELL_QUANTILES="$MG_SHELL_QUANTILES"
 MG_NOISE_DRAWS="$MG_NOISE_DRAWS"
@@ -519,6 +642,7 @@ MG_ISO_MIN_COUNT="$MG_ISO_MIN_COUNT"
 MG_GATE_AT_STEPS="$MG_GATE_AT_STEPS"
 MG_MIN_PURITY="$MG_MIN_PURITY"
 MG_MIN_LIVE_FRAC="$MG_MIN_LIVE_FRAC"
+MG_STATS_MEMBERS=$MG_STATS_MEMBERS
 MG_SOFTENING="$MG_SOFTENING"
 MG_BOUND_TAU="$MG_BOUND_TAU"
 MG_BG_K="$MG_BG_K"
@@ -555,6 +679,10 @@ MG_KNN_CENTRE="$MG_KNN_CENTRE"
 MG_KNN_ONE_SIDED="$MG_KNN_ONE_SIDED"
 MG_KNN_PHASE_LAMBDA="$MG_KNN_PHASE_LAMBDA"
 MG_KNN_CLASSES="$MG_KNN_CLASSES"
+MG_KNN_STRATA=$MG_KNN_STRATA
+MG_KNN_STRATA_RANK=$MG_KNN_STRATA_RANK
+MG_KNN_STRATA_CHARGE="$MG_KNN_STRATA_CHARGE"
+MG_KNN_CLASSES_DIAG_ONLY=$MG_KNN_CLASSES_DIAG_ONLY
 MG_W_ADV="$MG_W_ADV"
 MG_ADV_WARMUP="$MG_ADV_WARMUP"
 MG_ADV_RAMP="$MG_ADV_RAMP"

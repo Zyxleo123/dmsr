@@ -36,7 +36,9 @@ GA_ARMS="${GA_ARMS:-$(cd "$MG" && ls -d */ 2>/dev/null | tr -d / | tr '\n' ' ')}
 cpu_used() { squeue -u "$USER" -h -p cpu -o "%i" | wc -l; }
 cpu_free() { echo $(( GA_CPU_LIMIT - $(cpu_used) )); }
 
-declare -a DONE_=() CLASS_A=() CLASS_A0=() CLASS_B=() CLASS_C=() DEFERRED=()
+QUEUE="$(mktemp)"; trap 'rm -f "$QUEUE"' EXIT
+squeue -u "$USER" -h -o "%i %T" > "$QUEUE"
+declare -a DONE_=() CLASS_A=() CLASS_A0=() CLASS_B=() CLASS_C=() DEFERRED=() INFLIGHT=()
 for arm in $GA_ARMS; do
     d="$MG/$arm"
     [ -f "$d/tuned.pt" ] || continue
@@ -44,6 +46,18 @@ for arm in $GA_ARMS; do
     if [ -f "$d/holdout_${GA_BOX}/verdict_vs_self.json" ] \
        || [ -f "$d/holdout_${GA_BOX}/region_counts.json" ]; then
         DONE_+=("$arm"); continue
+    fi
+    # IN FLIGHT: this submitter classifies by output files, and a chain takes
+    # ~20 min to produce any. Without the ledger a rerun re-submits every chain
+    # already queued -- two exports writing one tiles.npz, and 3 GB of spliced
+    # field per duplicate on a quota that has already died once.
+    _led="$d/.gate_ledger_${GA_BOX}"
+    if [ -s "$_led" ]; then
+        _live=""
+        for _j in $(cat "$_led"); do
+            grep -q "^$_j " "$QUEUE" && { _live=1; break; }
+        done
+        [ -n "$_live" ] && { INFLIGHT+=("$arm"); continue; }
     fi
     if [ ! -f "$d/summary.json" ]; then CLASS_C+=("$arm"); continue; fi
     if [ -f "$REWARD_ROOT/flow_rockstar/compare/${GA_BOX}__mgho_${arm}_${GA_BOX}.json" ]; then
@@ -58,6 +72,7 @@ done
 
 echo "=== gate-all on $GA_BOX (baseline $GA_BASELINE_ARM)"
 echo "  already gated:            ${#DONE_[@]}"
+echo "  in flight (ledgered):     ${#INFLIGHT[@]}  ${INFLIGHT[*]:-}"
 echo "  A verdict only (1 cpu):   $(( ${#CLASS_A[@]} + ${#CLASS_A0[@]} ))  ${CLASS_A[*]:-} ${CLASS_A0[*]:-}"
 echo "  B full chain (1gpu+4cpu): ${#CLASS_B[@]}  ${CLASS_B[*]:-}"
 echo "  C no summary.json:        ${#CLASS_C[@]}  ${CLASS_C[*]:-}"
@@ -103,13 +118,18 @@ for arm in "${CLASS_B[@]}"; do
     fi
     echo "──────── B: $arm"
     # NO_CONTROL: the frozen control for this box is already gated and shared.
+    _out="$(mktemp)"
     if MG_ARMS="$arm" HG_BOX="$GA_BOX" NO_CONTROL=1 \
        HG_BASELINE_ARM="$GA_BASELINE_ARM" HG_BASELINE_NAME=self \
-       bash scripts/slurm/submit_gather_holdout_rockstar.sh 2>&1 | grep -E "^ *(export|splice|rockstar|compare|region) " ; then
-        :
+       bash scripts/slurm/submit_gather_holdout_rockstar.sh > "$_out" 2>&1; then
+        grep -E "^ *(export|splice|rockstar|compare|region) " "$_out" || true
+        sed -n 's/.*-> job \([0-9][0-9]*\).*/\1/p' "$_out" > "$MG/$arm/.gate_ledger_${GA_BOX}"
+        squeue -u "$USER" -h -o "%i %T" > "$QUEUE"
     else
+        cat "$_out"
         echo ">>> $arm: gate submission FAILED (see above)" >&2
     fi
+    rm -f "$_out"
 done
 
 echo

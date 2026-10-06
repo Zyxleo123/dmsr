@@ -20,8 +20,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts" / "reward
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from finetune_member_gather import (  # noqa: E402
-    HostTask, draw_seeds, fresh_draw_index, verdict,
+    HostTask, draw_seeds, fresh_draw_index, verdict, _box_to_tiles,
 )
+
+
+def test_box_to_tiles_matches_tile_particles_origin_convention():
+    """The dump's full-box slicer must invert tile_particles' tile ordering, or
+    the solved membership would be plotted against the wrong particles."""
+    import numpy as np
+    import torch
+    from cosmo_sr.features.member_gather import tile_particles
+    ng, th = 32, 8            # a toy box: 4^3 tiles of 8^3
+    n_side = ng // th
+    # A full box whose displacement channels are 0, so tile_particles returns the
+    # Lagrangian grid q -- then a tile's own particle positions pin its origin.
+    box = np.zeros((6, ng, ng, ng), dtype=np.float32)
+    tiles = [0, 5, 21, 63 % (n_side ** 3)]
+    tiles = [t for t in tiles if t < n_side ** 3]
+    sub = _box_to_tiles(box, tiles, ng_hr=ng, tile_hr=th)
+    assert sub.shape == (len(tiles), 6, th, th, th)
+    pos, _ = tile_particles(torch.as_tensor(sub), tiles, ng_hr=ng, tile_hr=th,
+                            boxsize_mpc_h=float(ng), dis_scale_mpc_h=1.0,
+                            vel_scale_kms=1.0)
+    cell = 1.0
+    per = th ** 3
+    for b, tid in enumerate(tiles):
+        tx = tid // (n_side * n_side); ty = (tid // n_side) % n_side; tz = tid % n_side
+        first = pos[b * per].numpy()            # local cell (0,0,0) of this tile
+        expected = (np.array([tx, ty, tz]) * th + 0.5) * cell
+        assert np.allclose(first, expected), (tid, first, expected)
 
 
 # highk_max_holdout=0 is the historical train-only verdict, so every test below
@@ -129,6 +156,12 @@ def _wpool(n_hosts=2, **over):
          # objects, against HR on the same particle ids. > 1 is the state
          # that makes Rockstar file them as somebody's subhalos.
          "iso_ratio": 1.34, "iso_above_hr": 0.71,
+         # Soft membership. `soft_mass_ratio` is the constraint that stops a
+         # candidate keeping a tiny cold core, and `soft_hr_fraction` is how
+         # much of the solved object is still HR's own material -- 1.0 on the
+         # hard arm. Present in every row so both arms chart together.
+         "soft_mass_ratio": 1.0, "soft_mass_ratio_min": 0.96,
+         "soft_hr_fraction": 0.82, "soft_n_eff_over_target": 0.94,
          "term_virial": 0.9, "term_bound": 0.4, "term_d6": 0.2,
          "term_rrms": 0.13, "term_sigmav": 0.1, "term_centre": 0.1,
          "term_radius": 0.0, "term_shell": 0.0, "term_isolation": 0.6,
