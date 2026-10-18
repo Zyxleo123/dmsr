@@ -103,6 +103,9 @@ from cosmo_sr.eval.rockstar import load_rockstar_ascii  # noqa: E402
 from cosmo_sr.features.field_guards import (  # noqa: E402
     banded_highk_hinge, highk_hinge, highk_power_ratio_torch,
 )
+from cosmo_sr.features.host_temperature import (  # noqa: E402
+    TempConfig, target_profile, temperature_loss, temperature_profile,
+)
 from cosmo_sr.features.knn_cdf import (  # noqa: E402
     OWNER_CLASSES, KnnConfig, box_neighbours, box_phase, box_positions,
     classify_owner, knn_tile_loss, tile_rows_flat,
@@ -117,7 +120,8 @@ from cosmo_sr.features.host_profile import (  # noqa: E402
     load_lr_host_table, lr_host_for,
 )
 from cosmo_sr.features.member_gather import (  # noqa: E402
-    MemberSets, build_member_sets, member_gather_loss, shell_charge,
+    MemberSets, build_member_sets, host_guard_config, member_gather_loss,
+    shell_charge,
     shell_radii, shell_reduce, tile_particles,
 )
 from cosmo_sr.features.member_pool import (  # noqa: E402
@@ -181,6 +185,13 @@ class HostTask:
     #: draw-0 reference read under draw 3 would charge the guard for ordinary
     #: realisation scatter and report host damage that never happened.
     host_sets_by_draw: Optional[List[Optional[MemberSets]]] = None
+    #: The host's HR centre (Mpc/h) and R_vir (Mpc/h), and HR's host-centric
+    #: local-temperature profile on these tiles' own particles -- the target of
+    #: ``--w-temp`` (cosmo_sr.features.host_temperature). ``temp_target`` is None
+    #: unless the term is on or measured, so every arm before it is unchanged.
+    host_pos: Optional[np.ndarray] = None
+    host_rvir: float = 0.0
+    temp_target: Optional[Dict] = None
 
     def sets_at(self, draw: int) -> MemberSets:
         """The draw's own set table; ``sets`` when the run has only one draw."""
@@ -338,6 +349,7 @@ def build_host_sets(
     # the LR catalog usable only above ~20k HR particles, and the solve falls
     # back to the flat background for the rest rather than borrowing a
     # neighbouring cluster's profile.
+    hr_host_rvir = (float(cat.rvir[int(_hrow[0])]) / 1000.0 if _hrow.size else 0.0)
     host_rvir = host_mvir = 0.0
     if str(getattr(args, "soft_host_profile", "off")) == "lr" and host_pos is not None:
         tbl = _lr_host_table(sel.box, args)
@@ -486,7 +498,17 @@ def build_host_sets(
         sets.pools = pools
         report["soft_pools"] = prep
 
+    temp_target = None
+    if temp_enabled(args) and host_pos is not None and hr_host_rvir > 0:
+        hpos, hvel = tile_particles(hr, sel.tiles, **kw)
+        temp_target = target_profile(
+            hpos.detach(), hvel.detach(),
+            torch.as_tensor(host_pos, dtype=hpos.dtype, device=hpos.device),
+            hr_host_rvir, temp_config_from_args(args),
+            queries_per_bin=int(args.temp_target_queries), seed=int(args.seed))
+        report["temp_target_bins"] = int((temp_target["n"] > 0).sum())
     return HostTask(
+        host_pos=host_pos, host_rvir=hr_host_rvir, temp_target=temp_target,
         sel=sel, sets=sets.to(cpu), hr=hr.to(cpu), report=report,
         tile_data={t: {"lr": data[t]["lr"].to(cpu),
                        "noise": {s: v.to(cpu) for s, v in data[t]["noise"].items()},
@@ -954,6 +976,17 @@ def eval_unsup_highk(model, pool: Sequence[Dict], geom, device, args,
 # per tile, the distribution of distances to the k-th nearest particle, against
 # that tile's own HR. It is translation-invariant, so it is a support term and
 # never a substitute for the supervised centre term.
+def temp_enabled(args) -> bool:
+    """The temperature term is built when it is charged OR only measured."""
+    return float(getattr(args, "w_temp", 0.0)) > 0 or bool(getattr(args, "temp_measure", False))
+
+
+def temp_config_from_args(args) -> TempConfig:
+    return TempConfig(k=int(args.temp_k), queries_per_bin=int(args.temp_queries),
+                      max_x=float(args.temp_max_x), min_x=float(args.temp_min_x),
+                      min_queries=int(args.temp_min_queries), boxsize_mpc_h=BOXSIZE)
+
+
 def knn_config_from_args(args) -> KnnConfig:
     return KnnConfig(ks=tuple(int(k) for k in args.knn_ks),
                      n_queries=int(args.knn_queries),
@@ -1247,6 +1280,11 @@ def report_rss(when: str) -> float:
     import resource
     gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 ** 2)
     print(f"  [mem] peak host RSS {when}: {gb:.1f} GB", flush=True)
+    # The GPU peak too: the soft arms were pinned to A6000s (--exclude gpu28,
+    # the 24 GB A5000s) only because no run had ever recorded this number.
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        gpu = torch.cuda.max_memory_allocated() / (1024.0 ** 3)
+        print(f"  [mem] peak GPU allocated {when}: {gpu:.1f} GB", flush=True)
     return gb
 
 
@@ -1432,9 +1470,7 @@ def host_forward(model, task: HostTask, geom, kw, mcfg, device,
             # leaving it set here is what killed jobs 56560/56562 five minutes
             # in, on the MemberGatherConfig refusal that exists to catch
             # exactly this combination being set by hand.
-            dataclasses.replace(mcfg, centre_mode="self", w_radius=0.0,
-                                soft_membership=False,
-                                soft_host_profile="off", soft_host_weight=0.0),
+            host_guard_config(mcfg),
             host_set_indices)
     return cand, base, hr, gather, diag, host
 
@@ -1520,6 +1556,25 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
             + float(args.w_vel_highk) * vk_pen)
     if host_gather is not None:
         loss = loss + float(args.w_host_sets) * host_gather
+    # --- host-centric local temperature (--w-temp; host_temperature.py) -----
+    # Velocity-only: neighbours are found without gradient, so this cannot move
+    # the density field the velocity oracle showed is already right. Measured
+    # under no_grad when only --temp-measure is on.
+    temp_pen, temp_info = None, {}
+    if task.temp_target is not None:
+        pos_c, vel_c = tile_particles(cand, task.tiles, **kw)
+        guess = torch.as_tensor(task.host_pos, dtype=pos_c.dtype, device=pos_c.device)
+        tcfg = temp_config_from_args(args)
+        if float(args.w_temp) > 0:
+            prof = temperature_profile(pos_c, vel_c, guess, task.host_rvir, tcfg)
+            temp_pen, temp_info = temperature_loss(
+                prof, task.temp_target["mean"], task.temp_target["n"], tcfg)
+            loss = loss + float(args.w_temp) * temp_pen
+        else:
+            with torch.no_grad():
+                prof = temperature_profile(pos_c, vel_c, guess, task.host_rvir, tcfg)
+                temp_pen, temp_info = temperature_loss(
+                    prof, task.temp_target["mean"], task.temp_target["n"], tcfg)
     row = {
         # WHICH noise realisation this row was measured under. Without it a
         # rotating run's metrics.jsonl cannot be split by draw, and the whole
@@ -1594,6 +1649,14 @@ def host_loss(model, task, geom, kw, mcfg, args, device, frozen_model,
         "soft_host_valid_frac": diag.get("soft_host_valid_frac", float("nan")),
         "soft_host_logrho_p10": diag.get("soft_host_logrho_p10", float("nan")),
         "soft_host_logrho_p90": diag.get("soft_host_logrho_p90", float("nan")),
+        # The temperature term, NaN when it is neither charged nor measured.
+        # temp_core_ratio < 1 is the cold core Rockstar fragments; > 1 in
+        # temp_out_ratio is the hot outskirts (HR = 1.00 on both).
+        "temp_raw": (float(temp_pen.detach()) if temp_pen is not None else float("nan")),
+        "term_temp": (float(args.w_temp) * float(temp_pen.detach())
+                      if temp_pen is not None else float("nan")),
+        "temp_core_ratio": temp_info.get("temp_core_ratio", float("nan")),
+        "temp_out_ratio": temp_info.get("temp_out_ratio", float("nan")),
     }
     # The host preservation guard, reported whether or not it is on so the frozen
     # start and every step carry the same keys. `host_gather` is the weighted
@@ -1899,6 +1962,9 @@ def evaluate_pool(model, tasks: Sequence[HostTask], geom, kw, mcfg, args,
         "by_env": _pool_splits(rows, "by_env"),
         "velhighk_ratio": med("velhighk_ratio"),
         "velhighk_ratio_min": float(np.min([r["velhighk_ratio"] for r in rows])),
+        "temp_raw": nmed("temp_raw"),
+        "temp_core_ratio": nmed("temp_core_ratio"),
+        "temp_out_ratio": nmed("temp_out_ratio"),
         "per_host": rows,
     }
     for k in _TERM_NAMES:
@@ -2233,6 +2299,12 @@ def run(args) -> Dict:
     }
     write_json(out_dir / "pool.json", pool_summary)
     print(f"  wrote {out_dir / 'pool.json'}", flush=True)
+    # The config, NOW, not only in the end-of-run summary.json. The early
+    # MG_GATE_AT_STEPS gate replays the run's config to rebuild its pool, and
+    # summary.json does not exist until the last step -- so every early gate
+    # died in export on a missing file (job 84389, all_blocks_radparent).
+    # `args` is final here: its one mutation (pool_only) is above.
+    write_json(out_dir / "run_config.json", {"config": vars(args)})
     # The pool is the memory-heavy stage (every host's tiles and set tables are
     # held on the CPU, one set per NOISE DRAW), so this is the number that sizes
     # --mem. A pool-only shakeout exists to produce exactly this.
@@ -2552,12 +2624,16 @@ def run(args) -> Dict:
 
     cursor = len(order)
     t0 = time.time()
+    n_nonfinite = 0
+    n_consec_nonfinite = 0
 
     for step in range(1, int(args.steps) + 1):
         w_adv = adv_weight_at(step, args) if critic is not None else 0.0
         opt.zero_grad(set_to_none=True)
         acc: List[Dict] = []
         adv_pairs: List = []
+        step_hosts: List[str] = []
+        step_losses: List[float] = []
         for _ in range(hps):
             if cursor >= len(order):
                 random.shuffle(order)
@@ -2579,6 +2655,8 @@ def run(args) -> Dict:
                                       task, hsps, set_rng),
                                   draw=draw,
                                   shell_draws=shell_draws_for(draw))
+            step_hosts.append(str(task.key))
+            step_losses.append(float(loss.detach()))
             # Mean over the hosts in the step, so the gradient scale does not
             # depend on --hosts-per-step and the learning rate stays comparable.
             (loss / hps).backward()
@@ -2613,10 +2691,43 @@ def run(args) -> Dict:
                                 class_ids=knn_loss_cls)
             (float(args.w_knn_unsup) * pen).backward()
             knn_pen = float(pen.detach())
-        if args.clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for g in groups for p in g["params"]], float(args.clip))
-        opt.step()
+        # ---- non-finite guard -------------------------------------------------
+        # Job 84238 (radparent arm) had every weight NaN by its first eval at
+        # step 250, with nothing logged per step: one non-finite gradient fed to
+        # Adam poisons every parameter for good. Skip that update instead, say
+        # WHICH host and term produced it, and stop if it keeps happening.
+        _bad_p = [n for n, p in model.named_parameters()
+                  if p.grad is not None and not bool(torch.isfinite(p.grad).all())]
+        _bad_l = [h for h, l in zip(step_hosts, step_losses)
+                  if not np.isfinite(l)]
+        if _bad_p or _bad_l:
+            n_nonfinite += 1
+            n_consec_nonfinite += 1
+            if n_nonfinite <= 20:
+                print(f"  !! NON-FINITE step {step}: hosts {step_hosts} "
+                      f"losses {[f'{l:.4g}' for l in step_losses]} | "
+                      f"{len(_bad_p)} params with non-finite grad "
+                      f"(first: {_bad_p[:3]}) -- update SKIPPED", flush=True)
+                for h, r in zip(step_hosts, acc):
+                    odd = {k: v for k, v in r.items()
+                           if isinstance(v, float) and not np.isfinite(v)}
+                    keep = {k: r[k] for k in sorted(r)
+                            if (k.startswith("term_raw_")
+                                or k.startswith("soft_"))
+                            and isinstance(r[k], (int, float))}
+                    print(f"     {h}: non-finite {odd} | {keep}", flush=True)
+            opt.zero_grad(set_to_none=True)
+            if n_consec_nonfinite >= int(args.max_nonfinite_steps):
+                raise SystemExit(
+                    f"{n_consec_nonfinite} consecutive non-finite steps (last "
+                    f"{step}, {n_nonfinite} total) -- stopping rather than "
+                    "training on skipped updates. Read the NON-FINITE lines.")
+        else:
+            n_consec_nonfinite = 0
+            if args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for g in groups for p in g["params"]], float(args.clip))
+            opt.step()
 
         # ---- critic updates (hinge D loss + lazy R1) --------------------------
         # After the generator step, on the SAME hosts' detached fakes -- one
@@ -2685,6 +2796,7 @@ def run(args) -> Dict:
         if step % int(args.eval_every) == 0 or step == int(args.steps):
             row = {
                 "step": step,
+                "n_nonfinite_steps": int(n_nonfinite),
                 "wall_s": time.time() - t0,
                 "batch_gather": float(np.mean([r["gather"] for r in acc])),
                 "batch_unsup_pen": unsup_pen,
@@ -3080,7 +3192,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "collapses 32x in the first 250 steps -- the steps "
                          "`bound` most needs.")
     ap.add_argument("--centre-mode",
-                    choices=("full", "radial", "self", "self_tan"),
+                    choices=("full", "radial", "self", "self_tan",
+                             "self_tan_parent"),
                     default="full",
                     help="what the centre term charges for. full: the whole "
                          "offset to the reachable HR centroid. radial: only its "
@@ -3113,6 +3226,28 @@ def build_parser() -> argparse.ArgumentParser:
                          "that is a rule (58%% of sets too close); the "
                          "transverse half is noise no input predicts. Pair with "
                          "--centre-mode self_tan.")
+    # --- host-centric local temperature (cosmo_sr.features.host_temperature)
+    ap.add_argument(
+        "--w-temp", type=float, default=0.0,
+        help="weight on the host-centric LOCAL TEMPERATURE profile: per r/R_vir "
+             "bin, the mean log k-NN velocity dispersion around each training "
+             "host, two-sided against HR's value on the same tiles. 0 is off and "
+             "every arm before 2026-10-15. Velocity-only (neighbours detached). "
+             "Measured: every tuned arm's core is 0.68-0.75x HR (0.34x in massive "
+             "hosts) and Rockstar fragments it 12-19x per structure; imposing HR's "
+             "profile took SUBFIND core satellites 672 -> 292 (HR 252).")
+    ap.add_argument("--temp-max-x", type=float, default=3.0,
+                    help="charge bins up to this r/R_vir; 0.5 = the core-only arm "
+                         "(the half the velocity oracle validated)")
+    ap.add_argument("--temp-min-x", type=float, default=0.0)
+    ap.add_argument("--temp-k", type=int, default=32)
+    ap.add_argument("--temp-queries", type=int, default=256,
+                    help="candidate queries per r/R_vir bin per host per step")
+    ap.add_argument("--temp-target-queries", type=int, default=2048,
+                    help="HR queries per bin for the (one-off) target profile")
+    ap.add_argument("--temp-min-queries", type=int, default=32)
+    ap.add_argument("--temp-measure", action="store_true",
+                    help="build and LOG the temperature profile at --w-temp 0")
     ap.add_argument(
         "--w-isolation", type=float, default=0.0,
         help="weight on the local background OCCUPANCY, hinged above HR: the "
@@ -3217,7 +3352,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- the host as a background component (the radial-placement arm) ------
     ap.add_argument(
-        "--soft-host-profile", choices=["off", "lr", "self"], default="off",
+        "--soft-host-profile", choices=["off", "lr", "self", "parent"],
+        default="off",
         help="give the membership solve a HOST density profile instead of a "
              "flat background. The flat background plus the n_c/f^3 prior make "
              "the host core the cheapest place for a candidate to meet its "
@@ -3253,6 +3389,13 @@ def build_parser() -> argparse.ArgumentParser:
              "membership stop being COVERED.")
     ap.add_argument("--soft-host-bins", type=int, default=24)
     ap.add_argument("--soft-host-r-max-rvir", type=float, default=4.0)
+    ap.add_argument(
+        "--soft-radial-weight", type=float, default=0.0,
+        help="gamma of the per-set radial prior in the membership solve: each "
+             "pool particle pays 0.5*gamma*((r - r_HR)/(width*R_vir))^2, r from "
+             "the set's OWN HR parent. 0 = off (bit-identical).")
+    ap.add_argument("--soft-radial-width", type=float, default=0.2,
+                    help="the radial prior's width, in the parent's R_vir")
 
     # --- relocation: the arm A / B / C experiment ---------------------------
     ap.add_argument(
@@ -3643,6 +3786,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="gradient accumulation. One host per step is a very "
                          "noisy estimate of a SHARED operator's gradient")
     ap.add_argument("--clip", type=float, default=1.0)
+    ap.add_argument("--detect-anomaly", action="store_true",
+                    help="debug: torch autograd anomaly detection")
+    ap.add_argument(
+        "--max-nonfinite-steps", type=int, default=25,
+        help="stop after this many CONSECUTIVE steps whose loss or gradient "
+             "was non-finite (each is skipped and logged, not applied)")
     ap.add_argument("--eval-every", type=int, default=250)
     ap.add_argument(
         "--gate-at-steps", default="",
@@ -3723,6 +3872,10 @@ def validate(args) -> None:
     -- minutes of a GPU allocation -- so a config that cannot mean what it says
     is refused here rather than discovered in an OOM or in a metrics file.
     """
+    if float(args.w_temp) < 0:
+        raise SystemExit("--w-temp must be >= 0")
+    if temp_enabled(args):
+        temp_config_from_args(args)     # TempConfig's own refusals (bin range, k)
     # --- the conditioning channel ------------------------------------------
     # Parsing catches a typo'd channel name; the existence check catches the
     # far more expensive case of a run that trains for ten hours against a
@@ -3760,7 +3913,8 @@ def validate(args) -> None:
         raise SystemExit(
             f"--max-num-p {args.max_num_p} is not above --min-num-p "
             f"{args.min_num_p}; the window is empty.")
-    if args.population != "sub" and args.centre_mode in ("radial", "self_tan"):
+    if args.population != "sub" and args.centre_mode in ("radial", "self_tan",
+                                                         "self_tan_parent"):
         # `radial` projects the centre offset onto the direction from the
         # CLUSTER to the set. For a top-level halo far out in the same tiles
         # that direction is still defined, but the term's whole justification --
@@ -3810,6 +3964,11 @@ def validate(args) -> None:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     validate(args)
+    if bool(getattr(args, "detect_anomaly", False)):
+        # Debug only (several x slower): a NaN in backward raises with the
+        # FORWARD op that produced it, which the non-finite guard cannot say.
+        torch.autograd.set_detect_anomaly(True)
+        print("=== autograd anomaly detection ON (debug run)", flush=True)
 
     s = run(args)
     return 0 if s.get("ok") else 1

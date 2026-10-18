@@ -209,14 +209,23 @@ def build_host_profile(
     ``valid=False``.
     """
     src = str(cfg.soft_host_profile)
-    if src not in ("lr", "self"):
-        raise ValueError(f"soft_host_profile {src!r} is not 'lr' or 'self'")
+    if src not in ("lr", "self", "parent"):
+        raise ValueError(f"soft_host_profile {src!r} is not 'lr', 'self' or "
+                         "'parent'")
     sel = [int(i) for i in idx]
     S = len(sel)
     nb = int(cfg.soft_host_bins)
     box = float(sets.boxsize_mpc_h)
-    ch = sets.centre_host.detach().cpu().numpy().astype(np.float64)
-    if float(np.abs(ch[sel]).sum()) == 0.0:
+    if src == "parent":
+        cp = getattr(sets, "centre_parent", None)
+        if cp is None:
+            raise ValueError(
+                "soft_host_profile='parent' needs MemberSets.centre_parent, "
+                "which this pool predates -- rebuild it with build_member_sets.")
+        ch = cp.detach().cpu().numpy().astype(np.float64)
+    else:
+        ch = sets.centre_host.detach().cpu().numpy().astype(np.float64)
+    if src != "parent" and float(np.abs(ch[sel]).sum()) == 0.0:
         raise ValueError(
             "soft_host_profile is on, but every centre_host is zero -- "
             "build_member_sets was called without host_pos, so the profile "
@@ -228,11 +237,15 @@ def build_host_profile(
     logr = np.zeros((S, nb), dtype=np.float64)
     valid = np.zeros(S, dtype=bool)
 
-    if src == "lr":
-        rv = np.asarray(getattr(sets, "host_rvir", np.zeros(sets.n_sets)),
-                        dtype=np.float64)
-        mv = np.asarray(getattr(sets, "host_mvir", np.zeros(sets.n_sets)),
-                        dtype=np.float64)
+    if src in ("lr", "parent"):
+        # Same NFW either way; only whose size it is differs. A zero row (LR
+        # gate dropped the host / no parent in the catalog) stays flat.
+        _r, _m = (("parent_rvir", "parent_mvir") if src == "parent"
+                  else ("host_rvir", "host_mvir"))
+        rv = getattr(sets, _r, None)
+        mv = getattr(sets, _m, None)
+        rv = np.zeros(sets.n_sets) if rv is None else np.asarray(rv, np.float64)
+        mv = np.zeros(sets.n_sets) if mv is None else np.asarray(mv, np.float64)
         for k, s in enumerate(sel):
             if not (rv[s] > 0.0 and mv[s] > 0.0):
                 continue   # host below the LR gate: no guess, flat background

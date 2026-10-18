@@ -164,7 +164,17 @@ def catalog_counts(cat) -> dict:
 # --------------------------------------------------------------------------
 
 def source_field(cfg, box: str, source: str, base_seed: int) -> np.ndarray:
-    """HR from the paired dataset, ``base`` from the frozen SR2 cache (memmap)."""
+    """HR from the paired dataset, ``base`` from the frozen SR2 cache (memmap).
+
+    Any other source is a path to a saved ``(6, N, N, N)`` field -- e.g. a
+    gated arm's spliced box under ``flow_rockstar/fields/`` -- so a swap can
+    pair one arm's displacement with another field's velocity.
+    """
+    if source not in ("hr", "base"):
+        p = Path(source)
+        if not p.is_file():
+            raise SystemExit(f"no field at {p}")
+        return np.load(p, mmap_mode="r")
     if source == "hr":
         p = hr_path(cfg, box)
         if not Path(p).is_file():
@@ -185,7 +195,8 @@ def source_field(cfg, box: str, source: str, base_seed: int) -> np.ndarray:
 
 def run_arm(cfg, box: str, arm: str, args) -> dict:
     banner(f"{box} / arm {arm}")
-    spec = arm_spec(arm)
+    spec = (dict(args.custom_spec) if getattr(args, "custom_spec", None)
+            else arm_spec(arm))
     work = paths.subdir("channel_swap", f"{box}__{arm}", create=True)
     out_json = work / f"{box}_{arm}_summary.json"
 
@@ -256,8 +267,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     add_common_args(ap)
     ap.add_argument("--box", default="set8")
-    ap.add_argument("--arm", default="srpos_hrvel", choices=sorted(ARMS),
-                    help="which channel-source combination to build")
+    ap.add_argument("--arm", default="srpos_hrvel",
+                    help="which channel-source combination to build: one of "
+                         f"{sorted(ARMS)}, or any name with --disp-from/--vel-from")
+    ap.add_argument("--disp-from", default="",
+                    help="custom arm: displacement source (hr, base, or a .npy path)")
+    ap.add_argument("--vel-from", default="",
+                    help="custom arm: velocity source (hr, base, or a .npy path)")
     ap.add_argument("--base-seed", type=int, default=0)
     ap.add_argument("--reuse", action="store_true", default=True,
                     help="keep an existing catalog for this arm (default)")
@@ -270,6 +286,15 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = load_reward_config(args)
+    if bool(args.disp_from) != bool(args.vel_from):
+        raise SystemExit("--disp-from and --vel-from go together")
+    if args.disp_from:
+        if args.arm in ARMS:
+            raise SystemExit(f"custom arm name {args.arm!r} shadows a built-in arm")
+        args.custom_spec = {"disp": args.disp_from, "vel": args.vel_from}
+    else:
+        arm_spec(args.arm)                       # a clear error for a typo
+        args.custom_spec = None
     run_arm(cfg, str(args.box), str(args.arm), args)
     return 0
 

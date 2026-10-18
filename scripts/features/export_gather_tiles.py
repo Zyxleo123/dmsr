@@ -98,7 +98,19 @@ def replay_args(run_dir: Path, box: str, argv_extra: List[str]):
     loudly rather than silently: a config key that has been renamed since the run
     is exactly the case where a quiet default would change the member sets.
     """
-    cfg = json.loads((run_dir / "summary.json").read_text())["config"]
+    # A finished run has summary.json; a run still training (the early
+    # MG_GATE_AT_STEPS gate) has only the trainer's start-of-run copy of the
+    # same namespace.
+    src = run_dir / "summary.json"
+    if not src.is_file():
+        src = run_dir / "run_config.json"
+    if not src.is_file():
+        raise FileNotFoundError(
+            f"{run_dir} has neither summary.json (written at the end of a run) "
+            "nor run_config.json (written at its start since 2026-10-15); a "
+            "run older than that can only be gated once it finishes, or after "
+            "scripts/features/rebuild_summary.py.")
+    cfg = json.loads(src.read_text())["config"]
     ap = build_parser()
     known = {a.dest: a for a in ap._actions}
     argv: List[str] = []

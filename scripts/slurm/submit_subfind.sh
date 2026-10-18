@@ -55,6 +55,13 @@ declare -A ARM_OF=(
     [self]=all_blocks_self
     [soft]=all_blocks_sm_coarse_soft
     [knn]=all_blocks_knn6d_w5
+    [iso]=all_blocks_abl_shp_iso1
+)
+# A gate run on a mid-training snapshot lives under holdout_<box><suffix> and is
+# tagged mgho_<arm><suffix>_<box>. iso is gated at step 2000: the only arm ever
+# measured to move radial placement (median 0.68 R_vir vs frozen 0.53).
+declare -A SNAP_OF=(
+    [iso]=_step2000
 )
 
 # The map2map from-scratch arms. These differ from every target above in one
@@ -165,7 +172,7 @@ for t in $SF_TARGETS; do
         *)
             ARM="${ARM_OF[$t]:-}"
             [ -n "$ARM" ] || { echo "unknown target '$t'" >&2; exit 1; }
-            TAG="mgho_${ARM}_${SF_BOX}"
+            TAG="mgho_${ARM}${SNAP_OF[$t]:-}_${SF_BOX}"
             NAME="${SF_BOX}__${TAG}"
             SOURCE=candidate
             ;;
@@ -190,7 +197,7 @@ for t in $SF_TARGETS; do
     elif [ "$SOURCE" = "candidate" ]; then
         FIELD="$FIELDS/${SF_BOX}__${TAG}__seed${SF_SEED}.npy"
         if [ ! -f "$FIELD" ]; then
-            RUN_DIR="$MG/${ARM_OF[$t]:-}/holdout_${SF_BOX}"
+            RUN_DIR="$MG/${ARM_OF[$t]:-}/holdout_${SF_BOX}${SNAP_OF[$t]:-}"
             WHICH=out
             [ "$t" = "frozen" ] && { RUN_DIR="$MG/all_blocks_self/holdout_${SF_BOX}"; WHICH=frozen; }
             if [ ! -f "$RUN_DIR/tiles.npz" ]; then

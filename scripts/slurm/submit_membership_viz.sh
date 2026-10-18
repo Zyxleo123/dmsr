@@ -37,6 +37,20 @@ MV_LAMBDA="${MV_LAMBDA:-1.0}"
 MV_N_EVOLUTION="${MV_N_EVOLUTION:-4}"
 MV_N_MATRIX="${MV_N_MATRIX:-6}"
 MV_SELECT="${MV_SELECT:-spread}"       # spread | mass | substitution
+# The host-profile background in the solve (MG_SOFT_HOST_PROFILE). `parent`
+# centres it on each set's OWN host; lr/self use the task host for every set.
+MV_HOST_PROFILE="${MV_HOST_PROFILE:-off}"   # off | lr | self | parent
+# A job id the dump waits on (afterok) -- e.g. a splice job that is about to
+# write MV_FIELD. Skips the "field readable" check at submit time.
+MV_AFTER="${MV_AFTER:-}"
+MV_HOST_WEIGHT="${MV_HOST_WEIGHT:-0.0}"
+# The per-set radial prior (MG_SOFT_RADIAL_*): gamma and width in R_vir.
+MV_RADIAL_WEIGHT="${MV_RADIAL_WEIGHT:-0.0}"
+MV_RADIAL_WIDTH="${MV_RADIAL_WIDTH:-0.2}"
+# Chain the per-band centre-count job (solve_centre_condensation_cpu.sbatch)
+# behind the dump. MV_ARM is the arm whose Rockstar catalog is searched.
+MV_CONDENSE="${MV_CONDENSE:-0}"
+MV_ARM="${MV_ARM:-mgho_all_blocks_sm_coarse_soft_${MV_BOX:-set9}}"
 
 # --- re-plot an EXISTING dump: no GPU, no re-solve --------------------------
 # The npz is the artefact; every figure is a pure function of it. Point
@@ -68,13 +82,17 @@ MV_ROCKSTAR_ASCII="${MV_ROCKSTAR_ASCII:-$REWARD_ROOT/halos/${MV_BOX}__hr__hr/hr_
 
 TS="$(date +%Y%m%d_%H%M%S)_$$"
 OUT_DIR="$REWARD_ROOT/member_gather/membership_viz"
-NPZ="$OUT_DIR/membership_${MV_PRIOR}_lam${MV_LAMBDA}_${MV_BOX}_${TS}.npz"
+_HP_TAG=""
+[[ "$MV_HOST_PROFILE" != "off" ]] && _HP_TAG="_hp${MV_HOST_PROFILE}${MV_HOST_WEIGHT}"
+[[ "$MV_RADIAL_WEIGHT" != "0.0" && "$MV_RADIAL_WEIGHT" != "0" ]] \
+    && _HP_TAG="${_HP_TAG}_rad${MV_RADIAL_WEIGHT}w${MV_RADIAL_WIDTH}"
+NPZ="$OUT_DIR/membership_${MV_PRIOR}_lam${MV_LAMBDA}${_HP_TAG}_${MV_BOX}_${TS}.npz"
 mkdir -p "$OUT_DIR" "$REWARD_ROOT/logs" "$REWARD_ROOT/env"
 
 if [[ -n "$MV_NPZ_IN" ]]; then
     [[ -r "$MV_NPZ_IN" ]] || { echo ">>> MV_NPZ_IN not readable: $MV_NPZ_IN" >&2; exit 1; }
     NPZ="$MV_NPZ_IN"
-elif [[ ! -r "$MV_FIELD" ]]; then
+elif [[ -z "${MV_AFTER:-}" && ! -r "$MV_FIELD" ]]; then
     echo ">>> field not readable: $MV_FIELD" >&2
     echo ">>> pass MV_FIELD=<a full-box (6,ng,ng,ng) .npy>, MV_BOX=<box>, or" >&2
     echo ">>> MV_NPZ_IN=<an existing dump> to re-plot without the GPU." >&2
@@ -115,6 +133,10 @@ MG_LABEL="_membership_viz"
 MG_DUMP_MEMBERSHIP_NPZ="$NPZ"
 MG_DUMP_MEMBERSHIP_FIELD="$MV_FIELD"
 MG_DUMP_MEMBERSHIP_HOST="$MV_HOST"
+MG_SOFT_HOST_PROFILE="$MV_HOST_PROFILE"
+MG_SOFT_HOST_WEIGHT="$MV_HOST_WEIGHT"
+MG_SOFT_RADIAL_WEIGHT="$MV_RADIAL_WEIGHT"
+MG_SOFT_RADIAL_WIDTH="$MV_RADIAL_WIDTH"
 EOT
 
 # Source it in a clean shell before queuing: an env file that does not source is
@@ -157,6 +179,8 @@ echo "  box:    $MV_BOX"
 echo "  field:  $MV_FIELD"
 echo "  host:   ${MV_HOST:-<richest in box>}"
 echo "  prior:  $MV_PRIOR   lambda: $MV_LAMBDA"
+echo "  host profile: $MV_HOST_PROFILE  beta=$MV_HOST_WEIGHT"
+echo "  radial prior: gamma=$MV_RADIAL_WEIGHT  width=$MV_RADIAL_WIDTH R_vir"
 echo "  npz:    $NPZ"
 echo "  dump env: $DUMP_ENV"
 echo "  viz  env: $VIZ_ENV"
@@ -207,6 +231,7 @@ MV_DUMP_GRES="${MV_DUMP_GRES:-}"
 MV_DUMP_EXCLUDE="${MV_DUMP_EXCLUDE:-}"
 
 DUMP_ID=$(sbatch --parsable --job-name=mgmemdump --time=00:40:00 \
+    ${MV_AFTER:+--dependency="afterok:$MV_AFTER"} \
     ${MV_DUMP_PARTITION:+--partition="$MV_DUMP_PARTITION"} \
     ${MV_DUMP_QOS:+--qos="$MV_DUMP_QOS"} \
     ${MV_DUMP_GRES:+--gres="$MV_DUMP_GRES"} \
@@ -217,6 +242,13 @@ echo "dump job (GPU): $DUMP_ID  (partition ${MV_DUMP_PARTITION:-general})"
 VIZ_ID=$(sbatch --parsable --dependency="afterok:$DUMP_ID" \
     scripts/slurm/membership_viz_cpu.sbatch "$VIZ_ENV")
 echo "viz  job (CPU): $VIZ_ID   (afterok:$DUMP_ID)"
+COND_ID=""
+if [[ "$MV_CONDENSE" == "1" ]]; then
+    COND_ID=$(sbatch --parsable --dependency="afterok:$DUMP_ID" \
+        scripts/slurm/solve_centre_condensation_cpu.sbatch \
+        "SC_BOX=$MV_BOX" "SC_ARM=$MV_ARM" "SC_NPZ=$NPZ")
+    echo "band job (CPU): $COND_ID   (afterok:$DUMP_ID)"
+fi
 echo
 
 cat <<EOS
@@ -230,3 +262,7 @@ cat <<EOS
   <stem>_evolution.png   membership P per pool particle, one column per EM sweep
   <stem>_matrix.png      particle x candidate budget heatmap (final sweep)
 EOS
+if [[ -n "$COND_ID" ]]; then
+    echo "  tail -F $REWARD_ROOT/logs/slurm-solve_condense-$COND_ID.out   # per-band table"
+    echo "  $OUT_DIR/condensation/$(basename "${NPZ%.npz}")_condensation.json"
+fi

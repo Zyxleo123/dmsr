@@ -48,6 +48,7 @@ from gather_holdout_figures_data import (  # noqa: E402
     tile_boxes, within_radius_mass_function,
 )
 from subhalo_radial import RVIR_BINS  # noqa: E402  (one definition of the bins)
+from placement_forensics import link_structures, representatives  # noqa: E402
 from cosmo_sr.reward.tiles import TileGrid  # noqa: E402
 
 BOX_MPC = 100.0
@@ -111,6 +112,58 @@ def radial_distribution(cat, boxes, dilate: float) -> Dict[str, object]:
             "counts": [int(c) for c in counts],
             "frac": [float(c) / n if n else 0.0 for c in counts],
             "median_r_over_rvir": float(np.median(x)) if x.size else float("nan")}
+
+
+#: Placement split used by the structure yardstick: the core, where tuned arms
+#: fragment cold host centres, and the outskirts, where every SR field is short.
+CORE_X, OUT_X = 0.25, (0.5, 3.0)
+
+
+def structure_distribution(cat, boxes, dilate: float, min_num_p: int = 20
+                           ) -> Dict[str, object]:
+    """Radial distribution of DISTINCT subhalo structures, not Rockstar objects.
+
+    Same selection as :func:`radial_distribution` (subhalos whose parent centre
+    is in the edited region, r / parent R_vir), then subhalos are linked when one
+    centre lies inside the other's r_vir and each linked group counts once, at
+    its most massive member's radius. Measured 2026-10-15: every tuned arm holds
+    ~500 core structures against frozen's 546, but 12-19 Rockstar fragments per
+    structure, so object counts ranked arms on fragmentation
+    (placement-is-velocity-temperature).
+    """
+    host = cat.parent_ids < 0
+    order = np.argsort(cat.ids)
+    sub = np.where(~host & (cat.num_p >= min_num_p))[0]
+    nb = len(RVIR_BINS)
+    empty = {"n_structures": 0, "structures_by_r": [0] * nb, "subs_by_r": [0] * nb,
+             "core": 0, "outskirts": 0, "frag_per_structure_core": float("nan")}
+    if sub.size == 0:
+        return empty
+    j = np.clip(np.searchsorted(cat.ids, cat.parent_ids[sub], sorter=order),
+                0, order.size - 1)
+    hrow = order[j]
+    ok = cat.ids[hrow] == cat.parent_ids[sub]
+    sub, hrow = sub[ok], hrow[ok]
+    keep = in_tile_region(cat.pos[hrow], boxes, dilate=dilate) & (cat.rvir[hrow] > 0)
+    sub, hrow = sub[keep], hrow[keep]
+    if sub.size == 0:
+        return empty
+    d = cat.pos[sub] - cat.pos[hrow]
+    d -= BOX_MPC * np.round(d / BOX_MPC)
+    x = np.linalg.norm(d, axis=1) / (cat.rvir[hrow] / 1000.0)
+    lab = link_structures(cat.pos[sub], cat.rvir[sub] / 1000.0, box=BOX_MPC)
+    rep = representatives(lab, cat.num_p[sub].astype(np.float64))
+    rb = lambda v: np.digitize(v, RVIR_BINS[1:], right=False)
+    ns = np.bincount(rb(x[rep]), minlength=nb)[:nb]
+    na = np.bincount(rb(x), minlength=nb)[:nb]
+    xr = x[rep]
+    core = int(np.sum(xr < CORE_X))
+    return {"n_structures": int(rep.size), "structures_by_r": ns.tolist(),
+            "subs_by_r": na.tolist(), "core": core,
+            "outskirts": int(np.sum((xr >= OUT_X[0]) & (xr < OUT_X[1]))),
+            "frag_per_structure_core": float(np.sum(x < CORE_X) / core) if core
+            else float("nan"),
+            "median_x": float(np.median(xr))}
 
 
 def radial_score(new_frac: List[float], hr_frac: List[float],
@@ -269,6 +322,30 @@ def main(argv=None) -> int:
                 print(f"    {k:<10} {rad_score[k]:.3f}")
     rad = {k: dict(v, bins=rlabels) for k, v in rad.items()}
 
+    # --- the placement yardstick: distinct structures, core vs outskirts -----
+    struct = {k: structure_distribution(c, boxes, a.dilate)
+              for k, c in cats.items() if c is not None}
+    print(f"\n=== distinct subhalo STRUCTURES (linked fragments count once), "
+          f"core < {CORE_X} R_vir, outskirts {OUT_X[0]}-{OUT_X[1]} R_vir")
+    print(f"{'':<10} {'structs':>8} {'core':>6} {'outskirts':>10} "
+          f"{'frag/struct core':>17} {'median':>7}")
+    for k in ("base", a.baseline_name, "new", "hr"):
+        if k in struct:
+            st = struct[k]
+            print(f"{k:<10} {st['n_structures']:>8} {st['core']:>6} {st['outskirts']:>10} "
+                  f"{st['frag_per_structure_core']:>17.1f} {st.get('median_x', float('nan')):>7.2f}")
+    if "hr" in struct and struct["hr"]["core"] and struct["hr"]["outskirts"]:
+        for k in struct:
+            if k == "hr":
+                continue
+            struct[k]["core_over_hr"] = struct[k]["core"] / struct["hr"]["core"]
+            struct[k]["outskirts_over_hr"] = (struct[k]["outskirts"]
+                                              / struct["hr"]["outskirts"])
+        print("  new/HR: core {:.2f}, outskirts {:.2f}  (1.00 = HR; the outskirts "
+              "are where every SR field is short)".format(
+                  struct["new"].get("core_over_hr", float("nan")),
+                  struct["new"].get("outskirts_over_hr", float("nan"))))
+
     hr = cats["hr"]
     where = np.where(hr.ids == a.host_id)[0]
     mf = {}
@@ -353,6 +430,7 @@ def main(argv=None) -> int:
         "region_counts": region, "mass_function": mf,
         "region_mass_function": rmf, "shape_score": shape,
         "radial_distribution": rad, "radial_score": rad_score,
+        "structure_distribution": struct,
         "q1_abundance_held": q1, "q2_hosts_recovered": q2,
         "verdict": verdict})
     print(f"\n=== wrote {Path(a.out).with_suffix('.json')}")

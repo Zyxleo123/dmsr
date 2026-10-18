@@ -202,3 +202,31 @@ def test_an_unconditioned_run_replays_as_unconditioned(tmp_path):
 
     run = _write_run(tmp_path, cond_channels="")
     assert cond_config_of(export_gather_tiles.replay_args(run, "set9", [])) is None
+
+
+def test_a_run_still_training_replays_from_its_start_of_run_config(tmp_path):
+    """The early MG_GATE_AT_STEPS gate exports while training continues, before
+    summary.json exists; the trainer's run_config.json must stand in for it
+    (job 84389 died on the missing file)."""
+    run = _write_run(tmp_path, **POOL_KEYS)
+    cfg = json.loads((run / "summary.json").read_text())["config"]
+    (run / "summary.json").unlink()
+    (run / "run_config.json").write_text(json.dumps({"config": cfg}))
+    got = export_gather_tiles.replay_args(run, "set9", [])
+    for k, want in POOL_KEYS.items():
+        assert getattr(got, k) == want, f"{k} did not survive the replay"
+
+
+def test_the_finished_summary_wins_over_the_start_of_run_config(tmp_path):
+    run = _write_run(tmp_path, min_num_p=50)
+    cfg = json.loads((run / "summary.json").read_text())["config"]
+    (run / "run_config.json").write_text(
+        json.dumps({"config": dict(cfg, min_num_p=999)}))
+    assert export_gather_tiles.replay_args(run, "set9", []).min_num_p == 50
+
+
+def test_a_run_with_neither_config_file_says_so(tmp_path):
+    run = tmp_path / "arm"
+    run.mkdir()
+    with pytest.raises(FileNotFoundError, match="run_config.json"):
+        export_gather_tiles.replay_args(run, "set9", [])

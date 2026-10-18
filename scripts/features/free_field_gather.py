@@ -161,6 +161,8 @@ def member_config_of(args) -> MemberGatherConfig:
         soft_host_conc=float(getattr(args, "soft_host_conc", 5.0)),
         soft_host_bins=int(getattr(args, "soft_host_bins", 24)),
         soft_host_r_max_rvir=float(getattr(args, "soft_host_r_max_rvir", 4.0)),
+        soft_radial_weight=float(getattr(args, "soft_radial_weight", 0.0)),
+        soft_radial_width=float(getattr(args, "soft_radial_width", 0.2)),
         relocate=str(getattr(args, "relocate", "off")),
         relocate_dirs=int(getattr(args, "relocate_dirs", 8)),
         relocate_eps=float(getattr(args, "relocate_eps", 0.05)),
@@ -585,7 +587,8 @@ def main(argv=None) -> int:
                          "log is [log(ref/x)]_+^2, unbounded as x -> 0 and "
                          "still exactly zero for meeting or beating HR.")
     ap.add_argument("--centre-mode",
-                    choices=("full", "radial", "self", "self_tan"),
+                    choices=("full", "radial", "self", "self_tan",
+                             "self_tan_parent"),
                     default="full",
                     help="full: the whole offset to the reachable HR centroid "
                          "(the 72/154 term). radial: only its projection on the "

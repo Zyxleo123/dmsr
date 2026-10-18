@@ -71,6 +71,7 @@ set -euo pipefail
 : "${MG_HOSTS_PER_STEP:=2}"
 : "${MG_SETS_PER_STEP:=0}"      # 0 = all of a host's sets, the full batch
 : "${MG_CLIP:=1.0}"
+: "${MG_DETECT_ANOMALY:=0}"     # debug: autograd anomaly detection (slow)
 : "${MG_EVAL_EVERY:=250}"
 # --- the objective, identical to the free field's defaults -------------------
 : "${MG_W_VIRIAL:=1.0}"
@@ -138,6 +139,12 @@ set -euo pipefail
 # MG_POPULATION=all built 3,374 net objects and Rockstar filed every one as a
 # subhalo (subs +4,260, top-level -886). `d6` does not close this: it
 # normalises by the background's DISPERSION, not its density.
+# Host-centric local temperature (host_temperature.py): two-sided, velocity
+# only. MG_TEMP_MAX_X=0.5 is the core-only arm; MG_TEMP_MEASURE=1 logs it at 0.
+: "${MG_W_TEMP:=0.0}"
+: "${MG_TEMP_MAX_X:=3.0}"
+: "${MG_TEMP_QUERIES:=256}"
+: "${MG_TEMP_MEASURE:=0}"
 : "${MG_W_ISOLATION:=0.0}"
 : "${MG_ISO_RADIUS_FRAC:=0.5}"
 : "${MG_ISO_SOFTNESS:=0.15}"
@@ -230,18 +237,24 @@ set -euo pipefail
 #         the ~43% of hosts under the LR completeness gate, which fall back to
 #         the flat background. Needs the table from build_lr_host_table.py.
 #   self  binned off the candidate field itself -- complete, partly circular.
+#   parent NFW about each set's OWN HR parent (lr and self are centred on the
+#         TASK host, which owns only ~1/3 of a pool's sets). Training-side only.
 #
 # MG_SOFT_HOST_WEIGHT=0 is byte-identical to every soft arm already on disk,
 # which is the zero of the ladder. beta is NOT comparable between lr and self
 # (their log-density ranges differ by ~3x) -- read the ladder off
 # soft_host_logrho_p10/p90 in the run's diagnostics, in nats.
-: "${MG_SOFT_HOST_PROFILE:=off}"   # off | lr | self
+: "${MG_SOFT_HOST_PROFILE:=off}"   # off | lr | self | parent
 : "${MG_SOFT_HOST_WEIGHT:=0.0}"
 : "${MG_SOFT_HOST_CONC:=5.0}"
 : "${MG_SOFT_HOST_BINS:=24}"
 : "${MG_SOFT_HOST_R_MAX_RVIR:=4.0}"
 : "${MG_LR_HOST_TABLE:=}"
 : "${MG_LR_HOST_R_MAX_RVIR:=2.0}"
+# Per-set radial prior in the solve (pulls each centre to its own HR radius,
+# measured from its own HR parent). 0 = off.
+: "${MG_SOFT_RADIAL_WEIGHT:=0.0}"
+: "${MG_SOFT_RADIAL_WIDTH:=0.2}"
 
 # --- membership-solve dump (visualisation only) ------------------------------
 # Set MG_DUMP_MEMBERSHIP_NPZ to build this arm's pool, solve one host's
@@ -437,6 +450,12 @@ if [[ "$MG_SOFT_HOST_PROFILE" != "off" ]]; then
   echo "=== watch soft_host_valid_frac (how many hosts got a profile) and"
   echo "=== soft_host_logrho_p10/p90 (the ladder, in nats)."
 fi
+if [[ "$MG_SOFT_RADIAL_WEIGHT" != "0" && "$MG_SOFT_RADIAL_WEIGHT" != "0.0" ]]; then
+  EXTRA+=(--soft-radial-weight "$MG_SOFT_RADIAL_WEIGHT"
+          --soft-radial-width "$MG_SOFT_RADIAL_WIDTH")
+  echo "=== RADIAL PRIOR: gamma=$MG_SOFT_RADIAL_WEIGHT width=$MG_SOFT_RADIAL_WIDTH R_vir"
+fi
+[[ "$MG_DETECT_ANOMALY" == "1" ]] && EXTRA+=(--detect-anomaly)
 [[ -n "$MG_WANDB_MODE" ]] && EXTRA+=(--wandb-mode "$MG_WANDB_MODE")
 if [[ -n "$MG_DUMP_MEMBERSHIP_NPZ" ]]; then
   EXTRA+=(--dump-membership-npz "$MG_DUMP_MEMBERSHIP_NPZ" \
@@ -540,6 +559,7 @@ echo "          only look worse than the full term."
 fi
 echo "            (0/0 is the pure quadratic that scored 72/154 -- the control)"
 echo "    env:    env_select ${MG_ENV_SELECT} (host floor ${MG_ENV_HOST_FLOOR}p)"
+echo "    temp:   w_temp ${MG_W_TEMP}, max_x ${MG_TEMP_MAX_X}, queries ${MG_TEMP_QUERIES}, measure ${MG_TEMP_MEASURE}"
 echo "    iso:    w_isolation ${MG_W_ISOLATION}, radius ${MG_ISO_RADIUS_FRAC}"\
      " of the bg sphere, min count ${MG_ISO_MIN_COUNT}"
 echo "    shell:  w_radius ${MG_W_RADIUS}, dead zone ${MG_RADIUS_DEAD_ZONE}r," \
@@ -681,6 +701,9 @@ python -u scripts/features/finetune_member_gather.py \
     --centre-dead-zone "$MG_CENTRE_DEAD_ZONE" \
     --centre-huber-radii "$MG_CENTRE_HUBER" \
     --w-radius "$MG_W_RADIUS" \
+    --w-temp "$MG_W_TEMP" --temp-max-x "$MG_TEMP_MAX_X" \
+    --temp-queries "$MG_TEMP_QUERIES" \
+    $([ "$MG_TEMP_MEASURE" = "1" ] && echo --temp-measure) \
     --w-isolation "$MG_W_ISOLATION" \
     --iso-radius-frac "$MG_ISO_RADIUS_FRAC" \
     --iso-softness "$MG_ISO_SOFTNESS" \

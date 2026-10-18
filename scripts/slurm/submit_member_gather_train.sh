@@ -68,6 +68,10 @@ SKIP_SHAKEOUT="${SKIP_SHAKEOUT:-0}"
 # a forward pass per step; give those arms more.
 MG_MEM="${MG_MEM:-}"
 MG_TIME="${MG_TIME:-}"
+# MG_EXCLUDE. Pins the GPU class by excluding nodes (a multi-node --nodelist
+# forces the node count). The soft arms' GPU peak was never recorded and they
+# ran on 48 GB A6000s, so exclude the 24 GB A5000 node (gpu28) unless measured.
+MG_EXCLUDE="${MG_EXCLUDE:-}"
 
 # --- the split ---------------------------------------------------------------
 MG_TRAIN_BOXES="${MG_TRAIN_BOXES:-set3 set4 set5 set6 set7}"
@@ -263,6 +267,8 @@ MG_SOFT_HOST_WEIGHT="${MG_SOFT_HOST_WEIGHT:-0.0}"
 MG_SOFT_HOST_CONC="${MG_SOFT_HOST_CONC:-5.0}"
 MG_SOFT_HOST_BINS="${MG_SOFT_HOST_BINS:-24}"
 MG_SOFT_HOST_R_MAX_RVIR="${MG_SOFT_HOST_R_MAX_RVIR:-4.0}"
+MG_SOFT_RADIAL_WEIGHT="${MG_SOFT_RADIAL_WEIGHT:-0.0}"
+MG_SOFT_RADIAL_WIDTH="${MG_SOFT_RADIAL_WIDTH:-0.2}"
 MG_LR_HOST_TABLE="${MG_LR_HOST_TABLE:-}"
 MG_LR_HOST_R_MAX_RVIR="${MG_LR_HOST_R_MAX_RVIR:-2.0}"
 MG_W_SHELL="${MG_W_SHELL:-0.0}"
@@ -404,6 +410,12 @@ MG_ENV_SELECT="${MG_ENV_SELECT:-any}"
 MG_ENV_HOST_FLOOR="${MG_ENV_HOST_FLOOR:-200}"
 MG_W_ISOLATION="${MG_W_ISOLATION:-0.0}"
 MG_ISO_RADIUS_FRAC="${MG_ISO_RADIUS_FRAC:-0.5}"
+# Host-centric local temperature (host_temperature.py; placement forensics
+# 2026-10-15): two-sided, velocity-only. MG_TEMP_MAX_X=0.5 charges the core only.
+MG_W_TEMP="${MG_W_TEMP:-0.0}"
+MG_TEMP_MAX_X="${MG_TEMP_MAX_X:-3.0}"
+MG_TEMP_QUERIES="${MG_TEMP_QUERIES:-256}"
+MG_TEMP_MEASURE="${MG_TEMP_MEASURE:-0}"
 MG_ISO_SOFTNESS="${MG_ISO_SOFTNESS:-0.15}"
 MG_ISO_MIN_COUNT="${MG_ISO_MIN_COUNT:-8.0}"
 
@@ -606,6 +618,9 @@ MG_SOFT_HOST_WEIGHT="$MG_SOFT_HOST_WEIGHT"
 MG_SOFT_HOST_CONC="$MG_SOFT_HOST_CONC"
 MG_SOFT_HOST_BINS="$MG_SOFT_HOST_BINS"
 MG_SOFT_HOST_R_MAX_RVIR="$MG_SOFT_HOST_R_MAX_RVIR"
+MG_SOFT_RADIAL_WEIGHT="$MG_SOFT_RADIAL_WEIGHT"
+MG_DETECT_ANOMALY="${MG_DETECT_ANOMALY:-0}"
+MG_SOFT_RADIAL_WIDTH="$MG_SOFT_RADIAL_WIDTH"
 MG_LR_HOST_TABLE="$MG_LR_HOST_TABLE"
 MG_LR_HOST_R_MAX_RVIR="$MG_LR_HOST_R_MAX_RVIR"
 MG_SOFT_SIGMA_SCALE="$MG_SOFT_SIGMA_SCALE"
@@ -637,6 +652,10 @@ MG_ENV_SELECT="$MG_ENV_SELECT"
 MG_ENV_HOST_FLOOR="$MG_ENV_HOST_FLOOR"
 MG_W_ISOLATION="$MG_W_ISOLATION"
 MG_ISO_RADIUS_FRAC="$MG_ISO_RADIUS_FRAC"
+MG_W_TEMP="$MG_W_TEMP"
+MG_TEMP_MAX_X="$MG_TEMP_MAX_X"
+MG_TEMP_QUERIES="$MG_TEMP_QUERIES"
+MG_TEMP_MEASURE="$MG_TEMP_MEASURE"
 MG_ISO_SOFTNESS="$MG_ISO_SOFTNESS"
 MG_ISO_MIN_COUNT="$MG_ISO_MIN_COUNT"
 MG_GATE_AT_STEPS="$MG_GATE_AT_STEPS"
@@ -956,6 +975,7 @@ for v in $(compgen -v | grep '^SLURM_' || true); do unset "$v"; done
 RES=()
 [ -n "$MG_MEM" ]  && RES+=(--mem="$MG_MEM")
 [ -n "$MG_TIME" ] && RES+=(--time="$MG_TIME")
+[ -n "$MG_EXCLUDE" ] && RES+=(--exclude="$MG_EXCLUDE")
 
 sub() {
     if [ "$DRY" = "1" ]; then echo "DRY: sbatch ${RES[*]-} $*" >&2; echo "DRYID"

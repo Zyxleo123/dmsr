@@ -122,6 +122,11 @@ if [[ -z "${M2M_OPTIMIZER_ARGS:-}" ]]; then
     M2M_OPTIMIZER_ARGS='{"betas": [0.0, 0.99]}'
 fi
 : "${M2M_EPOCHS:=1024}"
+# Permanent checkpoint every N epochs; between them only the rolling
+# state_latest.pt is kept. Stock map2map writes one 55 MB state_N.pt per epoch
+# (56 GB per run). Needs the LOCAL ADDITION --keep-every in the repo's args.py;
+# a tree without it gets the stock behaviour. 0 = stock.
+: "${M2M_KEEP_EVERY:=25}"
 : "${M2M_BATCHES:=1}"
 # map2map reads each file WHOLE on first touch (fields.py: "use memmap after
 # reading a file once"), and an HR box is 6 GB across disp+vel. Peak scales with
@@ -251,6 +256,9 @@ m2m_write_args() {
         printf '%s\n' --pad "$M2M_PAD" --scale-factor "$M2M_SCALE_FACTOR"
         printf '%s\n' --batches "$M2M_BATCHES" --loader-workers "$M2M_LOADER_WORKERS"
         printf '%s\n' --epochs "$M2M_EPOCHS"
+        if (( M2M_KEEP_EVERY > 0 )) && grep -q -- "'--keep-every'" "$M2M_REPO/map2map/args.py"; then
+            printf '%s\n' --keep-every "$M2M_KEEP_EVERY"
+        fi
         [[ "$M2M_AUGMENT" == "1" ]] && printf '%s\n' --augment
         [[ -n "${M2M_AUG_SHIFT// }" ]] && printf '%s\n' --aug-shift "$M2M_AUG_SHIFT"
         [[ -r "$M2M_OUT/checkpoint.pt" ]] && printf '%s\n' --load-state "$M2M_OUT/checkpoint.pt"

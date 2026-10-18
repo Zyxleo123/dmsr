@@ -421,7 +421,10 @@ def solve_memberships(
         # set's branch and `centre_host` is on that same branch, so the
         # difference is the true host-centric vector and never a box-face
         # artefact. Per-particle afterwards.
-        hc = sets.centre_host[sel].to(dt)
+        # `parent` measures radius from each set's OWN host; `lr`/`self` keep
+        # the task host they were built and gated with.
+        hc = (sets.centre_parent if host_src == "parent"
+              else sets.centre_host)[sel].to(dt)
         r_ent = torch.sqrt(((x - hc[setid]) ** 2).sum(1) + 1e-12)
         lrho_ent = prof.log_rho(r_ent, setid)
         # A particle in reach of two hosts competes against the DENSER one:
@@ -451,6 +454,51 @@ def solve_memberships(
         }
     else:
         rep_host = {"soft_host_profile": host_src, "soft_host_weight": beta}
+
+    # --- the per-set RADIAL prior (cfg.soft_radial_weight) -------------------
+    # A fixed cost per pool entry: how far the particle sits from its set's HR
+    # radius, measured from the set's OWN parent (never the task host), in
+    # units of `width * R_vir,parent`. Direction is free. Static over the solve
+    # because the field is fixed while P is solved; the M-step then recentres
+    # the window on the material at the right radius. Sets with no parent row
+    # are left uncharged. gamma = 0 adds nothing, so the solve is unchanged.
+    gam = float(getattr(cfg, "soft_radial_weight", 0.0))
+    radcost = None
+    rep_rad = {"soft_radial_weight": gam}
+    if gam > 0.0:
+        cp = getattr(sets, "centre_parent", None)
+        prv = getattr(sets, "parent_rvir", None)
+        if cp is None or prv is None:
+            raise ValueError(
+                "soft_radial_weight > 0 needs MemberSets.centre_parent and "
+                "parent_rvir, which this pool predates -- rebuild it.")
+        cpj = cp[sel].to(dt)
+        rv = torch.as_tensor(np.asarray(prv, dtype=np.float64)[sel.cpu().numpy()],
+                             device=dev, dtype=dt)
+        ok = rv > 0.0
+        r_t = torch.linalg.vector_norm(ctr_ref.to(dt) - cpj, dim=1)
+        r_e = torch.sqrt(((x - cpj[setid]) ** 2).sum(1) + 1e-12)
+        width = (float(cfg.soft_radial_width) * rv).clamp_min(1e-3)
+        u = (r_e - r_t[setid]) / width[setid]
+        # In the solve's dtype: `x` is promoted by the float64 set centres, and
+        # a float64 cost would promote every logit after it.
+        radcost = torch.where(ok[setid], 0.5 * gam * u * u,
+                              torch.zeros_like(u)).to(dt)
+        # Zero each set's cheapest entry. A per-set constant is exactly a shift
+        # of that set's dual `alpha`, so the fixed point is unchanged -- but
+        # left in, the dual has to climb it within `soft_mass_steps` capped
+        # steps, and measured on the toy it could not (mass ratio 0.56 at
+        # gamma=1, 0.23 at gamma=10).
+        rmin = torch.full((S,), float("inf"), device=dev,
+                          dtype=radcost.dtype).scatter_reduce(
+            0, setid, radcost, reduce="amin", include_self=True)
+        rmin = torch.where(torch.isfinite(rmin), rmin, torch.zeros_like(rmin))
+        radcost = radcost - rmin[setid]
+        rep_rad.update({
+            "soft_radial_width": float(cfg.soft_radial_width),
+            "soft_radial_valid_frac": float(ok.to(dt).mean()),
+            "soft_radial_cost_p50": float(radcost.median()),
+        })
 
     hr_r = sets.ref["r_rms"][sel].to(dt).clamp_min(1e-4)
     hr_v = sets.ref["sigma_v"][sel].to(dt).clamp_min(1.0)
@@ -505,6 +553,8 @@ def solve_memberships(
         d2 = (((x - c[setid]) ** 2).sum(1) / (sr[setid] ** 2)
               + ((v - vb[setid]) ** 2).sum(1) / (sv[setid] ** 2))
         logit = logpi + alpha[setid] - 0.5 * d2 / lam
+        if radcost is not None:
+            logit = logit - radcost
         lse = _scatter_lse(logit, pinv, n_part, logbg)
         return logit - lse[pinv]
 
@@ -619,6 +669,7 @@ def solve_memberships(
         "soft_lambda": lam,
     }
     diag.update(rep_host)
+    diag.update(rep_rad)
     sizes = [int(pools.rows[s].numel()) for s in idx]
     return list(torch.split(w, sizes)), diag
 
@@ -669,7 +720,22 @@ def weighted_set_statistics(
     # and the kinetic energy once, exactly as the masses would.
     wpot = 0.5 * m * (w * phi).sum()
     t = m * (w * ke).sum()
-    virial = 2.0 * t / wpot.abs().clamp_min(1e-30)
+    # In LOG space, not `2t / |W|`. A set the radial prior starves has tiny
+    # weights and a tiny |W| (quadratic in w), and autograd's quotient rule
+    # forms `t / W**2`, which overflows float32 to inf -- the potential's
+    # backward then multiplies inf by its zero self-pair and returns NaN (job
+    # 84238 went NaN inside 250 steps; anomaly mode named
+    # `_SpecificPotentialBackward`, job 84372). The log form only ever divides
+    # by W once. Capped at e^60 so a degenerate set cannot overflow exp().
+    # The particle mass cancels in the ratio (2T/|W| = 4 sum w ke / |sum w phi|)
+    # and is left OUT: kept in, it multiplied the 1/W gradient by 5.8e8 after
+    # the division and still overflowed float32 for the lightest sets (job
+    # 84387: 3 non-finite steps in 250 with the first log form).
+    s_ke = (w * ke).sum()
+    s_phi = (w * phi).sum()
+    log_virial = (torch.log((4.0 * s_ke).clamp_min(1e-30))
+                  - torch.log(s_phi.abs().clamp_min(1e-30))).clamp(max=60.0)
+    virial = torch.exp(log_virial)
 
     energy = ke + phi
     if bound_scale is None:

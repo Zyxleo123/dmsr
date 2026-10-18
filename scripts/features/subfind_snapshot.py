@@ -85,7 +85,7 @@ SOFTENING_MPC_H = 0.005
 
 def _param_txt(out_dir: Path, snap_base: str, n_part: int, boxsize: float,
                *, max_mem_mb: int, softening: float, time_limit_s: int,
-               des_link_ngb: int = 20) -> str:
+               des_link_ngb: int = 20, des_num_ngb: int = 64) -> str:
     """The GADGET-4 parameter file for a post-processing FOF/SUBFIND run.
 
     Only the tags a DM-only, non-integrating run actually reads. The time
@@ -168,13 +168,13 @@ ActivePartFracForNewDomainDecomp  0.01
 ActivePartFracForPMinsteadOfEwald 0.05
 
 %---- SUBFIND's two neighbour numbers, and they are NOT the same knob:
-%       DesNumNgb  (64) smooths the DENSITY field the excursion set descends.
-%       DesLinkNgb (20) is how many nearest neighbours each particle consults
+%       DesNumNgb  (64 default) smooths the DENSITY field the excursion set descends.
+%       DesLinkNgb (20 default) is how many nearest neighbours each particle consults
 %                       for denser companions when the set is walked down --
 %                       Springel et al. 2001's DesLinkNgb. It sets how early two
 %                       peaks are judged to touch, i.e. where a subhalo ends.
-%     Both are the standard values; changing either changes the catalogue.
-DesNumNgb                 64
+%     64/20 are the standard values; changing either changes the catalogue.
+DesNumNgb                 {des_num_ngb}
 MaxNumNgbDeviation        1
 DesLinkNgb                {des_link_ngb}
 
@@ -304,6 +304,10 @@ def main(argv=None) -> int:
                     help="SUBFIND's DesLinkNgb: neighbours consulted for denser "
                          "companions in the excursion set, i.e. where a subhalo "
                          "is judged to end. 20 is the published default")
+    ap.add_argument("--des-num-ngb", type=int, default=64,
+                    help="SUBFIND's DesNumNgb: neighbours the DENSITY estimate is "
+                         "smoothed over. 64 is the published default; lowering it "
+                         "resolves peaks closer together (the bump census uses 32)")
     ap.add_argument("--smoke", type=int, default=0,
                     help="write an N^3 synthetic snapshot with planted clumps "
                          "instead of reading a field")
@@ -351,7 +355,8 @@ def main(argv=None) -> int:
     param.write_text(_param_txt(
         out_dir, args.snap_base, n, float(pb.boxsize_mpc_h),
         max_mem_mb=args.max_mem_mb, softening=float(args.softening),
-        time_limit_s=args.time_limit_s, des_link_ngb=int(args.des_link_ngb)))
+        time_limit_s=args.time_limit_s, des_link_ngb=int(args.des_link_ngb),
+        des_num_ngb=int(args.des_num_ngb)))
     print(f"=== wrote {param}", flush=True)
 
     manifest = {
@@ -361,7 +366,7 @@ def main(argv=None) -> int:
         "particle_mass_msun_h": float(pb.particle_mass_msun_h),
         "boxsize_mpc_h": float(pb.boxsize_mpc_h),
         "softening_mpc_h": float(args.softening),
-        "des_num_ngb": 64, "des_link_ngb": int(args.des_link_ngb),
+        "des_num_ngb": int(args.des_num_ngb), "des_link_ngb": int(args.des_link_ngb),
         "omega_m": OMEGA_M, "omega_l": OMEGA_L, "hubble_param": HUBBLE_PARAM,
     }
     if planted is not None:

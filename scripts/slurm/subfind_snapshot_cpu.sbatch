@@ -33,16 +33,19 @@ set -euo pipefail
 : "${SF_MAX_MEM_MB:=13000}"
 : "${SF_SMOKE:=0}"
 : "${SF_FIELD:=}"
+: "${SF_DES_NUM_NGB:=64}"     # SUBFIND density neighbours (published default 64)
+: "${SF_DES_LINK_NGB:=20}"    # SUBFIND saddle/link neighbours = min subhalo size (default 20)
 
 use_env pjm
 
-echo "=== snapshot: name=$SF_NAME source=$SF_SOURCE tag=${SF_TAG:-none} -> $SF_OUT_DIR"
+echo "=== snapshot: name=$SF_NAME source=$SF_SOURCE tag=${SF_TAG:-none} DesNumNgb=$SF_DES_NUM_NGB DesLinkNgb=$SF_DES_LINK_NGB -> $SF_OUT_DIR"
 python -u scripts/features/subfind_snapshot.py \
     --out-dir "$SF_OUT_DIR" \
     --box "$SF_BOX" \
     --source "$SF_SOURCE" \
     --seed "$SF_SEED" \
     --max-mem-mb "$SF_MAX_MEM_MB" \
+    --des-num-ngb "$SF_DES_NUM_NGB" --des-link-ngb "$SF_DES_LINK_NGB" \
     ${SF_TAG:+--tag "$SF_TAG"} \
     ${SF_FIELD:+--field "$SF_FIELD"} \
     $([ "$SF_SMOKE" != "0" ] && echo --smoke "$SF_SMOKE")

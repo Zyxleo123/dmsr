@@ -43,13 +43,26 @@ if [ "$IDX" -ge "${#_A[@]}" ]; then
     exit 0
 fi
 ARM="${_A[$IDX]}"
+# A custom arm is "name:disp_source:vel_source", each source hr, base or the
+# path of a saved (6,N,N,N) field -- e.g. an arm's spliced box under
+# flow_rockstar/fields/. Paths here never contain ':'.
+CUSTOM=()
+if [[ "$ARM" == *:* ]]; then
+    IFS=: read -r ARM _DISP _VEL <<< "$ARM"
+    for _s in "$_DISP" "$_VEL"; do
+        [[ "$_s" == hr || "$_s" == base ]] || require_input "$_s" "a gate's splice stage"
+    done
+    CUSTOM=(--disp-from "$_DISP" --vel-from "$_VEL")
+fi
 
+echo "host $(hostname)  cpus ${SLURM_CPUS_PER_TASK:-?}  mem 192G  arm $ARM ${CUSTOM[*]}"
 require_input "external/rockstar/rockstar" "make -C external/rockstar"
 require_input "configs/sr2_baseline/rockstar.cfg" "this repository"
 require_input "$DATA/hr/$BOX.npy" "the paired_catnorm dataset"
 require_input "$DMSR_REWARD_ROOT/cache/sr2_base" "scripts/slurm/cache_sr2_base.sbatch"
 
-ARGS=(--config "$REWARD_CFG" --box "$BOX" --arm "$ARM" --base-seed "$BASE_SEED")
+ARGS=(--config "$REWARD_CFG" --box "$BOX" --arm "$ARM" --base-seed "$BASE_SEED"
+      "${CUSTOM[@]}")
 [ "$OVERWRITE" = "1" ] && ARGS+=(--overwrite)
 
 echo "=== $BOX / arm $ARM  (task $IDX of ${#_A[@]})"

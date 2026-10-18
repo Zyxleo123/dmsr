@@ -49,6 +49,12 @@ MG_ARMS="${MG_ARMS:-all_blocks_self all_blocks_nocentre all_blocks_full all_bloc
 # the two questions a follow-up arm raises: did subhalo abundance deteriorate
 # from the baseline, and was the host damage recovered. Empty = skip the stage.
 HG_BASELINE_ARM="${HG_BASELINE_ARM:-}"
+# The placement yardstick's second half: GADGET-4 SUBFIND on the arm's spliced
+# field, then placement_forensics with that catalog -- self-bound satellites by
+# r/R_vir, core vs outskirts, against HR and frozen. Opt-in: one whole cpu node
+# (44 ranks, 600G) for ~30-60 min per arm. Rockstar object counts rank arms on
+# fragmentation (placement-is-velocity-temperature); this is the real-object read.
+HG_SUBFIND="${HG_SUBFIND:-0}"
 HG_BASELINE_NAME="${HG_BASELINE_NAME:-baseline}"
 # Chain the whole gate behind a still-running training job, so `tuned.pt` is
 # gated the moment it exists. The gate costs ~19 min of compute against a ~10 h
@@ -269,6 +275,37 @@ gate_chain() {
         echo "    region   -> job $vd (afterok:$cmp${HG_BASELINE_ARM:+, vs $HG_BASELINE_ARM})"
         WATCH+=("  $label region:   tail -F $REWARD_ROOT/logs/slurm-hg_verdict-$vd.out")
         RESULTS+=("  $label region:  $RUN_DIR/${out_name}.json")
+    fi
+    if [ "$label" != "FROZEN" ] && [ "$HG_SUBFIND" = "1" ]; then
+        local sfr="$REWARD_ROOT/subfind" sfname="${HG_BOX}__${rs_tag}" sfenv sf1 sf2 sfp
+        sfenv="$REWARD_ROOT/env/hg_subfind_${rs_tag}_${STAMP}.env"
+        cat > "$sfenv" <<EOT
+PROJECT=$PROJECT
+DMSR_REWARD_ROOT=$REWARD_ROOT
+SUBFIND_ROOT=$sfr
+SF_BOX=$HG_BOX
+SF_SEED=$HG_SEED
+SF_MIN_P=50
+SF_NRANKS=44
+SF_MAX_MEM_MB=13000
+SF_NAME=$sfname
+SF_SOURCE=candidate
+SF_TAG=$rs_tag
+SF_HOST_ID=$HG_HOST_ID
+SF_FIELD=$field
+EOT
+        sf1=$(sub --dependency=afterok:"$sp" scripts/slurm/subfind_snapshot_cpu.sbatch "$sfenv")
+        sf2=$(sub --dependency=afterok:"$sf1" scripts/slurm/subfind_run_cpu.sbatch "$sfenv")
+        # The SUBFIND references must exist for this box (submit_subfind.sh full,
+        # SF_TARGETS="hr frozen"); a missing one is skipped by name, not fatal.
+        sfp=$(sub --dependency=afterok:"$sf2" scripts/slurm/placement_forensics_cpu.sbatch \
+              "BOX=$HG_BOX" "PF_ARMS=$label=$rs_tag" "PF_REGION_EXPORT=$RUN_DIR/export.json" \
+              "PF_CHECK_VERDICT= " \
+              "PF_SUBFIND=hr=$sfr/${HG_BOX}__hr/subfind_catalog.npz,frozen=$sfr/${HG_BOX}__frozen/subfind_catalog.npz,$label=$sfr/$sfname/subfind_catalog.npz" \
+              "PF_OUT=$RUN_DIR/placement_subfind.json")
+        echo "    subfind  -> jobs $sf1 (snapshot) / $sf2 (run) / $sfp (placement, afterok:$sf2)"
+        WATCH+=("  $label subfind:  tail -F $sfr/logs/slurm-sf_run-$sf2.out")
+        RESULTS+=("  $label subfind: $RUN_DIR/placement_subfind.json  (SUBFIND sats by r/R_vir)")
     fi
 
     WATCH+=("  $label rockstar: tail -F $REWARD_ROOT/flow_rockstar/logs/slurm-flow_rs_cat-$rs.out")

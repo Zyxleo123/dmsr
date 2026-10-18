@@ -4,6 +4,13 @@
 56365, set9 + set10). The two training arms are cleared to launch and have not
 been run.*
 
+> **Update 2026-10-15** -- see `docs/sr2_radial_prior.md`. The `lr`/`self`
+> profiles below measure radius from the TASK host for every set, which owns
+> only ~1/3 of a pool's sets; `soft_host_profile="parent"` (each set's own HR
+> parent) fixes that. Pre-tested, `parent` drains the core but overshoots past
+> 2 R_vir; trained together with a per-set radial prior it FAILED the held-out
+> gate (radial 0.33 R_vir, abundance 0.52x HR).
+
 ## Gate result (2026-09-17)
 
 **1. Supply -- PASS.** Frozen/HR median particle count in the decisive

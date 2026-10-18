@@ -371,7 +371,11 @@ class MemberGatherConfig:
     #: that one coordinate to the radius term and keeps the anchor on the two
     #: the radius term says nothing about. The two terms are then orthogonal by
     #: construction rather than competing (see ``w_radius``).
-    centre_mode: str = "full"      # "full" | "radial" | "self" | "self_tan"
+    #: ``"self_tan_parent"`` is ``self_tan`` with the radial direction taken
+    #: from each set's OWN HR parent (``MemberSets.centre_parent``), not the
+    #: task host; the anchor to pair with ``soft_radial_weight``, which moves
+    #: centres ~90% radially about their own parent (pre-test, h165513).
+    centre_mode: str = "full"      # "full" | "radial" | "self" | "self_tan" | "self_tan_parent"
 
     # --- the shell: right distance from the host, any direction -------------
     #: Weight on ``| |x_bar - x_host| - |x_target - x_host| |`` -- the set's
@@ -588,7 +592,10 @@ class MemberGatherConfig:
     #: produces. ``"lr"`` is an analytic NFW from the LR catalog
     #: (inference-honest, incomplete below ~20k HR particles); ``"self"`` is
     #: binned off the candidate field itself (complete, partly circular).
-    soft_host_profile: str = "off"      # "off" | "lr" | "self"
+    #: ``"parent"`` is an analytic NFW about each set's OWN HR parent (its
+    #: centre, ``R_vir`` and ``M_vir``) -- training-side only, like the HR prior
+    #: the solve already uses, and the only source not centred on the task host.
+    soft_host_profile: str = "off"      # "off" | "lr" | "self" | "parent"
     #: ``beta``: how much of the log host density is subtracted from the
     #: background. 0 is the flat background EXACTLY -- pinned by a test against
     #: the unmodified solve -- and 1 is full overdensity. A dose ladder, for
@@ -606,6 +613,15 @@ class MemberGatherConfig:
     #: the table the end slopes continue, so these bound resolution, not range.
     soft_host_bins: int = 24
     soft_host_r_max_rvir: float = 4.0
+    #: A per-set RADIAL prior in the solve: each pool particle is charged
+    #: ``0.5 * gamma * ((r - r_HR) / (width * R_vir,parent))**2``, where ``r``
+    #: is its distance from the set's OWN HR parent and ``r_HR`` that of the
+    #: HR subhalo. Direction is free. The host-profile background only repels
+    #: from the host and overshoots past HR's 1-1.5 R_vir peak
+    #: (``parent-host-profile-pretest``); this pulls each centre to its own
+    #: HR radius. Training-side only, like the HR prior. 0 = off, bit-identical.
+    soft_radial_weight: float = 0.0
+    soft_radial_width: float = 0.2
 
     # --- relocation: choose the group's particles from the SR field ---------
     #: Which arm of the relocation experiment
@@ -653,9 +669,9 @@ class MemberGatherConfig:
         if self.soft_prior not in ("coarse", "hard"):
             raise ValueError(f"soft_prior {self.soft_prior!r} is not "
                              "'coarse' or 'hard'")
-        if self.soft_host_profile not in ("off", "lr", "self"):
+        if self.soft_host_profile not in ("off", "lr", "self", "parent"):
             raise ValueError(f"soft_host_profile {self.soft_host_profile!r} is "
-                             "not 'off', 'lr' or 'self'")
+                             "not 'off', 'lr', 'self' or 'parent'")
         if self.soft_host_profile != "off" and not self.soft_membership:
             raise ValueError(
                 "soft_host_profile only has a meaning inside the membership "
@@ -666,6 +682,15 @@ class MemberGatherConfig:
                 f"soft_host_weight {self.soft_host_weight} is negative, which "
                 "ADDS the host density to the background and makes the core "
                 "cheaper still -- the defect this term exists to remove.")
+        if float(self.soft_radial_weight) < 0.0:
+            raise ValueError(f"soft_radial_weight {self.soft_radial_weight} is "
+                             "negative, which would push sets OFF their radius.")
+        if float(self.soft_radial_weight) > 0.0 and not self.soft_membership:
+            raise ValueError("soft_radial_weight is a membership-solve prior and "
+                             "soft_membership is False.")
+        if float(self.soft_radial_width) <= 0.0:
+            raise ValueError(f"soft_radial_width {self.soft_radial_width} must be "
+                             "positive (it is in units of the parent's R_vir).")
         if self.soft_host_profile != "off" and int(self.soft_host_bins) < 2:
             raise ValueError(f"soft_host_bins {self.soft_host_bins} is below 2; "
                              "the profile is interpolated and needs two nodes.")
@@ -716,9 +741,11 @@ class MemberGatherConfig:
             raise ValueError(
                 f"relocate_oversample {self.relocate_oversample} is below 1: "
                 "fewer neighbours would be queried than the group needs")
-        if self.centre_mode not in ("full", "radial", "self", "self_tan"):
+        if self.centre_mode not in ("full", "radial", "self", "self_tan",
+                                    "self_tan_parent"):
             raise ValueError(f"centre_mode {self.centre_mode!r} is not "
-                             "'full', 'radial', 'self' or 'self_tan'")
+                             "'full', 'radial', 'self', 'self_tan' or "
+                             "'self_tan_parent'")
         if self.w_radius < 0.0:
             raise ValueError(f"w_radius {self.w_radius} is negative; the term "
                              "would PAY for landing on the wrong shell")
@@ -1225,6 +1252,17 @@ class MemberSets:
     #: means "no profile", never "a host of zero mass".
     host_rvir: Optional[np.ndarray] = None
     host_mvir: Optional[np.ndarray] = None
+    #: ``(S, 3)`` each set's OWN parent host centre, on that set's unwrap
+    #: branch, and ``(S,)`` the parent's HR ``R_vir`` (Mpc/h) and ``M_vir``
+    #: (Msun/h). ``centre_host`` is the TASK host for every set, but sets are
+    #: selected by home tile and a 12.5 Mpc/h tile holds many hosts -- in the
+    #: set9 h165513 pool only 51 of 159 sets belong to the task host
+    #: (``host-profile-gate-passed``). ``soft_host_profile="parent"`` reads
+    #: these. Zero rows where the catalog has no parent; ``None`` for a pool
+    #: built before the fields existed.
+    centre_parent: Optional[torch.Tensor] = None
+    parent_rvir: Optional[np.ndarray] = None
+    parent_mvir: Optional[np.ndarray] = None
 
     @property
     def n_sets(self) -> int:
@@ -1261,6 +1299,7 @@ class MemberSets:
             centre_rhat=self.centre_rhat.to(device),
             centre_self=self.centre_self.to(device),
             centre_host=self.centre_host.to(device),
+            centre_parent=_t(getattr(self, "centre_parent", None)),
             ref={k: v.to(device) for k, v in self.ref.items()},
             pools=(None if getattr(self, "pools", None) is None
                    else self.pools.to(device)),
@@ -1542,6 +1581,24 @@ def member_gather_loss(
                             @ sets.centre_rhat[s])
         elif cfg.centre_mode == "self":
             pen = torch.linalg.vector_norm(cbar - sets.centre_self[s])
+        elif cfg.centre_mode == "self_tan_parent":
+            # `self_tan` about the set's OWN parent: the radial component of the
+            # self offset is free (the radial prior owns it), the transverse
+            # two are anchored. A set with no parent row keeps the full `self`
+            # anchor rather than a direction measured from nowhere.
+            doff = cbar - sets.centre_self[s]
+            cp = getattr(sets, "centre_parent", None)
+            prv = getattr(sets, "parent_rvir", None)
+            if cp is None or prv is None:
+                raise ValueError(
+                    "centre_mode='self_tan_parent' needs MemberSets."
+                    "centre_parent/parent_rvir, which this pool predates.")
+            if float(np.asarray(prv)[s]) > 0.0:
+                ray = sets.centre_target[s] - cp[s].to(doff.dtype)
+                rh = ray / torch.linalg.vector_norm(ray).clamp_min(1e-9)
+                pen = torch.linalg.vector_norm(doff - (doff @ rh) * rh)
+            else:
+                pen = torch.linalg.vector_norm(doff)
         elif cfg.centre_mode == "self_tan":
             # The self offset with its radial component projected out, so the
             # anchor holds the two coordinates `w_radius` says nothing about and
@@ -2060,6 +2117,23 @@ def _apply_cap(keep_rows: np.ndarray, n_sites: np.ndarray, max_sets: int,
     return np.sort(np.asarray(keep_rows)[np.asarray(picked, dtype=np.int64)])
 
 
+def host_guard_config(cfg: "MemberGatherConfig") -> "MemberGatherConfig":
+    """The host-preservation guard's config, derived from an arm's own.
+
+    The guard is an IDENTITY statement -- keep HR's host particles together --
+    so it runs on HR's hard mask with every membership-relaxation option off.
+    Every option that only has a meaning inside the soft solve must be reset
+    here, or ``__post_init__`` refuses the derived config at the first eval:
+    the host profile did that to jobs 56560/56562, and the radial prior to job
+    84183. A new solve-only option belongs in this list.
+    """
+    import dataclasses
+    return dataclasses.replace(
+        cfg, centre_mode="self", w_radius=0.0, soft_membership=False,
+        soft_host_profile="off", soft_host_weight=0.0,
+        soft_radial_weight=0.0)
+
+
 def build_member_sets(
     cat, owner_index, tiles: Sequence[int],
     hr_field: torch.Tensor, frozen_field: torch.Tensor,
@@ -2193,6 +2267,11 @@ def build_member_sets(
     live_rows, fixed_pos, fixed_vel, bg_rows, centres = [], [], [], [], []
     centre_tgt, centre_scl, centre_rh, centre_slf = [], [], [], []
     centre_hst = []
+    # Each set's own parent (see `MemberSets.centre_parent`), by catalog id.
+    _row_of = {int(h): i for i, h in enumerate(np.asarray(cat.ids))}
+    centre_par: List[torch.Tensor] = []
+    par_rvir: List[float] = []
+    par_mvir: List[float] = []
     # The host on the same periodic branch as the set it owns, or `rhat` is a
     # box-length artifact for any cluster near a face. Deferred into the loop:
     # the branch is per set, since `ctr` is that set's own unwrap centre.
@@ -2360,6 +2439,19 @@ def build_member_sets(
         halo_id.append(hid)
         num_p.append(int(cat.num_p[crow]))
         parent_id.append(int(cat.parent_ids[crow]))
+        _prow = (_row_of.get(int(cat.parent_ids[crow]))
+                 if int(cat.parent_ids[crow]) >= 0 else None)
+        if _prow is None:
+            centre_par.append(torch.zeros(3, device=dev, dtype=hr_pos.dtype))
+            par_rvir.append(0.0)
+            par_mvir.append(0.0)
+        else:
+            _pp = torch.as_tensor(np.asarray(cat.pos[_prow], dtype=np.float64),
+                                  device=dev, dtype=hr_pos.dtype)
+            centre_par.append(
+                unwrap_about(_pp[None, :], ctr, float(boxsize_mpc_h))[0].detach())
+            par_rvir.append(float(cat.rvir[_prow]) / 1000.0)
+            par_mvir.append(float(cat.mvir[_prow]))
         env_l.append(int(home_env[r]))
         iso_r.append(float(iso_radius))
         n_live_l.append(int(keep.size))
@@ -2494,4 +2586,8 @@ def build_member_sets(
         # broadcast. Kept per set anyway because `soft_membership` solves a
         # BATCH and a batch spanning two hosts must carry two profiles.
         host_rvir=np.full(len(halo_id), float(host_rvir_mpc_h), dtype=np.float64),
-        host_mvir=np.full(len(halo_id), float(host_mvir_msun_h), dtype=np.float64))
+        host_mvir=np.full(len(halo_id), float(host_mvir_msun_h), dtype=np.float64),
+        centre_parent=(torch.stack(centre_par) if centre_par
+                       else torch.zeros((0, 3), device=dev, dtype=hr_pos.dtype)),
+        parent_rvir=np.asarray(par_rvir, dtype=np.float64),
+        parent_mvir=np.asarray(par_mvir, dtype=np.float64))

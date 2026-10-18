@@ -87,3 +87,17 @@ def test_radial_score_is_zero_on_hr_and_ignores_abundance():
     # fractions, so a uniformly sparser catalog with the SAME shape scores 0
     assert gv.radial_score([0.5, 0.3, 0.2], hr) == 0.0
     assert gv.radial_score([0.2, 0.3, 0.5], hr) > 0.3
+
+
+def test_structure_distribution_counts_linked_fragments_once():
+    # ten fragments piled 0.10-0.12 Mpc/h from the host centre, plus two separate
+    # outskirt subhalos at 1.2 and 2.0 R_vir
+    offs = list(np.linspace(0.10, 0.12, 10)) + [1.2, 2.0]
+    cat = _radial_cat(offs)
+    cat.rvir = cat.rvir.astype(float)
+    cat.rvir[1:] = 50.0                                   # 0.05 Mpc/h subhalos
+    out = gv.structure_distribution(cat, _all_boxes(), dilate=0.0)
+    assert out["n_structures"] == 3
+    assert out["core"] == 1 and out["outskirts"] == 2
+    assert abs(out["frag_per_structure_core"] - 10.0) < 1e-9
+    assert out["subs_by_r"][0] == 10 and out["structures_by_r"][0] == 1
