@@ -14,7 +14,8 @@
 #      clones (SRS-map2map, map2map, map2map_styled, map2map_colleague, MP-Gadget
 #      Options.mk), external/rockstar + external/gadget4 sources, conda env exports
 #      (pjm, g4), Claude memory; plus runs/ and docs/figures/ (git-ignored).
-#   1  results: dmsr_reward/{ic_determinism,halos,logs,env}, lr_sims{,_256}
+#   1  results: dmsr_reward/{ic_determinism,halos,halos_particles,lr_host_*,logs,env},
+#      lr_sims{,_256}
 #      paramfiles + seed manifests + logs.
 #   2  raw sims: int_redshift_same_cosmology dmo-64/128/256, then dmo-512 set9+set10,
 #      then the rest of dmo-512 (~110 GB total).
@@ -90,7 +91,10 @@ tier0() {
 
 tier1() {
     say "tier 1: results, catalogs, sim metadata"
-    for d in ic_determinism halos logs env; do
+    # halos_particles holds the HR owner arrays the member-gather trainer is
+    # supervised by; lr_host_* feed the conditioning arms
+    for d in ic_determinism halos halos_particles lr_host_table lr_host_channel \
+             lr_host_channel_rhat logs env; do
         up "$S/dmsr_reward/$d" "scratch/DMSR/dmsr_reward/$d"
     done
     for d in lr_sims lr_sims_256; do
@@ -121,7 +125,9 @@ verify() {
     say "verify: one-way size check of every prefix"
     local m="$STAGE/MANIFEST.txt" bad=0
     : > "$m"
-    for p in dmsr_reward/ic_determinism dmsr_reward/halos dmsr_reward/logs dmsr_reward/env \
+    for p in dmsr_reward/ic_determinism dmsr_reward/halos dmsr_reward/halos_particles \
+             dmsr_reward/lr_host_table dmsr_reward/lr_host_channel \
+             dmsr_reward/lr_host_channel_rhat dmsr_reward/logs dmsr_reward/env \
              int_redshift_same_cosmology paired_catnorm dmsr_reward/cache/sr2_base; do
         if "$RCLONE" check "$S/$p" "$DEST/scratch/DMSR/$p" --one-way --size-only -q; then
             echo "OK   scratch/DMSR/$p  $("$RCLONE" size "$DEST/scratch/DMSR/$p" | tr '\n' ' ')" >> "$m"

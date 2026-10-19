@@ -8,7 +8,7 @@
 #
 # NEW_SCRATCH plays the role of rhea's ZFS=/zfsauton/scratch/yixiz (bulk data lands
 # in $NEW_SCRATCH/DMSR/...); NEW_HOME plays /zfsauton2/home/yixiz (the code tree is
-# $NEW_HOME/DMSR/...). Tier sizes: 0 ~1 GB, 1 ~4 GB, 2 ~110 GB, 3 ~100 GB.
+# $NEW_HOME/DMSR/...). Tier sizes: 0 ~1 GB, 1 ~15 GB, 2 ~110 GB, 3 ~100 GB.
 # Download is `rclone copy`, so rerunning resumes; run it as a CPU batch job if the
 # login node kills long processes, but check the compute nodes can reach B2 first.
 set -euo pipefail
@@ -31,7 +31,8 @@ tier0() {
     down home/DMSR/cosmo_sr_project/docs/figures "$NEW_HOME/DMSR/cosmo_sr_project/docs/figures"
 }
 tier1() {
-    for d in ic_determinism halos logs env; do
+    for d in ic_determinism halos halos_particles lr_host_table lr_host_channel \
+             lr_host_channel_rhat logs env; do
         down "scratch/DMSR/dmsr_reward/$d" "$S/dmsr_reward/$d"
     done
     down scratch/DMSR/lr_sims "$S/lr_sims"         # tier 3's catnorm*.npy land here too

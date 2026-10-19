@@ -29,7 +29,7 @@ Upload tiers, from `b2_upload.sh`:
 | tier | what | size | needed for |
 |---|---|---|---|
 | 0 | `bundle/`: a `git bundle --all` of this repo; `repos/<name>.{txt,patch,untracked.tar.gz}` for SRS-map2map, map2map, map2map_styled and MP-Gadget (remote, branch, commit, uncommitted diff, untracked files); `MP-Gadget.Options.mk`; `map2map_colleague.tar.gz`; `external_rockstar_gadget4.tar.gz` (our patched Rockstar and the GADGET-4 SUBFIND build config); `conda_{pjm,g4}.yml` + `pip_{pjm,g4}.txt`; `claude_memory.tar.gz` + `claude_global_CLAUDE.md`. Also the repo's `runs/` and `docs/figures/`. | ~1 GB | everything |
-| 1 | `dmsr_reward/ic_determinism` (all the IC results: set9 and set10 at 256³, set9 at 128³, the scaling run, and the dmo-256/128 Rockstar catalogs), `dmsr_reward/halos` (HR and frozen-SR2 Rockstar catalogs, set0-15), `dmsr_reward/{logs,env}`, and `lr_sims{,_256}` paramfiles, seed manifests and logs | ~4 GB | reading the results; the HR/SR2 catalogs the match stage needs |
+| 1 | `dmsr_reward/ic_determinism` (all the IC results: set9 and set10 at 256³, set9 at 128³, the scaling run, and the dmo-256/128 Rockstar catalogs), `dmsr_reward/halos` (HR and frozen-SR2 Rockstar catalogs, set0-15), `dmsr_reward/halos_particles` (HR owner arrays and member sets: the trainer's supervision, set0-12), `dmsr_reward/lr_host_*`, `dmsr_reward/{logs,env}`, and `lr_sims{,_256}` paramfiles, seed manifests and logs | ~15 GB | reading the results; the HR/SR2 catalogs the match stage needs |
 | 2 | `int_redshift_same_cosmology/dmo-{64,128,256,512}/set*/PART_009` (`disp`, `vel`, `cat`, `style` .npy, z=0) | ~110 GB | the source of everything: HR, LR, and the 128³/256³ runs used as IC proxies |
 | 3 | `paired_catnorm/{lr,hr}` (49 GB), `dmsr_reward/cache/sr2_base` (frozen SR2 fields, 48 GB), `lr_sims*/set*/catnorm*.npy` | ~100 GB | **the IC stages read `paired_catnorm/hr/<box>.npy` and `cache/sr2_base/<box>_seed0_*.npy` directly**, so pull these for at least set9 and set10 |
 
@@ -104,7 +104,7 @@ the right index rather than pinning rhea's build.
 
 ```bash
 cd $HOME/DMSR/cosmo_sr_project
-NEW_SCRATCH=<bulk root> NEW_HOME=$HOME bash scripts/transfer/b2_download.sh 0 1   # ~5 GB
+NEW_SCRATCH=<bulk root> NEW_HOME=$HOME bash scripts/transfer/b2_download.sh 0 1   # ~16 GB
 NEW_SCRATCH=<bulk root> NEW_HOME=$HOME bash scripts/transfer/b2_download.sh 2 3   # ~210 GB
 ```
 
@@ -159,7 +159,45 @@ Pass condition: the new `set9_ripples.json` reproduces the uploaded one: r ≈ 0
 `IC CARRIES PLACEMENT`, with a 1-3 R_vir match of ~0.56 against a ~0.01 null. Write the
 new outputs to a separate `ICD_ROOT` so they do not overwrite the uploaded reference.
 
-## 7. Claude Code memory
+## 7. Training on frozen SR2 with IC input: what the data covers
+
+The member-gather trainer is `scripts/features/finetune_member_gather.py`, launched via
+`submit_member_gather_train.sh` and `member_gather_train_gpu.sbatch`. It reads:
+
+| input | where | in B2? |
+|---|---|---|
+| frozen SR2 `G_z0.pt` | public SRS-map2map repo | n/a (git) |
+| LR input + HR target fields | `paired_catnorm/{lr,hr}/<box>.npy` | yes, set0-15 |
+| HR Rockstar catalogs | `dmsr_reward/halos/<box>__hr__hr` | yes, set0-15 |
+| **HR owner arrays** (the supervision; boxes without one are skipped) | `dmsr_reward/halos_particles/<box>__hr__hr/<box>_hr_owner.npy` | yes, **set0-12 only** |
+| frozen SR2 fields (reference margins, gates) | `dmsr_reward/cache/sr2_base` | yes, set0-15 |
+| LR-host table / channel (`--cond-*` arms only) | `dmsr_reward/lr_host_*` | yes |
+| arm configurations of past runs | `dmsr_reward/env/*.env` | yes |
+
+The `mgtrain` defaults are **not** the winning arm. Set the MG_* variables explicitly;
+the memory note `mgtrain-defaults-are-not-the-winning-arm` lists them. The held-out
+Rockstar gate also needs Rockstar rebuilt (section 3). SUBFIND cross-checks need
+GADGET-4 rebuilt.
+
+set13-15 have no owner arrays. Build them on babel with `submit_owner_arrays.sh`, which
+runs Rockstar with full particle output.
+
+**What does not exist yet.** The current boxes have no IC input:
+
+- **IC fields.** set0-15 have no ICs or seeds. If the requested files arrive, put them
+  beside the data (for example `ic/<box>.npy`) and feed them through the existing
+  conditioning path. That path is `--cond-*`, `MG_COND_ROOT`, and the zero-init side
+  conv `cond0` (`docs/sr2_*`, memory `lr-host-conditioning-channel-built`). A
+  zero-init column starts the run exactly at frozen SR2.
+- **New boxes, if the ICs turn out to be for new runs rather than set0-15.** Each one
+  needs its HR run, `preprocess_paired.py` into `paired_catnorm`, an HR Rockstar catalog,
+  an owner array (`submit_owner_arrays.sh`), and a frozen-SR2 cache
+  (`cache_sr2_base.sbatch`). All are rebuildable on babel from this repo.
+- **Check the IC grid against HR first.** The IC test proxied the IC with a 256³ run of
+  the same seed, not a real IC file. Before training, confirm a regenerated IC agrees
+  with HR at low k (memory `ic-conditioned-sr-branch`).
+
+## 8. Claude Code memory
 
 The project memory is in `bundle/claude_memory.tar.gz`. Claude Code keys it by the
 project's absolute path, with `/` replaced by `-`:
@@ -176,7 +214,7 @@ The global `CLAUDE.md` describes rhea's slurm rules (no ssh to rhea, `lov4`,
 agent submit jobs. Many memory files cite rhea job IDs and paths. They are history and
 do not need rewriting.
 
-## 8. Where the IC line stands
+## 9. Where the IC line stands
 
 The docs and memories hold the details (`ic-determinism-test`, `ic-conditioned-sr-branch`).
 
