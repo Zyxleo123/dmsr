@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run b2_upload.sh tiers as a CPU batch job: rhea's login node killed the
-# detached upload mid-tier-1 (no rclone error, the process just vanished).
+# Run b2_upload.sh tiers as a CPU batch job (rhea's cpu nodes can reach B2).
+# Independent tiers can run as sibling jobs; rclone copy makes reruns cheap.
 #
 #   sbatch scripts/transfer/b2_upload_cpu.sbatch 0 1
 #   sbatch --dependency=afterany:<ids> scripts/transfer/b2_upload_cpu.sbatch verify

@@ -10,7 +10,7 @@ document explains how to rebuild the working state on babel.
   its size and an OK/FAIL from a one-way check against rhea. If the file is missing,
   the upload did not reach its last step, so check each prefix before you trust it.
 - **Scripts:** `scripts/transfer/b2_upload.sh` (what was uploaded, and from where;
-  it ran as CPU jobs via `b2_upload_cpu.sbatch`, because rhea's login node killed it),
+  `b2_upload_cpu.sbatch` runs the same tiers as CPU jobs),
   `b2_download.sh` (the reverse), and `rewrite_paths.sh` (rhea paths to babel paths).
 
 ## 1. What is in B2
@@ -112,9 +112,9 @@ NEW_SCRATCH=<bulk root> NEW_HOME=$HOME bash scripts/transfer/b2_download.sh 2 3 
 `<bulk root>/DMSR/...`. Pick a filesystem with at least ~400 GB of headroom, because
 Rockstar dumps and arm fields grow fast. On rhea, invalid labels (empty `rockstar.log`,
 truncated `.particles`) turned out to be a full per-user quota, not a RAM problem.
-The script resumes when re-run. For a long pull, check whether babel's login node
-kills long processes (rhea's did) and whether its compute nodes can reach B2. If they
-can, run the pull as a CPU batch job.
+The script resumes when re-run. On rhea, a ~1 h, 210 GB upload ran to completion on the
+login node at ~20-80 MiB/s, and rhea's CPU compute nodes could reach B2 too. Check both
+on babel before a long pull.
 
 ## 5. Paths and cluster policy
 
