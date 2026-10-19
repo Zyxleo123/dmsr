@@ -51,7 +51,7 @@ and create a `b2` remote with the same account ID and application key. Test it w
 
 ```bash
 mkdir -p $HOME/DMSR && cd $HOME/DMSR
-git clone https://github.com/Zyxleo123/dmsr cosmo_sr_project
+git clone git@github.com:Zyxleo123/dmsr.git cosmo_sr_project   # ssh key auth; https had no credentials on rhea
 git -C cosmo_sr_project switch feat/direct-sr2-reward-ft
 
 # siblings (external/map2map and external/SRS-map2map are symlinks to ../../<name>)
