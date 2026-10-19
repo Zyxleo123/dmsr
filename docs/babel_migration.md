@@ -9,7 +9,8 @@ document explains how to rebuild the working state on babel.
 - **Data:** `b2:proteina/dmsr/`. `MANIFEST.txt` at that root lists every prefix with
   its size and an OK/FAIL from a one-way check against rhea. If the file is missing,
   the upload did not reach its last step, so check each prefix before you trust it.
-- **Scripts:** `scripts/transfer/b2_upload.sh` (what was uploaded, and from where),
+- **Scripts:** `scripts/transfer/b2_upload.sh` (what was uploaded, and from where;
+  it ran as CPU jobs via `b2_upload_cpu.sbatch`, because rhea's login node killed it),
   `b2_download.sh` (the reverse), and `rewrite_paths.sh` (rhea paths to babel paths).
 
 ## 1. What is in B2
